@@ -145,7 +145,7 @@ async function handleWithSkillRouter(
 }
 
 async function runSkill(ctx: SkillContext, skill: Skill): Promise<void> {
-  const { event, logger, runtime } = ctx;
+  const { logger, runtime } = ctx;
   const result = await skill.run(ctx);
   if (!result.ok) {
     logger.error('skill failed', {
