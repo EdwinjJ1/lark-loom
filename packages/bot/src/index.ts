@@ -23,32 +23,39 @@ const logger: Logger = {
   error: (msg, meta) => console.error(`[bot] ${msg}`, meta ?? ''),
 };
 
+// 防御性读 env：trim 掉 trailing space / \r / \t
+// 用户复制粘贴 .env 时常带尾随空白；用 token / table_id 拼到 URL 里会直接挂掉
+// 飞书 API（曾导致 BITABLE 写入静默失败）。
+function envTrim(name: string): string {
+  return (process.env[name] ?? '').trim();
+}
+
 function buildDeps() {
-  const appId = process.env['LARK_APP_ID'];
-  const appSecret = process.env['LARK_APP_SECRET'];
+  const appId = envTrim('LARK_APP_ID');
+  const appSecret = envTrim('LARK_APP_SECRET');
   if (!appId) throw new Error('Missing env var: LARK_APP_ID');
   if (!appSecret) throw new Error('Missing env var: LARK_APP_SECRET');
 
   const runtime = createBotRuntime();
-  const router = new SkillRouter(process.env['LARK_BOT_OPEN_ID'] ?? '');
+  const router = new SkillRouter(envTrim('LARK_BOT_OPEN_ID'));
 
   const llm = new VolcanoLLMClient({
-    apiKey: process.env['ARK_API_KEY'] ?? '',
+    apiKey: envTrim('ARK_API_KEY'),
     modelIds: {
-      lite: process.env['ARK_MODEL_LITE'] ?? '',
-      pro: process.env['ARK_MODEL_PRO'] ?? '',
+      lite: envTrim('ARK_MODEL_LITE'),
+      pro: envTrim('ARK_MODEL_PRO'),
     },
   });
 
   const bitable = new LarkBitableClient({
     appId,
     appSecret,
-    appToken: process.env['BITABLE_APP_TOKEN'] ?? '',
+    appToken: envTrim('BITABLE_APP_TOKEN'),
     tableIds: {
-      memory: process.env['BITABLE_TABLE_MEMORY'] ?? '',
-      decision: process.env['BITABLE_TABLE_DECISION'] ?? '',
-      todo: process.env['BITABLE_TABLE_TODO'] ?? '',
-      knowledge: process.env['BITABLE_TABLE_KNOWLEDGE'] ?? '',
+      memory: envTrim('BITABLE_TABLE_MEMORY'),
+      decision: envTrim('BITABLE_TABLE_DECISION'),
+      todo: envTrim('BITABLE_TABLE_TODO'),
+      knowledge: envTrim('BITABLE_TABLE_KNOWLEDGE'),
     },
   });
 
