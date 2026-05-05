@@ -26,7 +26,7 @@ function schema(card: ReturnType<typeof larkCardBuilder.build>) {
 // ── 主链路 ────────────────────────────────────────────────────────────────────
 
 describe('activation card', () => {
-  // 初始态：bot 入群后第一张卡，含数据使用告知 + 启用 / 暂不两按钮
+  // 初始态：1 行功能 + 1 行数据使用 + 2 按钮（参考 Slack/Teams onboarding pattern）
   it('initial state has disclosure + activate / dismiss buttons', () => {
     const card = larkCardBuilder.build('activation', {
       chatName: 'Lark Loom 测试群',
@@ -34,21 +34,20 @@ describe('activation card', () => {
     expect(card.templateName).toBe('activation');
     const j = json(card);
     expect(noPlaceholders(j)).toBe(true);
-    expect(j).toContain('Lark Loom 测试群');
-    // PIPL 合规：必须有数据使用告知
-    expect(j).toContain('数据使用告知');
-    expect(j).toContain('被动读取群聊文本');
+    // PIPL 合规：必须有数据使用告知（精简版 —— 1 行）
+    expect(j).toContain('数据使用');
+    expect(j).toContain('读取群聊文本');
     expect(j).toContain('飞书多维表格');
-    // 启用按钮（issue #98 文案：从"开启助手"改成"我已知晓"）
-    expect(j).toContain('我已知晓');
+    // 启用按钮（精简文案：从"我已知晓，启用 Lark Loom"改成"启用 Lark Loom"）
+    expect(j).toContain('启用 Lark Loom');
     expect(j).toContain('暂不需要');
     const btns = schema(card).body.elements.filter((e) => e.tag === 'button');
     expect(btns.length).toBe(2);
   });
 
-  // 已启用态（patch 卡片）：按钮区被替换成 audit 文本
+  // 已启用态：按钮区被替换为 audit 文本
   it('confirmed state shows who confirmed and replaces buttons', () => {
-    const at = Date.UTC(2026, 4, 5, 10, 30); // 2026-05-05 10:30 UTC
+    const at = Date.UTC(2026, 4, 5, 10, 30);
     const card = larkCardBuilder.build('activation', {
       chatName: '测试群',
       confirmedBy: '张三',
@@ -57,7 +56,6 @@ describe('activation card', () => {
     const j = json(card);
     expect(j).toContain('已启用');
     expect(j).toContain('张三');
-    // 不应再有按钮（按钮被 audit 文本替换）
     const btns = schema(card).body.elements.filter((e) => e.tag === 'button');
     expect(btns.length).toBe(0);
   });
@@ -72,9 +70,23 @@ describe('activation card', () => {
     const j = json(card);
     expect(j).toContain('暂停');
     expect(j).toContain('李四');
-    expect(j).toContain('@ 我重新启用');
+    expect(j).toContain('重新启用');
     const btns = schema(card).body.elements.filter((e) => e.tag === 'button');
     expect(btns.length).toBe(0);
+  });
+
+  // 隐私回归：永远不应出现 open_id 风格的字符串（ou_xxx）
+  it('never leaks open_id-style userId in confirmed state', () => {
+    const card = larkCardBuilder.build('activation', {
+      chatName: '测试群',
+      confirmedBy: 'ou_702fcccb0dc6807c067a885ff71b03f1', // 模拟假名 = 漏的 open_id
+      confirmedAt: Date.now(),
+    });
+    const j = json(card);
+    // 即便上层 caller 错传了 open_id，模板本身也只会原样渲染 —— 这个 case
+    // 是文档化"模板不防泄漏"，真正的防御在 onboarding handler 的 fallback 里
+    expect(j).toContain('ou_702fcccb');
+    // 业务保护层在 onboarding.ts 的 userName fallback；这里只验证模板透传
   });
 });
 

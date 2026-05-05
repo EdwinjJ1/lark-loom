@@ -55,7 +55,9 @@ export async function handleOnboardingAction(
   if (event.type !== 'cardAction') return;
 
   const payload: CardAction = event.payload;
-  const userName = payload.user.name ?? payload.user.userId;
+  // 飞书 cardAction 经常不传 user.name；不能 fallback 到 userId（会泄漏 open_id）
+  // 用通用占位 —— audit memory 里仍有完整 userId
+  const userName = payload.user.name ?? (action === 'activate' ? '管理员' : '群成员');
   const now = Date.now();
 
   const chatName = String(payload.value['chatName'] ?? '本群');
