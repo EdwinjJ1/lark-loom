@@ -400,22 +400,22 @@ export class LarkBotRuntime implements BotRuntime {
   async fetchHistory(params: FetchHistoryParams): Promise<Result<FetchHistoryResult>> {
     await this.limiter.acquire();
     try {
-      const list = (
-        this.client.im.message as unknown as {
-          list: (p: unknown) => Promise<{
-            code?: number;
-            msg?: string;
-            data?: {
-              has_more?: boolean;
-              page_token?: string;
-              items?: Array<Record<string, unknown>>;
-            };
-          }>;
-        }
-      ).list;
+      // 直接在 lambda 里 obj.method(...) 调用，避免摘下方法导致 this 丢失
       const res = await withRateLimitRetry(
         () =>
-          list({
+          (
+            this.client.im.message as unknown as {
+              list: (p: unknown) => Promise<{
+                code?: number;
+                msg?: string;
+                data?: {
+                  has_more?: boolean;
+                  page_token?: string;
+                  items?: Array<Record<string, unknown>>;
+                };
+              }>;
+            }
+          ).list({
             params: {
               container_id: params.chatId,
               container_id_type: 'chat',
@@ -477,17 +477,18 @@ export class LarkBotRuntime implements BotRuntime {
     try {
       // GET /open-apis/im/v1/messages/{message_id}
       // 返回值：data.items[] —— 普通消息只有 1 条；merge_forward 则父在前 + 全部嵌套子
-      const get = (
-        this.client.im.message as unknown as {
-          get: (p: unknown) => Promise<{
-            code?: number;
-            msg?: string;
-            data?: { items?: Array<Record<string, unknown>> };
-          }>;
-        }
-      ).get;
+      // 直接在 lambda 里 obj.method(...) 调用，避免摘下方法导致 this 丢失
       const res = await withRateLimitRetry(
-        () => get({ path: { message_id: messageId } }),
+        () =>
+          (
+            this.client.im.message as unknown as {
+              get: (p: unknown) => Promise<{
+                code?: number;
+                msg?: string;
+                data?: { items?: Array<Record<string, unknown>> };
+              }>;
+            }
+          ).get({ path: { message_id: messageId } }),
         { context: 'fetchMessage', logger: this.logger, tracker: this.tracker },
       );
 
