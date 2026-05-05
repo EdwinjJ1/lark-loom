@@ -58,7 +58,9 @@ function makeCtx(event: BotEvent, runtimeOverride?: BotRuntime): SkillContext {
       askStructured: vi.fn(),
       chatWithTools: vi.fn(),
     } as unknown as SkillContext['llm'],
-    bitable: {} as SkillContext['bitable'],
+    bitable: {
+      insert: vi.fn().mockResolvedValue(ok({ tableId: 't', recordId: 'r' })),
+    } as unknown as SkillContext['bitable'],
     docx: {} as SkillContext['docx'],
     slides: {} as NonNullable<SkillContext['slides']>,
     cardBuilder: {
@@ -168,6 +170,97 @@ describe('handleEvent wiring', () => {
     await handleEvent(ctx, router, { qa: mockSkill } as unknown as Record<SkillName, Skill>);
 
     expect(mockSkill.run).not.toHaveBeenCalled();
+  });
+
+  // 4a. taskAssignment intent → 写 bitable.memory 副作用（无 skill 不触发 run）
+  it('taskAssignment intent → bitable.insert called with memory side-effect', async () => {
+    const mockSkill: Skill = {
+      ...qaSkill,
+      match: () => true,
+      run: vi.fn().mockResolvedValue(ok({ text: 'x' })),
+    };
+    // 「我来负责前端」命中 taskAssignment pattern
+    const msg = makeMessage({ text: '我来负责前端，李四来负责后端', mentions: [] });
+    const ctx = makeCtx(makeEvent(msg));
+
+    await handleEvent(ctx, router, { qa: mockSkill } as unknown as Record<SkillName, Skill>);
+    // fire-and-forget，等微任务跑完
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockSkill.run).not.toHaveBeenCalled();
+    expect(ctx.bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'memory',
+        row: expect.objectContaining({
+          chatId: msg.chatId,
+          type: 'taskAssignment',
+          content: msg.text,
+        }),
+      }),
+    );
+  });
+
+  // 4b. progressUpdate intent → 写 bitable.memory 副作用
+  it('progressUpdate intent → bitable.insert called with memory side-effect', async () => {
+    const mockSkill: Skill = {
+      ...qaSkill,
+      match: () => true,
+      run: vi.fn().mockResolvedValue(ok({ text: 'x' })),
+    };
+    const msg = makeMessage({ text: '前端模块已完成，下周联调', mentions: [] });
+    const ctx = makeCtx(makeEvent(msg));
+
+    await handleEvent(ctx, router, { qa: mockSkill } as unknown as Record<SkillName, Skill>);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockSkill.run).not.toHaveBeenCalled();
+    expect(ctx.bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'memory',
+        row: expect.objectContaining({ type: 'progressUpdate' }),
+      }),
+    );
+  });
+
+  // 4c. side-effect bitable 返回 err Result 时不 throw，仅 logger.warn
+  it('side-effect bitable insert returns err → warn but does not throw', async () => {
+    const failingBitable = {
+      insert: vi
+        .fn()
+        .mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'bitable down'))),
+    } as unknown as SkillContext['bitable'];
+    const msg = makeMessage({ text: '我来负责前端', mentions: [] });
+    const ctx = { ...makeCtx(makeEvent(msg)), bitable: failingBitable };
+
+    await expect(
+      handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>),
+    ).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(ctx.logger.warn as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
+      'bitable insert failed',
+      expect.objectContaining({ intent: 'taskAssignment', code: ErrorCode.FEISHU_API_ERROR }),
+    );
+  });
+
+  // 4d. side-effect bitable.insert 真 reject（网络/认证异常）→ catch 兜住，不触发 unhandled rejection
+  it('side-effect bitable insert rejects → caught, warn but does not throw', async () => {
+    const throwingBitable = {
+      insert: vi.fn().mockRejectedValue(new Error('network ETIMEDOUT')),
+    } as unknown as SkillContext['bitable'];
+    const msg = makeMessage({ text: '我来负责前端', mentions: [] });
+    const ctx = { ...makeCtx(makeEvent(msg)), bitable: throwingBitable };
+
+    // 关键：handleEvent 自身不能 throw，且不能产生 unhandled rejection
+    await expect(
+      handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>),
+    ).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(ctx.logger.warn as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
+      'bitable insert threw',
+      expect.objectContaining({ intent: 'taskAssignment', error: 'network ETIMEDOUT' }),
+    );
   });
 
   // 5. skill.run() 返回 err → 不 crash，logger.error 被调用
@@ -497,5 +590,181 @@ describe('handleEvent wiring', () => {
 
     expect(skill.run).toHaveBeenCalledOnce();
     expect(runtime.sendText).toHaveBeenCalledWith({ chatId: 'oc_chat1', text: 'fallback answer' });
+  });
+});
+
+// ─── Onboarding（issue #98 数据使用告知）─────────────────────────────────────
+
+describe('onboarding flow', () => {
+  const router = new SkillRouter(BOT_ID);
+
+  it('botJoinedChat → sends activation card', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'botJoinedChat',
+      payload: {
+        chatId: 'oc_new_chat',
+        inviter: { userId: 'ou_admin', name: '管理员' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'activation',
+      expect.objectContaining({ chatName: expect.any(String) }),
+    );
+    expect(runtime.sendCard).toHaveBeenCalledWith(
+      expect.objectContaining({ chatId: 'oc_new_chat' }),
+    );
+    // 不应当发普通文本（onboarding 只发卡片）
+    expect(runtime.sendText).not.toHaveBeenCalled();
+  });
+
+  it('cardAction "activate" patches card to confirmed state + writes audit memory', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        user: { userId: 'ou_admin', name: '张三' },
+        value: { action: 'activate', chatName: '测试群' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    // patch 卡片成 confirmed 态
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'activation',
+      expect.objectContaining({
+        chatName: '测试群',
+        confirmedBy: '张三',
+        confirmedAt: expect.any(Number),
+      }),
+    );
+    expect(runtime.patchCard).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'msg_activation' }),
+    );
+    // audit memory 写入
+    expect(ctx.bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'memory',
+        row: expect.objectContaining({
+          kind: 'project',
+          chat_id: 'oc_chat1',
+          source_skill: 'onboarding',
+          content: expect.stringContaining('activate'),
+        }),
+      }),
+    );
+  });
+
+  it('cardAction "dismiss" patches to dismissed state', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        user: { userId: 'ou_user', name: '李四' },
+        value: { action: 'dismiss' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'activation',
+      expect.objectContaining({
+        dismissedBy: '李四',
+        dismissedAt: expect.any(Number),
+      }),
+    );
+    expect(runtime.patchCard).toHaveBeenCalledOnce();
+    expect(ctx.bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        row: expect.objectContaining({
+          source_skill: 'onboarding',
+          content: expect.stringContaining('dismiss'),
+        }),
+      }),
+    );
+  });
+
+  // 隐私回归：飞书 cardAction 不传 user.name 时，patch 卡片绝不能 fallback 到 userId
+  // （PR #99 第一版上线后实战发现 open_id 露出，issue #98 review fix）
+  it('cardAction without user.name uses generic placeholder, never leaks userId', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        // user.name 缺失（飞书在 cardAction 中常见情况）
+        user: { userId: 'ou_702fcccb0dc6807c067a885ff71b03f1' },
+        value: { action: 'activate', chatName: '测试群' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    // 调用 cardBuilder.build 时 confirmedBy 应该是通用占位，**不是** open_id
+    const buildCalls = (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mock.calls;
+    const lastCall = buildCalls[buildCalls.length - 1];
+    expect(lastCall![1]).toMatchObject({ confirmedBy: '管理员' });
+    expect(lastCall![1].confirmedBy).not.toContain('ou_'); // 永远不能 fallback 到 open_id
+  });
+
+  it('audit memory still written even when patchCard fails', async () => {
+    const runtime = makeRuntime();
+    runtime.patchCard = vi
+      .fn()
+      .mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'patch failed')));
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        user: { userId: 'ou_admin', name: '张三' },
+        value: { action: 'activate', chatName: '测试群' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    // patchCard 挂了，但 audit memory 仍然写入
+    expect(ctx.bitable.insert).toHaveBeenCalledOnce();
   });
 });

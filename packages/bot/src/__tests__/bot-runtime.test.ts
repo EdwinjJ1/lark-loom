@@ -262,6 +262,61 @@ describe('LarkBotRuntime', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  // 回归：fetchHistory / fetchMessage 不能把 SDK 方法摘下来调用，否则丢 `this`
+  // 触发 TypeError（PR #97 review 抓到的真 bug）。这里用一个 strict-this mock 检查。
+  it('fetchHistory preserves `this` binding when calling SDK list', async () => {
+    const observed: { value: unknown } = { value: undefined };
+    mockMessageList.mockImplementation(function (this: unknown, _arg: unknown) {
+      observed.value = this;
+      return Promise.resolve({ code: 0, data: { has_more: false, items: [] } });
+    });
+
+    const runtime = makeRuntime();
+    const result = await runtime.fetchHistory({ chatId: 'oc_chat1' });
+
+    expect(result.ok).toBe(true);
+    // strict mode 下 `this` 丢失会是 undefined；正确绑定时是 mock 所在的对象
+    expect(observed.value).not.toBeUndefined();
+    expect(observed.value).not.toBeNull();
+  });
+
+  it('fetchMessage preserves `this` binding when calling SDK get', async () => {
+    const mockGet = vi.fn();
+    const observed: { value: unknown } = { value: undefined };
+    mockGet.mockImplementation(function (this: unknown, _arg: unknown) {
+      observed.value = this;
+      return Promise.resolve({ code: 0, data: { items: [] } });
+    });
+    // im.message.get 没在顶层 mock 里 —— 直接给 client 临时挂上
+    const runtime = makeRuntime();
+    (runtime as unknown as { client: { im: { message: Record<string, unknown> } } }).client.im.message.get =
+      mockGet;
+
+    const result = await runtime.fetchMessage('msg_1');
+
+    expect(result.ok).toBe(true);
+    expect(observed.value).not.toBeUndefined();
+    expect(observed.value).not.toBeNull();
+  });
+
+  // 8. 撞 99991400 → 自动 retry 一次 → 成功（issue #91 Layer A 集成）
+  it('sendText auto-retries once on feishu rate limit code 99991400', async () => {
+    mockMessageCreate
+      .mockResolvedValueOnce({ code: 99991400, msg: 'rate limit' })
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'msg_after_retry' } });
+    const runtime = makeRuntime();
+    // recordRateLimited 是同步副作用 —— 在 sleep 之前打的标记，spy 进去而不走真实时间
+    const tracker = runtime.getQuotaTracker();
+    const recordSpy = vi.spyOn(tracker, 'recordRateLimited');
+
+    const result = await runtime.sendText({ chatId: 'oc_chat1', text: '撞限流' });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.messageId).toBe('msg_after_retry');
+    expect(mockMessageCreate).toHaveBeenCalledTimes(2);
+    expect(recordSpy).toHaveBeenCalledOnce(); // QuotaTracker 被标记过节流
+  });
+
   it('card action event triggers handler with action payload', async () => {
     const runtime = makeRuntime();
     const handler: EventHandler = vi.fn();

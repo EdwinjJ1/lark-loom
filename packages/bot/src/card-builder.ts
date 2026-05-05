@@ -145,23 +145,66 @@ function card(templateName: CardTemplateName, feishu: FeishuCard): Card {
 // ─── 主链路卡片 ───────────────────────────────────────────────────────────────
 
 /**
- * activation — 群创建后第一张卡
- * 目的：让管理员用一次点击开启助手，是整个产品的"入口"
- * UI：简洁，不堆功能介绍；两个按钮清晰对立
+ * activation — bot 入群后的第一张卡
+ *
+ * 三态：
+ *   1. 初始（默认）：自我介绍 + 数据使用告知 + [启用] / [暂不] 两按钮
+ *   2. 已启用（confirmedBy/confirmedAt 给值）：替换按钮区为"✅ 已由 X 于 Y 启用"
+ *   3. 已忽略（dismissedBy/dismissedAt 给值）：替换按钮区为"已忽略，需要时随时 @ 我"
+ *
+ * 设计意图：
+ *   - 数据使用段是 PIPL 合规告知，所有群成员可见；卡本身就是留痕的 disclosure。
+ *   - 已启用/已忽略态是 patchCard 的目标，audit 谁点了 + 什么时候点。
  */
 function buildActivation(input: ActivationCardInput): Card {
-  const desc = input.description ?? 'Lark Loom 可以自动整理需求、管理分工、生成 PPT，无需 @ 触发。';
+  const isConfirmed = input.confirmedBy !== undefined && input.confirmedAt !== undefined;
+  const isDismissed = input.dismissedBy !== undefined && input.dismissedAt !== undefined;
+
+  // 状态用 template color 区分：blue 初始 / green 已启用 / grey 已暂停。
+  // header 标题始终是产品名，避免 "Lark Loom 已启用 Lark Loom" 这种重复。
+  const headerColor = isConfirmed ? 'green' : isDismissed ? 'grey' : 'blue';
+
+  // 参考 ChatGPT for Slack / Linear / Notion AI 的 onboarding 模式：
+  //   - 第一人称功能描述，去 "你好！" 这种对话化开头
+  //   - disclosure 一句话，不 meta-描述 disclosure 本身
+  //   - 中性按钮文案，无 emoji 杂质（状态用 template color 表达）
+  const intro = md(
+    '我会分析群聊内容，将 **项目需求 / 决策 / 行动项** 自动整理至团队飞书多维表格。',
+  );
+  const disclosure = md(
+    '**数据使用**：群聊文本将通过大模型分析，分析结果可在多维表格中查看。',
+  );
+
+  const elements: BodyElement[] = [intro, disclosure];
+
+  if (isConfirmed) {
+    const time = formatTime(input.confirmedAt!);
+    elements.push(hr(), md(`已由 **${input.confirmedBy}** 于 ${time} 启用`));
+  } else if (isDismissed) {
+    const time = formatTime(input.dismissedAt!);
+    elements.push(hr(), md(`已由 **${input.dismissedBy}** 于 ${time} 暂停 · @ 我可重新启用`));
+  } else {
+    elements.push(
+      btn('启用 Lark Loom', { action: 'activate', chatName: input.chatName }, 'primary'),
+      btn('稍后', { action: 'dismiss' }, 'default'),
+    );
+  }
+
   return card('activation', {
     schema: '2.0',
-    header: { title: pt('Lark Loom 已加入群组'), template: 'blue' },
-    body: {
-      elements: [
-        md(`**${input.chatName}** 需要开启项目协作助手吗？\n\n${desc}`),
-        btn('开启助手', { action: 'activate', chatName: input.chatName }, 'primary'),
-        btn('暂不需要', { action: 'dismiss' }, 'default'),
-      ],
-    },
+    header: { title: pt('Lark Loom'), template: headerColor },
+    body: { elements },
   });
+}
+
+function formatTime(ms: number): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(ms));
 }
 
 /**
@@ -176,6 +219,37 @@ function buildDocPush(input: DocPushCardInput): Card {
     minutes: '🗒 会议纪要',
     other: '📄 文档',
   };
+
+  // loading 占位：先 sendCard 拿 messageId，跑完用 patchCard 换终态
+  if (input.isLoading) {
+    const etaLine = input.etaSeconds
+      ? `预计耗时约 ${input.etaSeconds} 秒，请稍候。`
+      : '通常需要 30-60 秒，请稍候。';
+    return card('docPush', {
+      schema: '2.0',
+      header: { title: pt('文档生成中…'), template: 'blue' },
+      body: {
+        elements: [
+          md(`${typeLabel[input.docType]} **${input.docTitle}**\n\n${etaLine}`),
+          md('_我会从群聊上下文与关联文档里提取需求，整理完会自动替换这条卡片。_'),
+        ],
+      },
+    });
+  }
+
+  // error 终态：跑挂时把 loading 卡片 patch 成失败提示
+  if (input.errorMessage) {
+    return card('docPush', {
+      schema: '2.0',
+      header: { title: pt('文档生成失败'), template: 'red' },
+      body: {
+        elements: [
+          md(`${typeLabel[input.docType]} **${input.docTitle}**\n\n${input.errorMessage}`),
+        ],
+      },
+    });
+  }
+
   const elements: BodyElement[] = [
     md(
       `${typeLabel[input.docType]} **${input.docTitle}** 已生成${input.summary ? `\n\n${input.summary}` : ''}`,

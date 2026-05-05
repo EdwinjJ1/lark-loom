@@ -11,9 +11,9 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-import type { LLMTool, ToolCall, ToolResult } from '@seedhac/contracts';
+import type { LLMTool, Skill, ToolCall, ToolResult } from '@seedhac/contracts';
 import type { MemoryKind } from '@seedhac/contracts';
-import { skills } from '@seedhac/skills';
+import { skills as defaultSkills } from '@seedhac/skills';
 
 import type { IMemoryStore } from './memory-store.js';
 import { truncateToBytes } from './text-utils.js';
@@ -50,6 +50,33 @@ const TOOLS: readonly LLMTool[] = [
     },
   },
   {
+    name: 'memory.write',
+    description:
+      '把一条记忆写入当前群。当用户消息包含可记忆的事实（项目名/目标/用户群体/deadline/文档链接/关键决策/分工等）时，应主动调用。同一 (kind, key) 已存在时会 upsert 更新。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: ['project', 'chat', 'user', 'skill_log'],
+          description: '记忆类型；项目背景/需求用 project，群级偏好用 chat，单人偏好用 user',
+        },
+        key: {
+          type: 'string',
+          description: '幂等键（A-Za-z0-9_:.- 内），同 (kind, key) 唯一定位一条记忆，例：project:overview',
+        },
+        content: { type: 'string', description: '要记录的事实，简洁不要超过 500 字' },
+        importance: {
+          type: 'number',
+          minimum: 1,
+          maximum: 10,
+          description: '可选，1-10 重要度；不传则后台 LLM 评分',
+        },
+      },
+      required: ['kind', 'key', 'content'],
+    },
+  },
+  {
     name: 'skill.list',
     description: '列出所有已注册 Skill 的名称和一句话描述',
     parameters: { type: 'object', properties: {} },
@@ -83,11 +110,15 @@ export interface ToolLogger {
 
 export interface ExecutorDeps {
   readonly store: IMemoryStore;
+  /** 当前 runtime 实际启用的 Skill 集合；不传时使用默认全量注册表。 */
+  readonly skills?: readonly Skill[];
   /** 当前群组 ID，memory.read 的隐式上下文 */
   readonly chatId: string;
   readonly logger: ToolLogger;
   /** docs/bot-memory 目录绝对路径 */
   readonly docsRoot: string;
+  /** memory.write 写入时落到 source_skill 列；区分 harness 主动 / 被动监听 / 具体 skill */
+  readonly sourceSkill?: string;
   /** 可注入的文件读取函数，便于测试 mock */
   readonly readFileFn?: (path: string) => Promise<string>;
 }
@@ -134,8 +165,10 @@ async function dispatch(
       return handleMemoryRead(args, deps);
     case 'memory.search':
       return handleMemorySearch(args, deps);
+    case 'memory.write':
+      return handleMemoryWrite(args, deps);
     case 'skill.list':
-      return handleSkillList();
+      return handleSkillList(deps.skills ?? defaultSkills);
     case 'skill.read':
       return handleSkillRead(args, deps.docsRoot, readFileFn);
     default:
@@ -175,7 +208,44 @@ async function handleMemorySearch(
   return JSON.stringify({ records: r.value });
 }
 
-function handleSkillList(): string {
+const VALID_KINDS: ReadonlySet<MemoryKind> = new Set(['project', 'chat', 'user', 'skill_log']);
+
+async function handleMemoryWrite(
+  args: Record<string, unknown>,
+  deps: ExecutorDeps,
+): Promise<string> {
+  const kindRaw = String(args['kind'] ?? '');
+  const key = String(args['key'] ?? '');
+  const content = String(args['content'] ?? '');
+
+  if (!VALID_KINDS.has(kindRaw as MemoryKind)) {
+    return JSON.stringify({ error: `kind must be one of: ${[...VALID_KINDS].join(', ')}` });
+  }
+  if (!key || !content) return JSON.stringify({ error: 'key and content are required' });
+
+  const importance =
+    typeof args['importance'] === 'number'
+      ? Math.min(Math.max(args['importance'], 1), 10)
+      : undefined;
+
+  const r = await deps.store.write({
+    kind: kindRaw as MemoryKind,
+    chat_id: deps.chatId, // 强制会话上下文，不信任 LLM 传入
+    key,
+    content,
+    source_skill: deps.sourceSkill ?? 'harness',
+    ...(importance !== undefined && { importance }),
+  });
+  if (!r.ok) return JSON.stringify({ error: r.error.message });
+  return JSON.stringify({
+    ok: true,
+    recordId: r.value.id,
+    kind: r.value.kind,
+    key: r.value.key,
+  });
+}
+
+function handleSkillList(skills: readonly Skill[]): string {
   const list = skills.map((s) => ({
     name: s.name,
     description: s.metadata.description,

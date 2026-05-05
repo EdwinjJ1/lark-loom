@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ok, err, makeError, ErrorCode } from '@seedhac/contracts';
-import type { ToolCall } from '@seedhac/contracts';
+import type { Skill, ToolCall } from '@seedhac/contracts';
+import { qaSkill } from '@seedhac/skills';
 import { getLLMTools, makeExecutor } from '../../memory/tool-handlers.js';
 import type { MemoryStore } from '../../memory/memory-store.js';
 import type { MemoryRecord } from '@seedhac/contracts';
@@ -40,12 +41,14 @@ function makeCall(name: string, args: Record<string, unknown>): ToolCall {
 // ─── getLLMTools ──────────────────────────────────────────────────────────────
 
 describe('getLLMTools', () => {
-  it('returns 4 tools with required fields', () => {
+  it('returns 5 tools with required fields', () => {
+    // M6（PR #87 / #85）加了 memory.write，从 4 个增到 5 个
     const tools = getLLMTools();
-    expect(tools).toHaveLength(4);
+    expect(tools).toHaveLength(5);
     const names = tools.map((t) => t.name);
     expect(names).toContain('memory.read');
     expect(names).toContain('memory.search');
+    expect(names).toContain('memory.write');
     expect(names).toContain('skill.list');
     expect(names).toContain('skill.read');
     for (const t of tools) {
@@ -152,6 +155,40 @@ describe('skill.list', () => {
     // Even with garbage args it should not throw
     const toolResult = await exec({ id: 'c1', name: 'skill.list', argumentsRaw: '{}' });
     expect(() => JSON.parse(toolResult.content)).not.toThrow();
+  });
+
+  it('uses the executor-injected skills instead of the global registry', async () => {
+    const store = makeStore();
+    const injectedSkill: Skill = {
+      ...qaSkill,
+      name: 'qa',
+      metadata: {
+        description: 'Only QA is enabled in this runtime',
+        when_to_use: 'Use for injected registry tests',
+        examples: ['@bot test injected skills'],
+      },
+    };
+    const exec = makeExecutor({
+      store,
+      skills: [injectedSkill],
+      chatId: CHAT_ID,
+      logger: mockLogger,
+      docsRoot: DOCS_ROOT,
+    });
+
+    const toolResult = await exec(makeCall('skill.list', {}));
+
+    const data = JSON.parse(toolResult.content) as {
+      skills: { name: string; description: string; when_to_use: string; examples: string[] }[];
+    };
+    expect(data.skills).toEqual([
+      {
+        name: 'qa',
+        description: 'Only QA is enabled in this runtime',
+        when_to_use: 'Use for injected registry tests',
+        examples: ['@bot test injected skills'],
+      },
+    ]);
   });
 });
 

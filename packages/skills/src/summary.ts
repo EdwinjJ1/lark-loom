@@ -106,13 +106,20 @@ export const summarySkill: Skill = {
       if (!res.ok) ctx.logger.warn('summary: batchInsert todo failed', { error: res.error });
     }
 
+    // 字段对齐 contracts/MemoryRecord schema（kind / chat_id / key / content /
+    // source_skill / importance / created_at / last_access），跟 BITABLE memory 表一致
+    const now = Date.now();
     const memRes = await ctx.bitable.insert({
       table: 'memory',
       row: {
-        chatId,
-        type: 'meeting_summary',
+        key: `summary-${chatId}-${now}`,
+        kind: 'chat',
+        chat_id: chatId,
         content: summary.decisions.join(' | '),
-        timestamp: Date.now(),
+        importance: 5,
+        last_access: now,
+        created_at: now,
+        source_skill: 'summary',
       },
     });
     if (!memRes.ok) ctx.logger.warn('summary: insert memory failed', { error: memRes.error });

@@ -34,11 +34,23 @@ function makeEvent(text: string): BotEvent {
   return { type: 'message', payload: makeMessage(text) };
 }
 
+// 跟新 13 字段 schema 对齐
 const MOCK_DOC = {
   title: '飞书智能助手 PRD',
+  summary: '住在飞书群里的 AI 助手，把对话织成结构化产出',
   background: '群协作信息散落，需要一个 Bot 把对话织成结构化产出。',
+  targetUsers: ['项目经理（主要）', '团队成员（次要）'],
   goals: ['自动整理需求', '主动浮信息', '生成演示文稿'],
-  scope: '只覆盖群聊场景，不监听 1v1 私聊。',
+  successMetrics: ['需求文档生成耗时 ≤ 60 秒'],
+  userStories: ['作为 PM，我希望 bot 自动从群聊整理 PRD'],
+  solution: '飞书群里被动监听 + LLM 提取 + 写 docx',
+  scope: {
+    included: ['需求整理', '分工表格', 'PPT 初稿'],
+    excluded: ['1v1 私聊监听'],
+  },
+  milestones: [{ name: 'MVP 内测' }],
+  risks: ['lark 长连接不稳：补 backfill'],
+  openQuestions: [],
   deliverables: ['需求文档', '分工表格', 'PPT 初稿'],
 };
 
@@ -99,24 +111,65 @@ const SCENARIO_COMBO_WIKI_BODY = '标题：项目方案 v3\n\n（详细需求…
 
 // ─── ctx factories ────────────────────────────────────────────────────────────
 
-function makeRuntime(history: readonly Message[]): BotRuntime {
+function makeRuntime(
+  history: readonly Message[],
+  fetchMessageOverride?: (id: string) => ReturnType<BotRuntime['fetchMessage']>,
+): BotRuntime {
   return {
     on: vi.fn(),
     start: vi.fn().mockResolvedValue(ok(undefined)),
     stop: vi.fn().mockResolvedValue(undefined),
     sendText: vi.fn(),
-    sendCard: vi.fn(),
-    patchCard: vi.fn(),
+    // requirementDoc 主流程：先 sendCard loading 拿 messageId，跑完 patchCard 终态
+    sendCard: vi
+      .fn()
+      .mockResolvedValue(ok({ messageId: 'loading_msg_001', chatId: 'oc_chat_001', timestamp: 0 })),
+    patchCard: vi.fn().mockResolvedValue(ok(undefined)),
     fetchHistory: vi.fn().mockResolvedValue(ok({ messages: history, hasMore: false })),
+    fetchMembers: vi.fn().mockResolvedValue(ok({ members: [] })),
+    fetchMessage: vi
+      .fn()
+      .mockImplementation(
+        fetchMessageOverride ??
+          (async (id: string) =>
+            err(makeError(ErrorCode.FEISHU_API_ERROR, `unexpected fetchMessage call: ${id}`))),
+      ),
   } as unknown as BotRuntime;
 }
 
+/**
+ * askStructured 现在被调两次：
+ *   1) lite 跑相关性预筛 —— 默认空 results 表示「不过滤」
+ *   2) pro  跑主提取 —— 返回 MOCK_DOC
+ */
 function makeLLM(doc = MOCK_DOC): LLMClient {
   return {
     ask: vi.fn(),
     chat: vi.fn(),
-    askStructured: vi.fn().mockResolvedValue(ok(doc)),
+    askStructured: vi
+      .fn()
+      .mockImplementation(
+        async (
+          _prompt: string,
+          _schema: unknown,
+          opts?: { model?: 'lite' | 'pro' },
+        ) => {
+          if (opts?.model === 'lite') {
+            return ok({ results: [] });
+          }
+          return ok(doc);
+        },
+      ),
   } as unknown as LLMClient;
+}
+
+/** 测试 helper：拿主提取（model: 'pro'）那次 askStructured 调用的 prompt。 */
+function mainExtractionPrompt(askStructured: ReturnType<typeof vi.fn>): string {
+  const proCall = askStructured.mock.calls.find(
+    (c) => (c[2] as { model?: string } | undefined)?.model === 'pro',
+  );
+  if (!proCall) throw new Error('main extraction (model=pro) askStructured call not found');
+  return proCall[0] as string;
 }
 
 function makeCardBuilder(): CardBuilder {
@@ -199,10 +252,20 @@ describe('requirementDocSkill.run() — single message scenario', () => {
     ctx = makeCtx(makeEvent('整理下项目需求'), { history: SCENARIO_SINGLE });
   });
 
-  it('returns docPush card with docType=requirement', async () => {
+  it('sends loading card first then patches it with docPush requirement card', async () => {
     const result = await requirementDocSkill.run(ctx);
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.card?.templateName).toBe('docPush');
+    // 不再直接返回 card —— 流程是：sendCard(loading) → ... → patchCard(final)
+    if (result.ok) expect(result.value.card).toBeUndefined();
+
+    // 先发了 loading 卡片
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'docPush',
+      expect.objectContaining({ isLoading: true, docType: 'requirement' }),
+    );
+    expect(ctx.runtime.sendCard).toHaveBeenCalledTimes(1);
+
+    // 跑完后 patch 成终态卡片
     expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
       'docPush',
       expect.objectContaining({
@@ -211,6 +274,9 @@ describe('requirementDocSkill.run() — single message scenario', () => {
         summary: expect.not.stringContaining('参考了'),
       }),
     );
+    expect(ctx.runtime.patchCard).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'loading_msg_001' }),
+    );
   });
 
   it('does NOT call docx.readContent when no Feishu URLs in history', async () => {
@@ -218,12 +284,19 @@ describe('requirementDocSkill.run() — single message scenario', () => {
     expect(ctx.docx.readContent).not.toHaveBeenCalled();
   });
 
-  it('writes memory with type=requirement and docToken', async () => {
+  it('writes memory with new schema (kind=project, key=req-<docToken>, source_skill)', async () => {
     await requirementDocSkill.run(ctx);
     expect(ctx.bitable.insert).toHaveBeenCalledWith(
       expect.objectContaining({
         table: 'memory',
-        row: expect.objectContaining({ type: 'requirement', docToken: MOCK_DOC_REF.docToken }),
+        row: expect.objectContaining({
+          key: `req-${MOCK_DOC_REF.docToken}`,
+          kind: 'project',
+          chat_id: 'oc_chat_001',
+          source_skill: 'requirementDoc',
+          // content 含 docToken url
+          content: expect.stringContaining(MOCK_DOC_REF.url),
+        }),
       }),
     );
   });
@@ -236,15 +309,15 @@ describe('requirementDocSkill.run() — multi-turn conversation scenario', () =>
     const ctx = makeCtx(makeEvent('整理一下项目需求吧'), { history: SCENARIO_MULTI_TURN });
     await requirementDocSkill.run(ctx);
 
-    const [prompt] = (ctx.llm.askStructured as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    const prompt = mainExtractionPrompt(ctx.llm.askStructured as ReturnType<typeof vi.fn>);
     // 五轮对话的发言人 + 关键内容都进了 prompt
     expect(prompt).toContain('[产品经理]:');
     expect(prompt).toContain('[开发]:');
     expect(prompt).toContain('项目协作助手');
     expect(prompt).toContain('飞书 Docx');
     expect(prompt).toContain('多端');
-    // 多轮场景下不包含「关联文档」section
-    expect(prompt).not.toContain('关联文档：');
+    // 多轮场景下不包含「关联文档（主要依据）」段落
+    expect(prompt).not.toContain('关联文档（**主要依据**）');
   });
 });
 
@@ -261,8 +334,8 @@ describe('requirementDocSkill.run() — single doc link scenario', () => {
 
     expect(ctx.docx.readContent).toHaveBeenCalledWith(SCENARIO_DOC_LINK_DOCTOKEN, 'doc');
 
-    const [prompt] = (ctx.llm.askStructured as ReturnType<typeof vi.fn>).mock.calls[0]!;
-    expect(prompt).toContain('关联文档：');
+    const prompt = mainExtractionPrompt(ctx.llm.askStructured as ReturnType<typeof vi.fn>);
+    expect(prompt).toContain('关联文档');
     expect(prompt).toContain(SCENARIO_DOC_LINK_BODY.split('\n')[0]!); // 「项目名称：飞书 AI 项目协作助手」
     expect(prompt).toContain('https://feishu.cn/docx/doxcnPRDABCDEF');
   });
@@ -314,12 +387,12 @@ describe('requirementDocSkill.run() — combo (chat + linked wiki) scenario', ()
 
     expect(ctx.docx.readContent).toHaveBeenCalledWith(SCENARIO_COMBO_WIKITOKEN, 'wiki');
 
-    const [prompt] = (ctx.llm.askStructured as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    const prompt = mainExtractionPrompt(ctx.llm.askStructured as ReturnType<typeof vi.fn>);
     // 聊天部分
     expect(prompt).toContain('我整理了下我们想做的东西');
     expect(prompt).toContain('@bot 能帮整理成 PRD 吗');
     // wiki 正文
-    expect(prompt).toContain('关联文档：');
+    expect(prompt).toContain('关联文档');
     expect(prompt).toContain('项目方案 v3');
   });
 });
@@ -335,8 +408,12 @@ describe('requirementDocSkill.run() — error paths', () => {
           start: vi.fn(),
           stop: vi.fn(),
           sendText: vi.fn(),
-          sendCard: vi.fn(),
-          patchCard: vi.fn(),
+          sendCard: vi
+            .fn()
+            .mockResolvedValue(
+              ok({ messageId: 'loading_msg_001', chatId: 'oc_chat_001', timestamp: 0 }),
+            ),
+          patchCard: vi.fn().mockResolvedValue(ok(undefined)),
           fetchHistory: vi
             .fn()
             .mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'history fetch failed'))),
@@ -372,7 +449,16 @@ describe('requirementDocSkill.run() — error paths', () => {
     if (!result.ok) expect(result.error.code).toBe(ErrorCode.LLM_TIMEOUT);
     expect(ctx.docx.createFromMarkdown).not.toHaveBeenCalled();
     expect(ctx.bitable.insert).not.toHaveBeenCalled();
-    expect(ctx.cardBuilder.build).not.toHaveBeenCalled();
+    // loading 卡片仍然会发；但不应进入终态 card（不带 isLoading 也不带 errorMessage）
+    expect(ctx.cardBuilder.build).not.toHaveBeenCalledWith(
+      'docPush',
+      expect.objectContaining({ summary: expect.any(String), docUrl: expect.stringContaining('feishu') }),
+    );
+    // 应该 patch 成 error 卡片
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'docPush',
+      expect.objectContaining({ errorMessage: expect.stringContaining('llm timed out') }),
+    );
   });
 
   it('returns err when docx.createFromMarkdown fails; memory not written, card not built', async () => {
@@ -397,7 +483,15 @@ describe('requirementDocSkill.run() — error paths', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe(ErrorCode.FEISHU_API_ERROR);
     expect(ctx.bitable.insert).not.toHaveBeenCalled();
-    expect(ctx.cardBuilder.build).not.toHaveBeenCalled();
+    // 同上：loading + error 卡片会 build；但不应进入「文档已生成」终态
+    expect(ctx.cardBuilder.build).not.toHaveBeenCalledWith(
+      'docPush',
+      expect.objectContaining({ docUrl: expect.stringContaining('feishu') }),
+    );
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'docPush',
+      expect.objectContaining({ errorMessage: expect.stringContaining('docx create failed') }),
+    );
   });
 
   it('still returns ok when bitable.insert fails (degrades gracefully)', async () => {

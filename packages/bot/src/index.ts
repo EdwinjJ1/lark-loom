@@ -23,12 +23,19 @@ const logger: Logger = {
   error: (msg, meta) => console.error(`[bot] ${msg}`, meta ?? ''),
 };
 
+// 防御性读 env：trim 掉 trailing space / \r / \t
+// 用户复制粘贴 .env 时常带尾随空白；用 token / table_id 拼到 URL 里会直接挂掉
+// 飞书 API（曾导致 BITABLE 写入静默失败）。
+function envTrim(name: string): string {
+  return (process.env[name] ?? '').trim();
+}
+
 function buildDeps() {
-  const appId = process.env['LARK_APP_ID'];
-  const appSecret = process.env['LARK_APP_SECRET'];
-  const bitableAppToken = process.env['LARK_BITABLE_APP_TOKEN'] ?? process.env['BITABLE_APP_TOKEN'];
+  const appId = envTrim('LARK_APP_ID');
+  const appSecret = envTrim('LARK_APP_SECRET');
+  const bitableAppToken = envTrim('LARK_BITABLE_APP_TOKEN') || envTrim('BITABLE_APP_TOKEN');
   const memoryTableId =
-    process.env['LARK_BITABLE_MEMORY_TABLE_ID'] ?? process.env['BITABLE_TABLE_MEMORY'];
+    envTrim('LARK_BITABLE_MEMORY_TABLE_ID') || envTrim('BITABLE_TABLE_MEMORY');
   if (!appId) throw new Error('Missing env var: LARK_APP_ID');
   if (!appSecret) throw new Error('Missing env var: LARK_APP_SECRET');
   if (!bitableAppToken) throw new Error('Missing env var: LARK_BITABLE_APP_TOKEN');
@@ -46,14 +53,14 @@ function buildDeps() {
     );
   }
 
-  const runtime = createBotRuntime();
-  const router = new SkillRouter(process.env['LARK_BOT_OPEN_ID'] ?? '');
+  const runtime = createBotRuntime({ logger });
+  const router = new SkillRouter(envTrim('LARK_BOT_OPEN_ID'));
 
   const llm = new VolcanoLLMClient({
-    apiKey: process.env['ARK_API_KEY'] ?? '',
+    apiKey: envTrim('ARK_API_KEY'),
     modelIds: {
-      lite: process.env['ARK_MODEL_LITE'] ?? '',
-      pro: process.env['ARK_MODEL_PRO'] ?? '',
+      lite: envTrim('ARK_MODEL_LITE'),
+      pro: envTrim('ARK_MODEL_PRO'),
     },
   });
 
@@ -63,9 +70,9 @@ function buildDeps() {
     appToken: bitableAppToken,
     tableIds: {
       memory: memoryTableId,
-      decision: process.env['BITABLE_TABLE_DECISION'] ?? '',
-      todo: process.env['BITABLE_TABLE_TODO'] ?? '',
-      knowledge: process.env['BITABLE_TABLE_KNOWLEDGE'] ?? '',
+      decision: envTrim('BITABLE_TABLE_DECISION'),
+      todo: envTrim('BITABLE_TABLE_TODO'),
+      knowledge: envTrim('BITABLE_TABLE_KNOWLEDGE'),
     },
   });
 

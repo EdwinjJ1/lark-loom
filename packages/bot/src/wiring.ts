@@ -1,16 +1,33 @@
-import type { ChatMessage, LLMClient, Skill, SkillContext, SkillName } from '@seedhac/contracts';
+import type {
+  ChatMessage,
+  LLMClient,
+  LLMTool,
+  Skill,
+  SkillContext,
+  SkillName,
+  ToolCall,
+  ToolResult,
+} from '@seedhac/contracts';
 import type { Message } from '@seedhac/contracts';
 import type { RouteIntent } from './skill-router.js';
 import type { SkillRouter } from './skill-router.js';
 import type { IMemoryStore } from './memory/memory-store.js';
 import { getLLMTools, makeExecutor } from './memory/tool-handlers.js';
 import type { SystemPromptCache } from './memory/system-prompt.js';
+import { handleBotJoinedChat, handleOnboardingAction } from './onboarding.js';
 
 export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   qa: 'qa',
   meetingNotes: 'summary',
   slides: 'slides',
+  requirementDoc: 'requirementDoc',
 };
+
+/**
+ * 这些 intent 没有对应 skill，但仍要把消息写进 bitable.memory，
+ * 供后续 qa / docIterate / recall 检索。fire-and-forget，失败仅 warn。
+ */
+const SIDE_EFFECT_INTENTS = new Set<RouteIntent>(['taskAssignment', 'progressUpdate']);
 
 export interface HarnessConfig {
   readonly promptCache: SystemPromptCache;
@@ -41,6 +58,14 @@ export async function handleEvent(
     await handleSchedule(ctx, skills);
     return;
   }
+  // bot 入群 → 立刻发 onboarding 卡（issue #98 数据使用告知 + 启用按钮）
+  if (event.type === 'botJoinedChat') {
+    await handleBotJoinedChat(ctx, {
+      chatId: event.payload.chatId,
+      inviterUserId: event.payload.inviter.userId,
+    });
+    return;
+  }
   if (event.type !== 'message') return;
 
   const msg = event.payload;
@@ -55,7 +80,15 @@ export async function handleEvent(
     return;
   }
 
-  // 非 @mention：保持原有 Skill 路由
+  // 非 @mention：原有 Skill 路由 + 被动 memory 观察（并行，不阻塞）
+  if (harness && shouldObservePassively(msg.text)) {
+    void handlePassiveObserve(ctx, msg, harness).catch((e) => {
+      logger.warn('passive observe threw', {
+        chatId: msg.chatId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    });
+  }
   await handleWithSkillRouter(ctx, router, skills);
 }
 
@@ -64,10 +97,45 @@ async function handleWithSkillRouter(
   router: SkillRouter,
   skills: Readonly<Partial<Record<SkillName, Skill>>>,
 ): Promise<void> {
-  const { event } = ctx;
+  const { event, logger } = ctx;
   if (event.type !== 'message') return;
   const msg = event.payload;
   const intent = router.route(msg);
+
+  // taskAssignment / progressUpdate 没对应 skill，但仍把消息写进 memory 表，
+  // 供后续 qa / docIterate / recall 检索。fire-and-forget。
+  // 必须同时挂 .then() 和 .catch()：底层网络/认证异常时 bitable.insert
+  // 可能直接 reject 而不是返回 err Result，没 .catch() 会触发
+  // unhandled rejection（Node 18+ 默认 --unhandled-rejections=strict 会终止进程）。
+  if (SIDE_EFFECT_INTENTS.has(intent)) {
+    void ctx.bitable
+      .insert({
+        table: 'memory',
+        row: {
+          chatId: msg.chatId,
+          type: intent,
+          content: msg.text,
+          timestamp: Date.now(),
+        },
+      })
+      .then((res) => {
+        if (!res.ok) {
+          logger.warn('bitable insert failed', {
+            intent,
+            code: res.error.code,
+            message: res.error.message,
+          });
+        }
+      })
+      .catch((e: unknown) => {
+        logger.warn('bitable insert threw', {
+          intent,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      });
+    return;
+  }
+
   const skillName = intentToSkill[intent];
   if (!skillName) return;
   const skill = skills[skillName];
@@ -272,6 +340,7 @@ async function handleWithHarness(
   const systemPrompt = harness.promptCache.build({ chatId, mention: true });
   const executor = makeExecutor({
     store: harness.memoryStore,
+    skills: registeredSkillValues(skills),
     chatId,
     logger,
     docsRoot: harness.docsRoot,
@@ -292,6 +361,7 @@ async function handleWithHarness(
   const result = await llm.chatWithTools(messages, {
     tools: getLLMTools(),
     executor,
+    timeoutMs: 60_000,
   });
 
   if (!result.ok) {
@@ -369,6 +439,12 @@ function registeredSkillNames(
   return Object.keys(skills).filter((name): name is SkillName => isSkillName(name, skills));
 }
 
+function registeredSkillValues(
+  skills: Readonly<Partial<Record<SkillName, Skill>>>,
+): readonly Skill[] {
+  return registeredSkillNames(skills).map((name) => skills[name]!);
+}
+
 function isSkillName(
   value: string,
   skills: Readonly<Partial<Record<SkillName, Skill>>>,
@@ -407,6 +483,13 @@ async function handleCardAction(
   const { event, logger, runtime } = ctx;
   if (event.type !== 'cardAction') return;
   const action = event.payload.value['action'];
+
+  // onboarding（issue #98）：activation 卡按钮被点击
+  if (action === 'activate' || action === 'dismiss') {
+    await handleOnboardingAction(ctx, action);
+    return;
+  }
+
   if (action !== 'qa.reanswer') return;
 
   const chatId = String(event.payload.value['chatId'] ?? event.payload.chatId);
@@ -456,4 +539,97 @@ async function handleSchedule(
   }
   if (!(await skill.match(ctx))) return;
   await runSkill(ctx, skill);
+}
+
+// ─── 被动 memory 观察 ─────────────────────────────────────────────────────────
+//
+// 设计：非 @mention 的消息也可能含有值得长期记忆的事实（项目背景/PRD/分工/截止日期）。
+// 关键字门先粗筛，命中再调一个轻量 LLM（只暴露 memory.write 一个工具），不发任何回复。
+// 失败/超时静默 warn，不阻塞 SkillRouter 的主路径。
+
+const PASSIVE_MEMORY_KEYWORDS_RE =
+  /项目|需求|PRD|目标用户|背景|MVP|交付|deadline|截止|分工|负责|决定|确定|结论|文档/i;
+
+const PASSIVE_MIN_TEXT_LENGTH = 12;
+
+const MEMORY_WRITE_TOOL_NAME = 'memory.write';
+
+export function shouldObservePassively(text: string): boolean {
+  // 太短的消息（"好的""嗯"）一律跳过
+  if (text.trim().length < PASSIVE_MIN_TEXT_LENGTH) return false;
+  return PASSIVE_MEMORY_KEYWORDS_RE.test(text);
+}
+
+async function handlePassiveObserve(
+  ctx: SkillContext,
+  msg: Message,
+  harness: HarnessConfig,
+): Promise<void> {
+  const { llm, logger } = ctx;
+  const chatId = msg.chatId;
+
+  // 只暴露 memory.write，不暴露 search/read/skill.* — 避免模型走偏
+  const writeTool = getLLMTools().find((t) => t.name === MEMORY_WRITE_TOOL_NAME);
+  if (!writeTool) {
+    logger.warn('passive observe: memory.write tool missing', { chatId });
+    return;
+  }
+
+  const executor = makeExecutor({
+    store: harness.memoryStore,
+    chatId,
+    logger,
+    docsRoot: harness.docsRoot,
+    sourceSkill: 'passive_observe',
+  });
+
+  const systemPrompt =
+    '你是一个静默的记忆观察者。读到的消息**不要回复用户**。\n' +
+    '如果消息包含值得群组长期记住的事实（项目目标/用户群体/截止日期/分工/关键文档/重要决策），' +
+    '调用 memory.write 写入；importance 只在很重要时（≥7）才指定。\n' +
+    '若消息是闲聊/重复/没有事实信息，什么都不调，直接输出 SKIP。';
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: msg.text },
+  ];
+
+  const result = await observeWithTimeout(
+    llm,
+    messages,
+    [writeTool],
+    executor,
+    30_000, // 被动观察用更短超时，30s 还回不来就放弃
+  );
+
+  if (!result.ok) {
+    logger.warn('passive observe failed', {
+      chatId,
+      code: result.error.code,
+      message: result.error.message,
+    });
+    return;
+  }
+
+  logger.info('passive observe done', {
+    chatId,
+    rounds: result.value.rounds,
+    toolCallCount: result.value.toolCalls.length,
+  });
+}
+
+async function observeWithTimeout(
+  llm: LLMClient,
+  messages: readonly ChatMessage[],
+  tools: readonly LLMTool[],
+  executor: (call: ToolCall) => Promise<ToolResult>,
+  timeoutMs: number,
+): ReturnType<LLMClient['chatWithTools']> {
+  return llm.chatWithTools(messages, {
+    tools,
+    executor,
+    maxToolCallRounds: 2, // 被动观察最多 2 轮（一次调 write + 一次确认）
+    model: 'lite', // 被动用便宜模型
+    timeoutMs,
+  });
 }
