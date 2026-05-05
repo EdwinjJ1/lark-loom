@@ -53,6 +53,13 @@ export interface ActivationCardInput {
   readonly chatName: string;
   /** 可选：展示给管理员的一句话说明 */
   readonly description?: string;
+  // 卡片三态：未确认 / 已启用 / 已忽略 —— confirmed* 与 dismissed* 互斥
+  /** 启用状态：点击者 displayName 或 open_id */
+  readonly confirmedBy?: string;
+  readonly confirmedAt?: number;
+  /** 忽略状态 */
+  readonly dismissedBy?: string;
+  readonly dismissedAt?: number;
 }
 
 export interface DocPushCardInput {

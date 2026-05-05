@@ -14,6 +14,7 @@ import type { SkillRouter } from './skill-router.js';
 import type { IMemoryStore } from './memory/memory-store.js';
 import { getLLMTools, makeExecutor } from './memory/tool-handlers.js';
 import type { SystemPromptCache } from './memory/system-prompt.js';
+import { handleBotJoinedChat, handleOnboardingAction } from './onboarding.js';
 
 export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   qa: 'qa',
@@ -51,6 +52,14 @@ export async function handleEvent(
   const { event, logger } = ctx;
   if (event.type === 'cardAction') {
     await handleCardAction(ctx, skills);
+    return;
+  }
+  // bot 入群 → 立刻发 onboarding 卡（issue #98 数据使用告知 + 启用按钮）
+  if (event.type === 'botJoinedChat') {
+    await handleBotJoinedChat(ctx, {
+      chatId: event.payload.chatId,
+      inviterUserId: event.payload.inviter.userId,
+    });
     return;
   }
   if (event.type !== 'message') return;
@@ -321,6 +330,13 @@ async function handleCardAction(
   const { event, logger, runtime } = ctx;
   if (event.type !== 'cardAction') return;
   const action = event.payload.value['action'];
+
+  // onboarding（issue #98）：activation 卡按钮被点击
+  if (action === 'activate' || action === 'dismiss') {
+    await handleOnboardingAction(ctx, action);
+    return;
+  }
+
   if (action !== 'qa.reanswer') return;
 
   const chatId = String(event.payload.value['chatId'] ?? event.payload.chatId);
