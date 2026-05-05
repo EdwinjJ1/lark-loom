@@ -245,14 +245,20 @@ describe('handleEvent wiring', () => {
     await handleEvent(ctx, router, { qa: skill } as unknown as Record<SkillName, Skill>);
     await vi.waitFor(() => expect(memoryStore.write).toHaveBeenCalledTimes(2));
 
-    expect(memoryStore.write).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ kind: 'skill_log', source_skill: 'qa', importance: 7 }),
+    // skill_log + chat 并行写入；不显式传 importance（让 store 异步 LLM 评分）。
+    const writeKinds = memoryStore.write.mock.calls.map(
+      (call) => (call[0] as { kind: string }).kind,
     );
-    expect(memoryStore.write).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ kind: 'chat', source_skill: 'qa', importance: 5 }),
+    expect(writeKinds.sort()).toEqual(['chat', 'skill_log']);
+    expect(memoryStore.write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'skill_log', source_skill: 'qa' }),
     );
+    expect(memoryStore.write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'chat', source_skill: 'qa' }),
+    );
+    for (const call of memoryStore.write.mock.calls) {
+      expect((call[0] as { importance?: number }).importance).toBeUndefined();
+    }
   });
 
   it('schedule event sends selected skill output to the scheduled chat', async () => {

@@ -34,6 +34,18 @@ function buildDeps() {
   if (!bitableAppToken) throw new Error('Missing env var: LARK_BITABLE_APP_TOKEN');
   if (!memoryTableId) throw new Error('Missing env var: LARK_BITABLE_MEMORY_TABLE_ID');
 
+  // 旧名 BITABLE_* 仍是兼容 fallback；显式提示用户迁移到 LARK_BITABLE_*。
+  if (!process.env['LARK_BITABLE_APP_TOKEN'] && process.env['BITABLE_APP_TOKEN']) {
+    logger.warn(
+      'env: BITABLE_APP_TOKEN is deprecated, please rename to LARK_BITABLE_APP_TOKEN in .env',
+    );
+  }
+  if (!process.env['LARK_BITABLE_MEMORY_TABLE_ID'] && process.env['BITABLE_TABLE_MEMORY']) {
+    logger.warn(
+      'env: BITABLE_TABLE_MEMORY is deprecated, please rename to LARK_BITABLE_MEMORY_TABLE_ID in .env',
+    );
+  }
+
   const runtime = createBotRuntime();
   const router = new SkillRouter(process.env['LARK_BOT_OPEN_ID'] ?? '');
 

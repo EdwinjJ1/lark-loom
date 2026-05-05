@@ -126,6 +126,10 @@ function writeSkillMemory(
   void writeSkillMemoryNow(ctx, skill, result);
 }
 
+// 自动写入的 skill_log / chat 记忆 input 上限：JSON.stringify 后还要嵌进 2KB content，
+// 给 reason/output/skill/at 留余量后单字段最多 500 字符。
+const AUTO_MEMORY_INPUT_MAX = 500;
+
 async function writeSkillMemoryNow(
   ctx: SkillContext,
   skill: Skill,
@@ -136,14 +140,15 @@ async function writeSkillMemoryNow(
   const { chatId, userId, eventKey } = memoryEventIdentity(ctx);
   const now = Date.now();
   const summary = summarizeSkillResult(skill, result);
+  const baseUserField = userId ? { user_id: safeMemoryKey(userId) } : {};
 
-  const skillLog = await memoryStore.write({
+  // 不显式传 importance —— MemoryStore.write 会异步调 LLM 评分。
+  const skillLogPromise = memoryStore.write({
     kind: 'skill_log',
     chat_id: chatId,
     key: safeMemoryKey(`skill:${skill.name}:${eventKey}:${now}`),
-    ...(userId ? { user_id: safeMemoryKey(userId) } : {}),
+    ...baseUserField,
     source_skill: skill.name,
-    importance: 7,
     content: JSON.stringify({
       skill: skill.name,
       reason: result.reasoning ?? '',
@@ -151,6 +156,29 @@ async function writeSkillMemoryNow(
       at: now,
     }),
   });
+
+  const writeChatMemory = skill.name === 'qa' || skill.name === 'summary';
+  const chatPromise = writeChatMemory
+    ? memoryStore.write({
+        kind: 'chat',
+        chat_id: chatId,
+        key: safeMemoryKey(`chat:${skill.name}:${eventKey}:${now}`),
+        ...baseUserField,
+        source_skill: skill.name,
+        content: JSON.stringify({
+          skill: skill.name,
+          input:
+            ctx.event.type === 'message'
+              ? ctx.event.payload.text.slice(0, AUTO_MEMORY_INPUT_MAX)
+              : '',
+          output: summary,
+          reason: result.reasoning ?? '',
+          at: now,
+        }),
+      })
+    : null;
+
+  const [skillLog, chatWrite] = await Promise.all([skillLogPromise, chatPromise]);
   if (!skillLog.ok) {
     ctx.logger.warn('memory auto-write skill_log failed', {
       skill: skill.name,
@@ -158,24 +186,7 @@ async function writeSkillMemoryNow(
       message: skillLog.error.message,
     });
   }
-
-  if (skill.name !== 'qa' && skill.name !== 'summary') return;
-  const chatWrite = await memoryStore.write({
-    kind: 'chat',
-    chat_id: chatId,
-    key: safeMemoryKey(`chat:${skill.name}:${eventKey}:${now}`),
-    ...(userId ? { user_id: safeMemoryKey(userId) } : {}),
-    source_skill: skill.name,
-    importance: skill.name === 'summary' ? 7 : 5,
-    content: JSON.stringify({
-      skill: skill.name,
-      input: ctx.event.type === 'message' ? ctx.event.payload.text : '',
-      output: summary,
-      reason: result.reasoning ?? '',
-      at: now,
-    }),
-  });
-  if (!chatWrite.ok) {
+  if (chatWrite && !chatWrite.ok) {
     ctx.logger.warn('memory auto-write chat failed', {
       skill: skill.name,
       code: chatWrite.error.code,

@@ -25,6 +25,9 @@ interface WeeklySnapshot {
   readonly summary: string;
 }
 
+// LLM JSON 解析失败时，从原始 logs 拼凑一个简易快照——只取前 N 条避免内容溢出。
+const FALLBACK_LOG_LIMIT = 6;
+
 function weekRange(now: number): string {
   const d = new Date(now);
   const day = d.getDay() === 0 ? 7 : d.getDay();
@@ -34,6 +37,30 @@ function weekRange(now: number): string {
   end.setDate(start.getDate() + 6);
   const fmt = (x: Date) => x.toISOString().slice(0, 10);
   return `${fmt(start)} ~ ${fmt(end)}`;
+}
+
+interface WeeklyCachedSnapshot {
+  readonly weekRange: string;
+  readonly title?: string;
+  readonly highlights?: readonly string[];
+  readonly decisions?: readonly string[];
+  readonly todos?: readonly string[];
+}
+
+function parseCachedSnapshot(content: string): WeeklyCachedSnapshot | null {
+  try {
+    const parsed = JSON.parse(content) as Partial<WeeklyCachedSnapshot>;
+    if (typeof parsed.weekRange !== 'string') return null;
+    return {
+      weekRange: parsed.weekRange,
+      ...(typeof parsed.title === 'string' && { title: parsed.title }),
+      ...(Array.isArray(parsed.highlights) && { highlights: parsed.highlights.map(String) }),
+      ...(Array.isArray(parsed.decisions) && { decisions: parsed.decisions.map(String) }),
+      ...(Array.isArray(parsed.todos) && { todos: parsed.todos.map(String) }),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function renderLogs(logs: readonly MemoryRecord[]): string {
@@ -61,7 +88,9 @@ function parseSnapshot(raw: string, logs: readonly MemoryRecord[]): WeeklySnapsh
       summary,
     };
   } catch {
-    const fallback = logs.slice(0, 6).map((m) => `${m.source_skill}: ${m.content.slice(0, 80)}`);
+    const fallback = logs
+      .slice(0, FALLBACK_LOG_LIMIT)
+      .map((m) => `${m.source_skill}: ${m.content.slice(0, 80)}`);
     return {
       title: '项目周快照',
       highlights: fallback,
@@ -142,6 +171,27 @@ export const weeklySkill: Skill = {
       return err(makeError(ErrorCode.INVALID_INPUT, 'weekly requires chatId'));
     }
 
+    const range = weekRange(Date.now());
+    const weekKey = `weekly:${range.slice(0, 10)}`;
+
+    // 当周已生成过快照 → 直接重发，避免 cron + 手动重复触发把 skill_log 删完。
+    const existing = await memoryStore.read('project', chatId, weekKey);
+    if (existing.ok && existing.value) {
+      const cached = parseCachedSnapshot(existing.value.content);
+      if (cached && cached.weekRange === range) {
+        const cachedCard = ctx.cardBuilder.build('weekly', {
+          weekRange: range,
+          highlights: cached.highlights ?? [],
+          decisions: cached.decisions ?? [],
+          todos: cached.todos ?? [],
+        });
+        return ok({
+          card: cachedCard,
+          reasoning: '本周快照已存在，直接重发缓存版本',
+        });
+      }
+    }
+
     const logsResult = await memoryStore.list({
       chatId,
       kind: 'skill_log',
@@ -162,11 +212,10 @@ export const weeklySkill: Skill = {
     if (!llmResult.ok) return err(llmResult.error);
 
     const snapshot = parseSnapshot(llmResult.value, logs);
-    const range = weekRange(Date.now());
     const writeResult = await memoryStore.write({
       kind: 'project',
       chat_id: chatId,
-      key: `weekly:${range.slice(0, 10)}`,
+      key: weekKey,
       source_skill: 'weekly',
       importance: 9,
       content: JSON.stringify({
