@@ -22,6 +22,12 @@ export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   requirementDoc: 'requirementDoc',
 };
 
+/**
+ * 这些 intent 没有对应 skill，但仍要把消息写进 bitable.memory，
+ * 供后续 qa / docIterate / recall 检索。fire-and-forget，失败仅 warn。
+ */
+const SIDE_EFFECT_INTENTS = new Set<RouteIntent>(['taskAssignment', 'progressUpdate']);
+
 export interface HarnessConfig {
   readonly promptCache: SystemPromptCache;
   readonly memoryStore: IMemoryStore;
@@ -78,10 +84,36 @@ async function handleWithSkillRouter(
   router: SkillRouter,
   skills: Readonly<Partial<Record<SkillName, Skill>>>,
 ): Promise<void> {
-  const { event } = ctx;
+  const { event, logger } = ctx;
   if (event.type !== 'message') return;
   const msg = event.payload;
   const intent = router.route(msg);
+
+  // taskAssignment / progressUpdate 没对应 skill，但仍把消息写进 memory 表，
+  // 供后续 qa / docIterate / recall 检索。fire-and-forget。
+  if (SIDE_EFFECT_INTENTS.has(intent)) {
+    void ctx.bitable
+      .insert({
+        table: 'memory',
+        row: {
+          chatId: msg.chatId,
+          type: intent,
+          content: msg.text,
+          timestamp: Date.now(),
+        },
+      })
+      .then((res) => {
+        if (!res.ok) {
+          logger.warn('bitable insert failed', {
+            intent,
+            code: res.error.code,
+            message: res.error.message,
+          });
+        }
+      });
+    return;
+  }
+
   const skillName = intentToSkill[intent];
   if (!skillName) return;
   const skill = skills[skillName];
