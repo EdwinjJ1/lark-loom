@@ -509,3 +509,179 @@ describe('handleEvent wiring', () => {
     expect(runtime.sendText).toHaveBeenCalledWith({ chatId: 'oc_chat1', text: 'fallback answer' });
   });
 });
+
+// ─── Onboarding（issue #98 数据使用告知）─────────────────────────────────────
+
+describe('onboarding flow', () => {
+  const router = new SkillRouter(BOT_ID);
+
+  it('botJoinedChat → sends activation card', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'botJoinedChat',
+      payload: {
+        chatId: 'oc_new_chat',
+        inviter: { userId: 'ou_admin', name: '管理员' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'activation',
+      expect.objectContaining({ chatName: expect.any(String) }),
+    );
+    expect(runtime.sendCard).toHaveBeenCalledWith(
+      expect.objectContaining({ chatId: 'oc_new_chat' }),
+    );
+    // 不应当发普通文本（onboarding 只发卡片）
+    expect(runtime.sendText).not.toHaveBeenCalled();
+  });
+
+  it('cardAction "activate" patches card to confirmed state + writes audit memory', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        user: { userId: 'ou_admin', name: '张三' },
+        value: { action: 'activate', chatName: '测试群' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    // patch 卡片成 confirmed 态
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'activation',
+      expect.objectContaining({
+        chatName: '测试群',
+        confirmedBy: '张三',
+        confirmedAt: expect.any(Number),
+      }),
+    );
+    expect(runtime.patchCard).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'msg_activation' }),
+    );
+    // audit memory 写入
+    expect(ctx.bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'memory',
+        row: expect.objectContaining({
+          kind: 'project',
+          chat_id: 'oc_chat1',
+          source_skill: 'onboarding',
+          content: expect.stringContaining('activate'),
+        }),
+      }),
+    );
+  });
+
+  it('cardAction "dismiss" patches to dismissed state', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        user: { userId: 'ou_user', name: '李四' },
+        value: { action: 'dismiss' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    expect(ctx.cardBuilder.build).toHaveBeenCalledWith(
+      'activation',
+      expect.objectContaining({
+        dismissedBy: '李四',
+        dismissedAt: expect.any(Number),
+      }),
+    );
+    expect(runtime.patchCard).toHaveBeenCalledOnce();
+    expect(ctx.bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        row: expect.objectContaining({
+          source_skill: 'onboarding',
+          content: expect.stringContaining('dismiss'),
+        }),
+      }),
+    );
+  });
+
+  // 隐私回归：飞书 cardAction 不传 user.name 时，patch 卡片绝不能 fallback 到 userId
+  // （PR #99 第一版上线后实战发现 open_id 露出，issue #98 review fix）
+  it('cardAction without user.name uses generic placeholder, never leaks userId', async () => {
+    const runtime = makeRuntime();
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        // user.name 缺失（飞书在 cardAction 中常见情况）
+        user: { userId: 'ou_702fcccb0dc6807c067a885ff71b03f1' },
+        value: { action: 'activate', chatName: '测试群' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    // 调用 cardBuilder.build 时 confirmedBy 应该是通用占位，**不是** open_id
+    const buildCalls = (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mock.calls;
+    const lastCall = buildCalls[buildCalls.length - 1];
+    expect(lastCall![1]).toMatchObject({ confirmedBy: '管理员' });
+    expect(lastCall![1].confirmedBy).not.toContain('ou_'); // 永远不能 fallback 到 open_id
+  });
+
+  it('audit memory still written even when patchCard fails', async () => {
+    const runtime = makeRuntime();
+    runtime.patchCard = vi
+      .fn()
+      .mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'patch failed')));
+    const event: BotEvent = {
+      type: 'cardAction',
+      payload: {
+        chatId: 'oc_chat1',
+        messageId: 'msg_activation',
+        user: { userId: 'ou_admin', name: '张三' },
+        value: { action: 'activate', chatName: '测试群' },
+        timestamp: Date.now(),
+      },
+    };
+    const ctx = makeCtx(event, runtime);
+    (ctx.cardBuilder.build as ReturnType<typeof vi.fn>).mockReturnValue({
+      templateName: 'activation',
+      content: { built: true },
+    });
+
+    await handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>);
+
+    // patchCard 挂了，但 audit memory 仍然写入
+    expect(ctx.bitable.insert).toHaveBeenCalledOnce();
+  });
+});
