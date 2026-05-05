@@ -160,38 +160,39 @@ function buildActivation(input: ActivationCardInput): Card {
   const isConfirmed = input.confirmedBy !== undefined && input.confirmedAt !== undefined;
   const isDismissed = input.dismissedBy !== undefined && input.dismissedAt !== undefined;
 
-  const headerTitle = isConfirmed
-    ? '✅ Lark Loom 已启用'
-    : isDismissed
-      ? 'Lark Loom 已暂停'
-      : '👋 Lark Loom 加入了群聊';
+  // 状态用 template color 区分：blue 初始 / green 已启用 / grey 已暂停。
+  // header 标题始终是产品名，避免 "Lark Loom 已启用 Lark Loom" 这种重复。
   const headerColor = isConfirmed ? 'green' : isDismissed ? 'grey' : 'blue';
 
-  // 简洁两行：功能 + 数据使用。参考 Slack apps / MS Teams bots 的 onboarding
-  // 模式 —— 一句话功能 + 一句话 data use，单主 CTA，不堆段落。
-  const intro = md('自动整理 **项目需求 / 决策 / 行动项**，无需 @ 即可触发。');
+  // 参考 ChatGPT for Slack / Linear / Notion AI 的 onboarding 模式：
+  //   - 第一人称功能描述，去 "你好！" 这种对话化开头
+  //   - disclosure 一句话，不 meta-描述 disclosure 本身
+  //   - 中性按钮文案，无 emoji 杂质（状态用 template color 表达）
+  const intro = md(
+    '我会分析群聊内容，将 **项目需求 / 决策 / 行动项** 自动整理至团队飞书多维表格。',
+  );
   const disclosure = md(
-    '🔒 **数据使用**：本助手会读取群聊文本，调用大模型分析后写入团队飞书多维表格。所有群成员可见此告知。',
+    '**数据使用**：群聊文本将通过大模型分析，分析结果可在多维表格中查看。',
   );
 
   const elements: BodyElement[] = [intro, disclosure];
 
   if (isConfirmed) {
     const time = formatTime(input.confirmedAt!);
-    elements.push(hr(), md(`✅ 由 **${input.confirmedBy}** 于 ${time} 启用`));
+    elements.push(hr(), md(`已由 **${input.confirmedBy}** 于 ${time} 启用`));
   } else if (isDismissed) {
     const time = formatTime(input.dismissedAt!);
-    elements.push(hr(), md(`⏸ 由 **${input.dismissedBy}** 于 ${time} 暂停 · @ 我可重新启用`));
+    elements.push(hr(), md(`已由 **${input.dismissedBy}** 于 ${time} 暂停 · @ 我可重新启用`));
   } else {
     elements.push(
       btn('启用 Lark Loom', { action: 'activate', chatName: input.chatName }, 'primary'),
-      btn('暂不需要', { action: 'dismiss' }, 'default'),
+      btn('稍后', { action: 'dismiss' }, 'default'),
     );
   }
 
   return card('activation', {
     schema: '2.0',
-    header: { title: pt(headerTitle), template: headerColor },
+    header: { title: pt('Lark Loom'), template: headerColor },
     body: { elements },
   });
 }
