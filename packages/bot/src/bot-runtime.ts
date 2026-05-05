@@ -12,6 +12,7 @@ import {
   type FetchHistoryResult,
   type FetchMembersParams,
   type FetchMembersResult,
+  type Logger,
   type Message,
   type Mention,
   type UserRef,
@@ -22,8 +23,12 @@ import {
   makeError,
   ErrorCode,
 } from '@seedhac/contracts';
+import { type QuotaTracker, globalQuotaTracker, withRateLimitRetry } from './rate-limit.js';
 
 // ─── 限流器：100 req/min + 5 req/sec ─────────────────────────────────────────
+//
+// Layer B（issue #91）：QuotaTracker.isThrottled() 时把 sec/min 配额减半，
+// 主动收紧本地限流，配合 withRateLimitRetry 的事后退避形成双层防护。
 
 class RateLimiter {
   private secTokens = 5;
@@ -32,6 +37,8 @@ class RateLimiter {
   private lastMin = Date.now();
   private readonly queue: Array<() => void> = [];
   private processing = false;
+
+  constructor(private readonly tracker: QuotaTracker = globalQuotaTracker) {}
 
   acquire(): Promise<void> {
     return new Promise((resolve) => {
@@ -57,9 +64,12 @@ class RateLimiter {
 
   private refill(): void {
     const now = Date.now();
-    this.secTokens = Math.min(5, this.secTokens + ((now - this.lastSec) / 1000) * 5);
+    const factor = this.tracker.isThrottled() ? 0.5 : 1;
+    const maxSec = 5 * factor;
+    const maxMin = 100 * factor;
+    this.secTokens = Math.min(maxSec, this.secTokens + ((now - this.lastSec) / 1000) * maxSec);
     this.lastSec = now;
-    this.minTokens = Math.min(100, this.minTokens + ((now - this.lastMin) / 60000) * 100);
+    this.minTokens = Math.min(maxMin, this.minTokens + ((now - this.lastMin) / 60000) * maxMin);
     this.lastMin = now;
   }
 }
@@ -179,7 +189,9 @@ function parseCardAction(data: Record<string, unknown>): CardAction {
 export class LarkBotRuntime implements BotRuntime {
   private readonly client: lark.Client;
   private readonly wsClient: lark.WSClient;
-  private readonly limiter = new RateLimiter();
+  private readonly tracker: QuotaTracker;
+  private readonly limiter: RateLimiter;
+  private readonly logger: Logger | undefined;
   private readonly handlers = new Set<EventHandler>();
   /** patchCard 节流：messageId → 上次 patch 完成的时间 */
   private readonly patchTimes = new Map<string, number>();
@@ -191,6 +203,8 @@ export class LarkBotRuntime implements BotRuntime {
       verificationToken?: string;
       encryptKey?: string;
       logLevel?: lark.LoggerLevel;
+      logger?: Logger;
+      quotaTracker?: QuotaTracker;
     },
   ) {
     this.client = new lark.Client({
@@ -202,6 +216,14 @@ export class LarkBotRuntime implements BotRuntime {
       appSecret: env.appSecret,
       ...(env.logLevel !== undefined && { loggerLevel: env.logLevel }),
     });
+    this.tracker = env.quotaTracker ?? globalQuotaTracker;
+    this.limiter = new RateLimiter(this.tracker);
+    this.logger = env.logger;
+  }
+
+  /** 暴露给测试 / 监控用，运行时可读取当前配额观测。 */
+  getQuotaTracker(): QuotaTracker {
+    return this.tracker;
   }
 
   on(handler: EventHandler): () => void {
@@ -286,15 +308,19 @@ export class LarkBotRuntime implements BotRuntime {
     await this.limiter.acquire();
     try {
       const content = JSON.stringify({ text: params.text });
-      const res = params.replyTo
-        ? await this.client.im.message.reply({
-            path: { message_id: params.replyTo },
-            data: { msg_type: 'text', content },
-          })
-        : await this.client.im.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: { receive_id: params.chatId, msg_type: 'text', content },
-          });
+      const res = await withRateLimitRetry(
+        () =>
+          params.replyTo
+            ? this.client.im.message.reply({
+                path: { message_id: params.replyTo! },
+                data: { msg_type: 'text', content },
+              })
+            : this.client.im.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: params.chatId, msg_type: 'text', content },
+              }),
+        { context: 'sendText', logger: this.logger, tracker: this.tracker },
+      );
 
       if (res.code !== 0) {
         return err(makeError(ErrorCode.FEISHU_API_ERROR, `sendText failed: ${res.msg}`));
@@ -314,15 +340,19 @@ export class LarkBotRuntime implements BotRuntime {
     await this.limiter.acquire();
     try {
       const content = JSON.stringify(params.card.content);
-      const res = params.replyTo
-        ? await this.client.im.message.reply({
-            path: { message_id: params.replyTo },
-            data: { msg_type: 'interactive', content },
-          })
-        : await this.client.im.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: { receive_id: params.chatId, msg_type: 'interactive', content },
-          });
+      const res = await withRateLimitRetry(
+        () =>
+          params.replyTo
+            ? this.client.im.message.reply({
+                path: { message_id: params.replyTo! },
+                data: { msg_type: 'interactive', content },
+              })
+            : this.client.im.message.create({
+                params: { receive_id_type: 'chat_id' },
+                data: { receive_id: params.chatId, msg_type: 'interactive', content },
+              }),
+        { context: 'sendCard', logger: this.logger, tracker: this.tracker },
+      );
 
       if (res.code !== 0) {
         return err(makeError(ErrorCode.FEISHU_API_ERROR, `sendCard failed: ${res.msg}`));
@@ -346,10 +376,14 @@ export class LarkBotRuntime implements BotRuntime {
 
     await this.limiter.acquire();
     try {
-      const res = await this.client.im.message.patch({
-        path: { message_id: params.messageId },
-        data: { content: JSON.stringify(params.card.content) },
-      });
+      const res = await withRateLimitRetry(
+        () =>
+          this.client.im.message.patch({
+            path: { message_id: params.messageId },
+            data: { content: JSON.stringify(params.card.content) },
+          }),
+        { context: 'patchCard', logger: this.logger, tracker: this.tracker },
+      );
 
       this.patchTimes.set(params.messageId, Date.now());
 
@@ -366,29 +400,34 @@ export class LarkBotRuntime implements BotRuntime {
   async fetchHistory(params: FetchHistoryParams): Promise<Result<FetchHistoryResult>> {
     await this.limiter.acquire();
     try {
-      const res = await (
-        this.client.im.message as unknown as {
-          list: (p: unknown) => Promise<{
-            code?: number;
-            msg?: string;
-            data?: {
-              has_more?: boolean;
-              page_token?: string;
-              items?: Array<Record<string, unknown>>;
-            };
-          }>;
-        }
-      ).list({
-        params: {
-          container_id: params.chatId,
-          container_id_type: 'chat',
-          page_size: params.pageSize ?? 20,
-          ...(params.pageToken && { page_token: params.pageToken }),
-          ...(params.startTime && { start_time: String(Math.floor(params.startTime / 1000)) }),
-          ...(params.endTime && { end_time: String(Math.floor(params.endTime / 1000)) }),
-          sort_type: 'ByCreateTimeDesc',
-        },
-      });
+      // 直接在 lambda 里 obj.method(...) 调用，避免摘下方法导致 this 丢失
+      const res = await withRateLimitRetry(
+        () =>
+          (
+            this.client.im.message as unknown as {
+              list: (p: unknown) => Promise<{
+                code?: number;
+                msg?: string;
+                data?: {
+                  has_more?: boolean;
+                  page_token?: string;
+                  items?: Array<Record<string, unknown>>;
+                };
+              }>;
+            }
+          ).list({
+            params: {
+              container_id: params.chatId,
+              container_id_type: 'chat',
+              page_size: params.pageSize ?? 20,
+              ...(params.pageToken && { page_token: params.pageToken }),
+              ...(params.startTime && { start_time: String(Math.floor(params.startTime / 1000)) }),
+              ...(params.endTime && { end_time: String(Math.floor(params.endTime / 1000)) }),
+              sort_type: 'ByCreateTimeDesc',
+            },
+          }),
+        { context: 'fetchHistory', logger: this.logger, tracker: this.tracker },
+      );
 
       if (res.code !== 0) {
         return err(makeError(ErrorCode.FEISHU_API_ERROR, `fetchHistory failed: ${res.msg}`));
@@ -438,15 +477,20 @@ export class LarkBotRuntime implements BotRuntime {
     try {
       // GET /open-apis/im/v1/messages/{message_id}
       // 返回值：data.items[] —— 普通消息只有 1 条；merge_forward 则父在前 + 全部嵌套子
-      const res = await (
-        this.client.im.message as unknown as {
-          get: (p: unknown) => Promise<{
-            code?: number;
-            msg?: string;
-            data?: { items?: Array<Record<string, unknown>> };
-          }>;
-        }
-      ).get({ path: { message_id: messageId } });
+      // 直接在 lambda 里 obj.method(...) 调用，避免摘下方法导致 this 丢失
+      const res = await withRateLimitRetry(
+        () =>
+          (
+            this.client.im.message as unknown as {
+              get: (p: unknown) => Promise<{
+                code?: number;
+                msg?: string;
+                data?: { items?: Array<Record<string, unknown>> };
+              }>;
+            }
+          ).get({ path: { message_id: messageId } }),
+        { context: 'fetchMessage', logger: this.logger, tracker: this.tracker },
+      );
 
       if (res.code !== 0) {
         return err(makeError(ErrorCode.FEISHU_API_ERROR, `fetchMessage failed: ${res.msg}`));
@@ -493,10 +537,14 @@ export class LarkBotRuntime implements BotRuntime {
   async fetchMembers(params: FetchMembersParams): Promise<Result<FetchMembersResult>> {
     await this.limiter.acquire();
     try {
-      const res = await this.client.im.v1.chatMembers.get({
-        path: { chat_id: params.chatId },
-        params: { member_id_type: 'open_id', page_size: 100 },
-      });
+      const res = await withRateLimitRetry(
+        () =>
+          this.client.im.v1.chatMembers.get({
+            path: { chat_id: params.chatId },
+            params: { member_id_type: 'open_id', page_size: 100 },
+          }),
+        { context: 'fetchMembers', logger: this.logger, tracker: this.tracker },
+      );
 
       if (res.code !== 0) {
         return err(makeError(ErrorCode.FEISHU_API_ERROR, `fetchMembers failed: ${res.msg}`));
@@ -526,7 +574,7 @@ export class LarkBotRuntime implements BotRuntime {
 
 // ─── 工厂函数 ──────────────────────────────────────────────────────────────────
 
-export function createBotRuntime(): LarkBotRuntime {
+export function createBotRuntime(opts: { logger?: Logger } = {}): LarkBotRuntime {
   const appId = process.env['LARK_APP_ID'];
   const appSecret = process.env['LARK_APP_SECRET'];
   if (!appId) throw new Error('Missing env var: LARK_APP_ID');
@@ -546,5 +594,6 @@ export function createBotRuntime(): LarkBotRuntime {
     encryptKey: process.env['LARK_ENCRYPT_KEY'] ?? '',
     logLevel:
       logLevelMap[(process.env['LARK_LOG_LEVEL'] ?? 'info').toLowerCase()] ?? lark.LoggerLevel.info,
+    ...(opts.logger !== undefined && { logger: opts.logger }),
   });
 }
