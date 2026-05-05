@@ -39,12 +39,16 @@ const TRIGGER_RE =
 /**
  * 把历史消息里的「合并转发」展开：调 runtime.fetchMessage 拿父 + 嵌套子，
  * 用嵌套子（仅文本）替换掉父消息原位。失败时保留父原样并 logger.warn。
+ *
+ * 同时返回 forwardedIds —— 所有被转发进来的子消息 messageId。这些消息是
+ * 用户**主动转发的显式输入**（跟贴 wiki 链接同语义），不应该被相关性预筛过滤掉。
  */
 async function expandMergeForward(
   ctx: SkillContext,
   history: readonly Message[],
-): Promise<readonly Message[]> {
+): Promise<{ messages: readonly Message[]; forwardedIds: Set<string> }> {
   const out: Message[] = [];
+  const forwardedIds = new Set<string>();
   for (const m of history) {
     if ((m.contentType as string) !== 'merge_forward') {
       out.push(m);
@@ -76,9 +80,12 @@ async function expandMergeForward(
       messageId: m.messageId,
       childCount: children.length,
     });
-    out.push(...children);
+    for (const child of children) {
+      out.push(child);
+      forwardedIds.add(child.messageId);
+    }
   }
-  return out;
+  return { messages: out, forwardedIds };
 }
 
 function summarize(value: string, max = 200): string {
@@ -88,27 +95,39 @@ function summarize(value: string, max = 200): string {
 
 /**
  * 用 lite 模型对历史消息做相关性预筛 —— 群里可能掺多个项目讨论。
- * linkedDocs 不进预筛：用户主动贴的文档是显式输入信号，100% 保留。
+ *
+ * Tier-1 显式输入（用户主动提供的内容）100% 保留，不进 lite 预筛：
+ *   - linkedDocs: 用户贴/转发进来的飞书文档
+ *   - forwardedIds: 用户合并转发进来的聊天记录子消息（同等显式输入语义）
+ *
+ * 只有「群里**原本就有**的非转发消息」才走 lite 相关性筛。
  */
 async function filterByRelevance(
   ctx: SkillContext,
   trigger: Message,
   history: readonly Message[],
   linkedDocs: readonly LinkedDocSnippet[],
+  forwardedIds: ReadonlySet<string>,
 ): Promise<{ history: readonly Message[]; linkedDocs: readonly LinkedDocSnippet[] }> {
-  if (history.length === 0) {
+  // 拆成「转发进来必保留」和「群里原生消息走筛」两组
+  const forwarded = history.filter((m) => forwardedIds.has(m.messageId));
+  const natives = history.filter((m) => !forwardedIds.has(m.messageId));
+
+  if (natives.length === 0) {
     return { history, linkedDocs };
   }
 
-  const candidates: RelevanceCandidate[] = history.map((m, i) => ({
+  const candidates: RelevanceCandidate[] = natives.map((m, i) => ({
     id: `m${i}`,
     kind: 'message',
     excerpt: `[${m.sender.name ?? m.sender.userId}] ${summarize(m.text, 200)}`,
   }));
 
-  ctx.logger.info('requirementDoc: relevance pre-filter (history only; linkedDocs always kept)', {
-    historyCount: history.length,
+  ctx.logger.info('requirementDoc: relevance pre-filter', {
+    nativeCount: natives.length,
+    forwardedCount: forwarded.length,
     linkedDocCount: linkedDocs.length,
+    note: 'forwarded + linkedDocs are always kept; lite filter only judges native messages',
   });
 
   const judgmentResult = await ctx.llm.askStructured(
@@ -118,7 +137,7 @@ async function filterByRelevance(
   );
 
   if (!judgmentResult.ok) {
-    // 预筛挂掉不致命，退回全量
+    // 预筛挂掉不致命，退回全量原生消息
     ctx.logger.warn('requirementDoc: relevance filter failed, falling back to full context', {
       code: judgmentResult.error.code,
       message: judgmentResult.error.message,
@@ -132,18 +151,18 @@ async function filterByRelevance(
   }
 
   const keepIds = new Set(judgmentResult.value.results.filter((r) => r.keep).map((r) => r.id));
-  const keptHistory = history.filter((_, i) => keepIds.has(`m${i}`));
+  const keptNatives = natives.filter((_, i) => keepIds.has(`m${i}`));
+
+  // 把「保留的原生」+「全部 forwarded」按 history 原顺序组合，保证时间序正确
+  const keptHistory = history.filter(
+    (m) => forwardedIds.has(m.messageId) || keptNatives.includes(m),
+  );
 
   ctx.logger.info('requirementDoc: relevance pre-filter done', {
-    historyKept: `${keptHistory.length}/${history.length}`,
+    nativeKept: `${keptNatives.length}/${natives.length}`,
+    forwardedKept: `${forwarded.length}/${forwarded.length} (always kept)`,
     linkedDocKept: `${linkedDocs.length}/${linkedDocs.length} (always kept)`,
   });
-
-  if (keptHistory.length === 0 && linkedDocs.length > 0) {
-    ctx.logger.warn(
-      'requirementDoc: relevance filter dropped all history, proceeding with linkedDocs only',
-    );
-  }
 
   return { history: keptHistory, linkedDocs };
 }
@@ -249,18 +268,22 @@ export const requirementDocSkill: Skill = {
     }
     const historyRaw = historyResult.value.messages;
 
-    // a2. 展开合并转发：父原位替换为嵌套子消息
-    const historyExpanded = await expandMergeForward(ctx, historyRaw);
+    // a2. 展开合并转发：父原位替换为嵌套子消息，同时记录哪些是转发进来的
+    const { messages: historyExpanded, forwardedIds } = await expandMergeForward(ctx, historyRaw);
 
     // a3. 抽取并读取飞书文档（doc / wiki / 嵌套子里的 URL 也会被找到）
     const linkedDocsAll = await fetchLinkedDocs(ctx, historyExpanded);
 
-    // b. lite 模型相关性预筛历史（linkedDocs 100% 保留）
+    // b. lite 模型相关性预筛历史
+    //    - linkedDocs 100% 保留（用户主动贴的）
+    //    - forwarded 子消息 100% 保留（用户主动转发的，同等语义）
+    //    - 仅群里原生非转发消息走 lite 筛
     const { history, linkedDocs } = await filterByRelevance(
       ctx,
       msg,
       historyExpanded,
       linkedDocsAll,
+      forwardedIds,
     );
 
     // c. pro 模型主提取
@@ -268,8 +291,13 @@ export const requirementDocSkill: Skill = {
       historyCount: history.length,
       linkedDocCount: linkedDocs.length,
     });
+    // 把保留下来的 forwarded 子消息抽出来，作为 Tier-1 显式输入塞进 prompt
+    const forwardedTexts = history
+      .filter((m) => forwardedIds.has(m.messageId))
+      .map((m) => m.text);
+
     const docResult = await ctx.llm.askStructured(
-      REQ_PROMPT(history, linkedDocs),
+      REQ_PROMPT(history, linkedDocs, forwardedTexts),
       RequirementDocSchema,
       // pro 模型默认超时 30s 不够：拉了多条历史 + 文档正文，prompt 偏长，35–60s 是常态
       { model: 'pro', timeoutMs: 90_000 },
