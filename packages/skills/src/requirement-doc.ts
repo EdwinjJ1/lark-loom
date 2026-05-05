@@ -350,14 +350,20 @@ export const requirementDocSkill: Skill = {
     }
 
     // e. 写 memory（失败仅 warn，不阻断卡片输出）
+    //    字段对齐 contracts/MemoryRecord schema（kind / chat_id / key / content / source_skill / importance / created_at / last_access），
+    //    跟 BITABLE memory 表 schema 一致。docToken 嵌进 content 末行（无独立字段位）。
+    const now = Date.now();
     const memRes = await ctx.bitable.insert({
       table: 'memory',
       row: {
-        chatId,
-        type: 'requirement',
-        docToken: fileResult.value.docToken,
-        content: doc.title,
-        timestamp: Date.now(),
+        key: `req-${fileResult.value.docToken}`,
+        kind: 'project',
+        chat_id: chatId,
+        content: `[需求文档] ${doc.title}\n${fileResult.value.url}`,
+        importance: 5,
+        last_access: now,
+        created_at: now,
+        source_skill: 'requirementDoc',
       },
     });
     if (!memRes.ok) {

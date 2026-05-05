@@ -284,12 +284,19 @@ describe('requirementDocSkill.run() — single message scenario', () => {
     expect(ctx.docx.readContent).not.toHaveBeenCalled();
   });
 
-  it('writes memory with type=requirement and docToken', async () => {
+  it('writes memory with new schema (kind=project, key=req-<docToken>, source_skill)', async () => {
     await requirementDocSkill.run(ctx);
     expect(ctx.bitable.insert).toHaveBeenCalledWith(
       expect.objectContaining({
         table: 'memory',
-        row: expect.objectContaining({ type: 'requirement', docToken: MOCK_DOC_REF.docToken }),
+        row: expect.objectContaining({
+          key: `req-${MOCK_DOC_REF.docToken}`,
+          kind: 'project',
+          chat_id: 'oc_chat_001',
+          source_skill: 'requirementDoc',
+          // content 含 docToken url
+          content: expect.stringContaining(MOCK_DOC_REF.url),
+        }),
       }),
     );
   });
