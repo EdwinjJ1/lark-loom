@@ -41,12 +41,14 @@ function makeCall(name: string, args: Record<string, unknown>): ToolCall {
 // ─── getLLMTools ──────────────────────────────────────────────────────────────
 
 describe('getLLMTools', () => {
-  it('returns 4 tools with required fields', () => {
+  it('returns 5 tools with required fields', () => {
+    // M6（PR #87 / #85）加了 memory.write，从 4 个增到 5 个
     const tools = getLLMTools();
-    expect(tools).toHaveLength(4);
+    expect(tools).toHaveLength(5);
     const names = tools.map((t) => t.name);
     expect(names).toContain('memory.read');
     expect(names).toContain('memory.search');
+    expect(names).toContain('memory.write');
     expect(names).toContain('skill.list');
     expect(names).toContain('skill.read');
     for (const t of tools) {

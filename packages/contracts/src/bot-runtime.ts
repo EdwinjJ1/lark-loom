@@ -82,6 +82,13 @@ export interface BotRuntime {
   /** 拉取群成员列表（机器人必须是群成员）*/
   fetchMembers(params: FetchMembersParams): Promise<Result<FetchMembersResult>>;
 
+  /**
+   * 按 messageId 取单条消息。
+   * 如果消息是合并转发（merge_forward），返回 parent + 平铺的所有嵌套子消息
+   * （父在前；子按原始顺序在后）。普通消息只返回它自己一条。
+   */
+  fetchMessage(messageId: string): Promise<Result<{ readonly messages: readonly Message[] }>>;
+
   /** 注册事件回调；返回 unregister 函数 */
   on(handler: EventHandler): () => void;
 

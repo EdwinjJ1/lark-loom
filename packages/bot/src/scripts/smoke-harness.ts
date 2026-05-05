@@ -73,6 +73,7 @@ const runtime: BotRuntime = {
       hasMore: false,
     }),
   fetchMembers: async () => ok({ members: [] }),
+  fetchMessage: async () => ok({ messages: [] }),
 };
 
 const llm: LLMClient = {

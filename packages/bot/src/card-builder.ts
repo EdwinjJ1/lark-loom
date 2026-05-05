@@ -176,6 +176,37 @@ function buildDocPush(input: DocPushCardInput): Card {
     minutes: '🗒 会议纪要',
     other: '📄 文档',
   };
+
+  // loading 占位：先 sendCard 拿 messageId，跑完用 patchCard 换终态
+  if (input.isLoading) {
+    const etaLine = input.etaSeconds
+      ? `预计耗时约 ${input.etaSeconds} 秒，请稍候。`
+      : '通常需要 30-60 秒，请稍候。';
+    return card('docPush', {
+      schema: '2.0',
+      header: { title: pt('文档生成中…'), template: 'blue' },
+      body: {
+        elements: [
+          md(`${typeLabel[input.docType]} **${input.docTitle}**\n\n${etaLine}`),
+          md('_我会从群聊上下文与关联文档里提取需求，整理完会自动替换这条卡片。_'),
+        ],
+      },
+    });
+  }
+
+  // error 终态：跑挂时把 loading 卡片 patch 成失败提示
+  if (input.errorMessage) {
+    return card('docPush', {
+      schema: '2.0',
+      header: { title: pt('文档生成失败'), template: 'red' },
+      body: {
+        elements: [
+          md(`${typeLabel[input.docType]} **${input.docTitle}**\n\n${input.errorMessage}`),
+        ],
+      },
+    });
+  }
+
   const elements: BodyElement[] = [
     md(
       `${typeLabel[input.docType]} **${input.docTitle}** 已生成${input.summary ? `\n\n${input.summary}` : ''}`,

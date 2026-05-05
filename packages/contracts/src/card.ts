@@ -57,11 +57,18 @@ export interface ActivationCardInput {
 
 export interface DocPushCardInput {
   readonly docTitle: string;
+  /** 终态文档 URL；loading / error 态可为空字符串 */
   readonly docUrl: string;
   /** 文档类型，影响图标与措辞 */
   readonly docType: 'requirement' | 'report' | 'minutes' | 'other';
   /** 可选：一句话内容摘要 */
   readonly summary?: string;
+  /** loading 占位：先发出去拿 messageId，跑完了再 patchCard 替换为终态 */
+  readonly isLoading?: boolean;
+  /** loading 时显示的预估时长（秒），如 30-60 渲染成「预计 30-60 秒」 */
+  readonly etaSeconds?: number;
+  /** error 终态：跑挂时把 loading 卡片 patch 成失败提示 */
+  readonly errorMessage?: string;
 }
 
 export interface TablePushCardInput {

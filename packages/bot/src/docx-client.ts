@@ -40,46 +40,75 @@ export class LarkDocxClient implements DocxClient {
   }
 
   async appendBlocks(docToken: string, blocks: readonly DocBlock[]): Promise<Result<void>> {
-    try {
-      const children = blocks.map((block) => {
-        switch (block.type) {
-          case 'heading1':
-            return {
-              block_type: 3,
-              heading1: { elements: [{ text_run: { content: block.text } }] },
-            };
-          case 'heading2':
-            return {
-              block_type: 4,
-              heading2: { elements: [{ text_run: { content: block.text } }] },
-            };
-          case 'paragraph':
-            return { block_type: 2, text: { elements: [{ text_run: { content: block.text } }] } };
-          case 'bullet':
-            return {
-              block_type: 12,
-              bullet: { elements: [{ text_run: { content: block.text } }] },
-            };
-        }
-      });
+    // 飞书 documentBlockChildren.create 单次推荐 ≤ 50 blocks，超量会 400 field_violations
+    // 用 30 留安全冗余 + 13 字段 PRD 通常 50-60 blocks 需要 2 批
+    const BATCH_SIZE = 30;
+    // 防御：跳过空文本，飞书拒绝空 text_run
+    const safeBlocks = blocks.filter((b) => b.text && b.text.trim().length > 0);
 
-      const res = await (this.client.docx.v1.documentBlockChildren as any).create({
-        path: {
-          document_id: docToken,
-          block_id: docToken,
-        },
-        data: { children },
-      });
-
-      if (res.code !== 0) {
-        return err(makeError(ErrorCode.FEISHU_API_ERROR, `append blocks failed: ${res.msg}`));
+    const childrenAll = safeBlocks.map((block) => {
+      switch (block.type) {
+        case 'heading1':
+          return {
+            block_type: 3,
+            heading1: { elements: [{ text_run: { content: block.text } }] },
+          };
+        case 'heading2':
+          return {
+            block_type: 4,
+            heading2: { elements: [{ text_run: { content: block.text } }] },
+          };
+        case 'paragraph':
+          return { block_type: 2, text: { elements: [{ text_run: { content: block.text } }] } };
+        case 'bullet':
+          return {
+            block_type: 12,
+            bullet: { elements: [{ text_run: { content: block.text } }] },
+          };
       }
+    });
 
-      return ok(undefined);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return err(makeError(ErrorCode.FEISHU_API_ERROR, `append blocks error: ${msg}`));
+    for (let i = 0; i < childrenAll.length; i += BATCH_SIZE) {
+      const batch = childrenAll.slice(i, i + BATCH_SIZE);
+      try {
+        const res = await (this.client.docx.v1.documentBlockChildren as any).create({
+          path: { document_id: docToken, block_id: docToken },
+          data: { children: batch },
+        });
+
+        if (res.code !== 0) {
+          // 详细错误信息（含 field_violations）方便定位具体哪个 block 被拒
+          const fieldViolations = (res as { field_violations?: unknown }).field_violations;
+          return err(
+            makeError(
+              ErrorCode.FEISHU_API_ERROR,
+              `append blocks failed (batch ${i / BATCH_SIZE + 1}): ${res.msg}`,
+              undefined,
+              { batchSize: batch.length, fieldViolations },
+            ),
+          );
+        }
+      } catch (e: unknown) {
+        // axios 错误带 response.data，里面通常有 field_violations
+        const err2 = e as {
+          message?: string;
+          response?: { data?: { msg?: string; field_violations?: unknown } };
+        };
+        const baseMsg = err2.message ?? String(e);
+        const apiMsg = err2.response?.data?.msg;
+        const fieldViolations = err2.response?.data?.field_violations;
+        return err(
+          makeError(
+            ErrorCode.FEISHU_API_ERROR,
+            `append blocks error (batch ${i / BATCH_SIZE + 1}): ${apiMsg ?? baseMsg}`,
+            undefined,
+            { batchIndex: i / BATCH_SIZE + 1, batchSize: batch.length, fieldViolations },
+          ),
+        );
+      }
     }
+
+    return ok(undefined);
   }
 
   async getShareLink(docToken: string): Promise<Result<string>> {

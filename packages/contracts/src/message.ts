@@ -14,6 +14,7 @@ export type MessageContentType =
   | 'audio'
   | 'card'
   | 'sticker'
+  | 'merge_forward' // 合并转发：rawContent="Merged and Forwarded Message"，嵌套子要走 BotRuntime.fetchMessage 展开
   | 'unknown';
 
 export interface UserRef {

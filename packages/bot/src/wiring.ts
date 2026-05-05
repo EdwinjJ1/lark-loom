@@ -19,6 +19,7 @@ export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   qa: 'qa',
   meetingNotes: 'summary',
   slides: 'slides',
+  requirementDoc: 'requirementDoc',
 };
 
 export interface HarnessConfig {
