@@ -91,6 +91,9 @@ async function handleWithSkillRouter(
 
   // taskAssignment / progressUpdate 没对应 skill，但仍把消息写进 memory 表，
   // 供后续 qa / docIterate / recall 检索。fire-and-forget。
+  // 必须同时挂 .then() 和 .catch()：底层网络/认证异常时 bitable.insert
+  // 可能直接 reject 而不是返回 err Result，没 .catch() 会触发
+  // unhandled rejection（Node 18+ 默认 --unhandled-rejections=strict 会终止进程）。
   if (SIDE_EFFECT_INTENTS.has(intent)) {
     void ctx.bitable
       .insert({
@@ -110,6 +113,12 @@ async function handleWithSkillRouter(
             message: res.error.message,
           });
         }
+      })
+      .catch((e: unknown) => {
+        logger.warn('bitable insert threw', {
+          intent,
+          error: e instanceof Error ? e.message : String(e),
+        });
       });
     return;
   }

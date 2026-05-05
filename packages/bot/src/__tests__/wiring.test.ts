@@ -222,8 +222,8 @@ describe('handleEvent wiring', () => {
     );
   });
 
-  // 4c. side-effect bitable 失败时不 throw，仅 logger.warn
-  it('side-effect bitable insert failure → warn but does not throw', async () => {
+  // 4c. side-effect bitable 返回 err Result 时不 throw，仅 logger.warn
+  it('side-effect bitable insert returns err → warn but does not throw', async () => {
     const failingBitable = {
       insert: vi
         .fn()
@@ -240,6 +240,26 @@ describe('handleEvent wiring', () => {
     expect(ctx.logger.warn as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
       'bitable insert failed',
       expect.objectContaining({ intent: 'taskAssignment', code: ErrorCode.FEISHU_API_ERROR }),
+    );
+  });
+
+  // 4d. side-effect bitable.insert 真 reject（网络/认证异常）→ catch 兜住，不触发 unhandled rejection
+  it('side-effect bitable insert rejects → caught, warn but does not throw', async () => {
+    const throwingBitable = {
+      insert: vi.fn().mockRejectedValue(new Error('network ETIMEDOUT')),
+    } as unknown as SkillContext['bitable'];
+    const msg = makeMessage({ text: '我来负责前端', mentions: [] });
+    const ctx = { ...makeCtx(makeEvent(msg)), bitable: throwingBitable };
+
+    // 关键：handleEvent 自身不能 throw，且不能产生 unhandled rejection
+    await expect(
+      handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>),
+    ).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(ctx.logger.warn as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
+      'bitable insert threw',
+      expect.objectContaining({ intent: 'taskAssignment', error: 'network ETIMEDOUT' }),
     );
   });
 
