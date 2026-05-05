@@ -34,11 +34,23 @@ function makeEvent(text: string): BotEvent {
   return { type: 'message', payload: makeMessage(text) };
 }
 
+// 跟新 13 字段 schema 对齐
 const MOCK_DOC = {
   title: '飞书智能助手 PRD',
+  summary: '住在飞书群里的 AI 助手，把对话织成结构化产出',
   background: '群协作信息散落，需要一个 Bot 把对话织成结构化产出。',
+  targetUsers: ['项目经理（主要）', '团队成员（次要）'],
   goals: ['自动整理需求', '主动浮信息', '生成演示文稿'],
-  scope: '只覆盖群聊场景，不监听 1v1 私聊。',
+  successMetrics: ['需求文档生成耗时 ≤ 60 秒'],
+  userStories: ['作为 PM，我希望 bot 自动从群聊整理 PRD'],
+  solution: '飞书群里被动监听 + LLM 提取 + 写 docx',
+  scope: {
+    included: ['需求整理', '分工表格', 'PPT 初稿'],
+    excluded: ['1v1 私聊监听'],
+  },
+  milestones: [{ name: 'MVP 内测' }],
+  risks: ['lark 长连接不稳：补 backfill'],
+  openQuestions: [],
   deliverables: ['需求文档', '分工表格', 'PPT 初稿'],
 };
 
