@@ -36,7 +36,7 @@ function buildDeps() {
   if (!appId) throw new Error('Missing env var: LARK_APP_ID');
   if (!appSecret) throw new Error('Missing env var: LARK_APP_SECRET');
 
-  const runtime = createBotRuntime();
+  const runtime = createBotRuntime({ logger });
   const router = new SkillRouter(envTrim('LARK_BOT_OPEN_ID'));
 
   const llm = new VolcanoLLMClient({

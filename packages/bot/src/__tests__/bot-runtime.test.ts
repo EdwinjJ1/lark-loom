@@ -262,6 +262,24 @@ describe('LarkBotRuntime', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  // 8. 撞 99991400 → 自动 retry 一次 → 成功（issue #91 Layer A 集成）
+  it('sendText auto-retries once on feishu rate limit code 99991400', async () => {
+    mockMessageCreate
+      .mockResolvedValueOnce({ code: 99991400, msg: 'rate limit' })
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'msg_after_retry' } });
+    const runtime = makeRuntime();
+    // recordRateLimited 是同步副作用 —— 在 sleep 之前打的标记，spy 进去而不走真实时间
+    const tracker = runtime.getQuotaTracker();
+    const recordSpy = vi.spyOn(tracker, 'recordRateLimited');
+
+    const result = await runtime.sendText({ chatId: 'oc_chat1', text: '撞限流' });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.messageId).toBe('msg_after_retry');
+    expect(mockMessageCreate).toHaveBeenCalledTimes(2);
+    expect(recordSpy).toHaveBeenCalledOnce(); // QuotaTracker 被标记过节流
+  });
+
   it('card action event triggers handler with action payload', async () => {
     const runtime = makeRuntime();
     const handler: EventHandler = vi.fn();
