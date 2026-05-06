@@ -74,6 +74,7 @@ const runtime: BotRuntime = {
     }),
   fetchMembers: async () => ok({ members: [] }),
   fetchMessage: async () => ok({ messages: [] }),
+  pinMessage: async () => ok(undefined),
 };
 
 const llm: LLMClient = {
@@ -137,6 +138,7 @@ const ctx: SkillContext = {
     grantMembersEdit: async () => ok(undefined),
     appendToSection: async () => ok(undefined),
     replaceSection: async () => ok(undefined),
+    renameTitle: async () => ok(undefined),
   },
   cardBuilder: larkCardBuilder,
   retrievers: {},

@@ -499,6 +499,63 @@ export class LarkDocxClient implements DocxClient {
       return err(makeError(ErrorCode.FEISHU_API_ERROR, `replaceSection insert error: ${msg}`, e));
     }
   }
+
+  /**
+   * 改文档标题（issue #120 P6）。
+   *
+   * 飞书 docx：文档显示的标题来自首个 H1 block 的内容。改 H1 = 改标题。
+   * 步骤：list 顶层 children → 找首个 block_type === 3 (heading1) → batchUpdate
+   * 把它的 elements 改成 [{ text_run: { content: newTitle } }]。
+   */
+  async renameTitle(docToken: string, newTitle: string): Promise<Result<void>> {
+    if (!newTitle.trim()) return ok(undefined);
+
+    // 找首个 H1 block_id
+    let h1BlockId: string | undefined;
+    try {
+      const res = await (this.client.docx.v1.documentBlockChildren as any).list({
+        path: { document_id: docToken, block_id: docToken },
+        params: { page_size: 50 },
+      });
+      if (res.code !== 0) {
+        return err(makeError(ErrorCode.FEISHU_API_ERROR, `renameTitle list failed: ${res.msg}`));
+      }
+      const items =
+        (res.data?.items ?? []) as Array<{ block_id?: string; block_type?: number }>;
+      const h1 = items.find((c) => c.block_type === 3);
+      h1BlockId = h1?.block_id;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(makeError(ErrorCode.FEISHU_API_ERROR, `renameTitle list error: ${msg}`, e));
+    }
+    if (!h1BlockId) {
+      return err(makeError(ErrorCode.INVALID_INPUT, 'renameTitle: no H1 block found'));
+    }
+
+    // batchUpdate 改 H1 文本
+    try {
+      const res = await (this.client.docx.v1.documentBlock as any).batchUpdate({
+        path: { document_id: docToken },
+        data: {
+          requests: [
+            {
+              block_id: h1BlockId,
+              update_text_elements: {
+                elements: [{ text_run: { content: newTitle } }],
+              },
+            },
+          ],
+        },
+      });
+      if (res.code !== 0) {
+        return err(makeError(ErrorCode.FEISHU_API_ERROR, `renameTitle update failed: ${res.msg}`));
+      }
+      return ok(undefined);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(makeError(ErrorCode.FEISHU_API_ERROR, `renameTitle update error: ${msg}`, e));
+    }
+  }
 }
 
 export function createDocxClient(): LarkDocxClient {

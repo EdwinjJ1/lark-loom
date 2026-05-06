@@ -46,4 +46,9 @@ export interface DocxClient {
     sectionTitle: string,
     blocks: readonly DocBlock[],
   ): Promise<Result<void>>;
+  /**
+   * 改文档标题（issue #120 P6）—— 找首个 H1 block，batchUpdate 它的文本。
+   * 这样用户在飞书里看到的"项目核心文档 - 本群"会被改成"{项目名} - 核心文档"。
+   */
+  renameTitle(docToken: string, newTitle: string): Promise<Result<void>>;
 }

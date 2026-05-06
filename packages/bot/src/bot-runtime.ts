@@ -570,6 +570,35 @@ export class LarkBotRuntime implements BotRuntime {
       return err(makeError(ErrorCode.FEISHU_API_ERROR, `fetchMembers error: ${msg}`, e));
     }
   }
+
+  async pinMessage(chatId: string, messageId: string): Promise<Result<void>> {
+    await this.limiter.acquire();
+    try {
+      const res = await withRateLimitRetry(
+        () =>
+          (
+            this.client.im.v1 as unknown as {
+              chatTopNotice: {
+                putTopNotice: (p: unknown) => Promise<{ code?: number; msg?: string }>;
+              };
+            }
+          ).chatTopNotice.putTopNotice({
+            path: { chat_id: chatId },
+            data: {
+              chat_top_notice: [{ action_type: '1', message_id: messageId }],
+            },
+          }),
+        { context: 'pinMessage', logger: this.logger, tracker: this.tracker },
+      );
+      if (res.code !== 0) {
+        return err(makeError(ErrorCode.FEISHU_API_ERROR, `pinMessage failed: ${res.msg}`));
+      }
+      return ok(undefined);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(makeError(ErrorCode.FEISHU_API_ERROR, `pinMessage error: ${msg}`, e));
+    }
+  }
 }
 
 // ─── 工厂函数 ──────────────────────────────────────────────────────────────────

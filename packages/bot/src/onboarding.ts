@@ -250,8 +250,7 @@ async function bootstrapProjectDoc(
     url: created.value.url,
   });
 
-  // 发一张通知卡 —— 让用户立刻看到核心文档已创建（issue #120 review fix）
-  // 复用 docPush 卡片：标题 + 摘要 + "打开文档"按钮
+  // 发一张通知卡 —— 让用户立刻看到核心文档已创建
   const notifyCard = ctx.cardBuilder.build('docPush', {
     docTitle: docTitle,
     docUrl: created.value.url,
@@ -264,6 +263,18 @@ async function bootstrapProjectDoc(
     logger.warn('onboarding: send core doc notify card failed', {
       error: notifyRes.error.message,
     });
+    return;
+  }
+
+  // 把通知卡置顶到群顶部（issue #120 P6）—— 用户随时能找到核心文档
+  // 失败仅 warn（可能机器人不在群里 / API 权限不够）
+  const pinRes = await runtime.pinMessage(chatId, notifyRes.value.messageId);
+  if (!pinRes.ok) {
+    logger.warn('onboarding: pin core doc card failed', {
+      error: pinRes.error.message,
+    });
+  } else {
+    logger.info('onboarding: pinned core doc card', { messageId: notifyRes.value.messageId });
   }
 }
 
