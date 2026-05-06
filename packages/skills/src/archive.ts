@@ -60,15 +60,58 @@ const PREFIX_TABLE: ReadonlyArray<{
   { re: /^\[(任务表|todo|分工)\]/i, kind: 'taskAssignment', label: '任务分工表' },
 ];
 
+const KIND_ORDER: Record<NonNullable<ArchiveLink['kind']>, number> = {
+  requirementDoc: 0,
+  slides: 1,
+  taskAssignment: 2,
+  bitable: 3,
+  other: 9,
+};
+
+/**
+ * 把 URL 规范化用作去重 key：去掉 query / fragment / 末尾斜杠，转小写。
+ * 飞书同一文档的多种链接形式（带 from 参数 / 不带）都能匹配。
+ */
+function canonicalizeUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname.replace(/\/$/, '')}`.toLowerCase();
+  } catch {
+    return url.toLowerCase().replace(/[?#].*$/, '').replace(/\/$/, '');
+  }
+}
+
+/**
+ * 没前缀的 memory 条目走这里：根据 URL 路径推断 kind / label。
+ * 这样"群聊里贴的 PPT 链接"也能被正确归类，不再统称"相关文档"。
+ */
+function inferFromUrl(url: string): { kind: NonNullable<ArchiveLink['kind']>; label: string } {
+  if (/\/slides\//i.test(url)) return { kind: 'slides', label: '演示 PPT' };
+  if (/\/(sheets|base)\//i.test(url)) return { kind: 'bitable', label: '飞书表格' };
+  if (/\/(docx|doc|wiki|file)\//i.test(url)) return { kind: 'other', label: '飞书文档' };
+  return { kind: 'other', label: '相关链接' };
+}
+
+interface CandidateLink extends ExtractedLink {
+  /** 是否来自 [前缀] 显式标注（vs 从 URL 路径推断） */
+  readonly fromPrefix: boolean;
+}
+
 /**
  * 从 memory records 提取产出物链接。
  *
- * 同 kind+label 组合取最新一条；总数上限 6 条避免卡片爆掉。
+ * 防重复策略（实测发现 3 个链接全是同一个 PPT URL 的 bug）：
+ *   1. 按规范化 URL 去重 —— 同 URL 只保留一条；同 URL 多个候选取 kind 高优先 +
+ *      显式标注优先 + recordedAt 最新
+ *   2. 显式标注（prefix 匹配的 named entry）：每个 (kind, label) 保留最新一条
+ *      — 避免出现"两次生成的 PRD 同时列出"
+ *   3. URL 推断（没前缀）：直接按 URL 路径推断 label，最多保留 2 条 — 避免群
+ *      聊里乱贴的链接刷屏卡片
+ *
+ * 总数上限 6 避免卡片爆掉。
  */
 export function extractLinksFromMemory(memories: readonly BitableRow[]): readonly ArchiveLink[] {
-  // 用 "kind|label" 作为去重 key，让"汇报分工文稿"和"任务分工表"能并存（都是 taskAssignment）
-  const byKey = new Map<string, ExtractedLink>();
-  const others: ExtractedLink[] = [];
+  const byUrl = new Map<string, CandidateLink>();
 
   for (const m of memories) {
     const content = String(m['content'] ?? '');
@@ -77,43 +120,58 @@ export function extractLinksFromMemory(memories: readonly BitableRow[]): readonl
 
     const urls = content.match(FEISHU_URL_RE);
     if (!urls || urls.length === 0) continue;
-    const url = urls[0]!;
+    const rawUrl = urls[0]!;
+    const canonUrl = canonicalizeUrl(rawUrl);
 
     const matched = PREFIX_TABLE.find((p) => p.re.test(content));
-    if (!matched) {
-      others.push({ kind: 'other', label: '相关文档', url, recordedAt });
+    const candidate: CandidateLink = matched
+      ? { kind: matched.kind, label: matched.label, url: rawUrl, recordedAt, fromPrefix: true }
+      : { ...inferFromUrl(rawUrl), url: rawUrl, recordedAt, fromPrefix: false };
+
+    const existing = byUrl.get(canonUrl);
+    if (!existing) {
+      byUrl.set(canonUrl, candidate);
       continue;
     }
 
-    const dedupeKey = `${matched.kind}|${matched.label}`;
-    const existing = byKey.get(dedupeKey);
-    if (!existing || existing.recordedAt < recordedAt) {
-      byKey.set(dedupeKey, { kind: matched.kind, label: matched.label, url, recordedAt });
-    }
+    // 同 URL 已存在 → 选更优的：显式标注 > kind 等级高 > recordedAt 新
+    const candBetter =
+      (candidate.fromPrefix && !existing.fromPrefix) ||
+      (candidate.fromPrefix === existing.fromPrefix &&
+        KIND_ORDER[candidate.kind ?? 'other'] < KIND_ORDER[existing.kind ?? 'other']) ||
+      (candidate.fromPrefix === existing.fromPrefix &&
+        candidate.kind === existing.kind &&
+        candidate.recordedAt > existing.recordedAt);
+    if (candBetter) byUrl.set(canonUrl, candidate);
   }
 
-  // 主分类排在前面，按 kind 优先级 + recordedAt 新→旧
-  const kindOrder: Record<NonNullable<ArchiveLink['kind']>, number> = {
-    requirementDoc: 0,
-    slides: 1,
-    taskAssignment: 2,
-    bitable: 3,
-    other: 9,
-  };
-  const ordered: ArchiveLink[] = [...byKey.values()]
-    .sort((a, b) => {
-      const ka = kindOrder[a.kind ?? 'other'];
-      const kb = kindOrder[b.kind ?? 'other'];
+  const candidates = [...byUrl.values()];
+
+  // 显式标注：每个 (kind, label) 保留 recordedAt 最新 —— 避免重复列出同类
+  const named = new Map<string, CandidateLink>();
+  for (const c of candidates.filter((c) => c.fromPrefix)) {
+    const k = `${c.kind}|${c.label}`;
+    const ex = named.get(k);
+    if (!ex || ex.recordedAt < c.recordedAt) named.set(k, c);
+  }
+  const namedList = [...named.values()];
+
+  // 推断的"其它"：最多 2 条，按 recordedAt 倒序
+  const inferredList = candidates
+    .filter((c) => !c.fromPrefix)
+    .sort((a, b) => b.recordedAt - a.recordedAt)
+    .slice(0, 2);
+
+  // 排序：先 named 按 kind 优先级，再 inferred 按 recordedAt
+  const ordered: ArchiveLink[] = [
+    ...namedList.sort((a, b) => {
+      const ka = KIND_ORDER[a.kind ?? 'other'];
+      const kb = KIND_ORDER[b.kind ?? 'other'];
       if (ka !== kb) return ka - kb;
       return b.recordedAt - a.recordedAt;
-    })
-    .map((l) => ({ kind: l.kind ?? ('other' as const), label: l.label, url: l.url }));
-
-  // others 补充最近 2 条
-  others
-    .sort((a, b) => b.recordedAt - a.recordedAt)
-    .slice(0, 2)
-    .forEach((l) => ordered.push({ kind: 'other' as const, label: l.label, url: l.url }));
+    }),
+    ...inferredList,
+  ].map((l) => ({ kind: l.kind ?? ('other' as const), label: l.label, url: l.url }));
 
   return ordered.slice(0, 6);
 }
