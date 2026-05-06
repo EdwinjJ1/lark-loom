@@ -40,7 +40,10 @@ export interface BlockerEntry {
   readonly source?: string;
 }
 
-const FEISHU_URL_RE = /https?:\/\/[^\s)>]+(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/;
+// 注意：`[^\s)>]*`（不是 `+`）—— 必须允许域名前 0 字符，否则
+// `https://feishu.cn/...`（无 tenant 子域）不会被匹配。
+const FEISHU_URL_RE =
+  /https?:\/\/[^\s)>]*(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/;
 
 /**
  * 从 memory 找到当前 chatId 的核心文档 docToken。找不到返回 null。
