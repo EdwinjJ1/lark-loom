@@ -241,6 +241,8 @@ async function handleMemorySearch(
 }
 
 const VALID_KINDS: ReadonlySet<MemoryKind> = new Set(['project', 'chat', 'user', 'skill_log']);
+const SAFE_DECISION_KEY_RE = /^[A-Za-z0-9_:.-]+$/;
+const MAX_DECISION_KEY_LENGTH = 120;
 
 async function handleMemoryWrite(
   args: Record<string, unknown>,
@@ -281,38 +283,59 @@ async function handleDecisionWrite(
   args: Record<string, unknown>,
   deps: ExecutorDeps,
 ): Promise<string> {
-  const key = String(args['key'] ?? '');
-  const content = String(args['content'] ?? '');
+  const key = String(args['key'] ?? '').trim();
+  const content = String(args['content'] ?? '').trim();
   if (!key || !content) return JSON.stringify({ error: 'key and content are required' });
+  if (key.length > MAX_DECISION_KEY_LENGTH || !SAFE_DECISION_KEY_RE.test(key)) {
+    return JSON.stringify({
+      error: 'key must only contain A-Za-z0-9_:.- and be at most 120 characters',
+    });
+  }
 
   const importance =
-    typeof args['importance'] === 'number'
+    typeof args['importance'] === 'number' && Number.isFinite(args['importance'])
       ? Math.min(Math.max(args['importance'], 1), 10)
       : 8; // 决策默认重要度 8
 
   const sourceSkill = deps.sourceSkill ?? 'harness';
   const now = Date.now();
 
-  // 1. 写 Bitable decision 表（主存储），无 bitable 时静默跳过
+  // 1. 写 Bitable decision 表（主存储），字段对齐现有 decision schema。
+  //    key 映射为 title，用 (chatId, title) 做幂等 upsert。
   let bitableRecordId: string | undefined;
   if (deps.bitable) {
-    const insertResult = await deps.bitable.insert({
+    const decisionRow = {
+      title: key,
+      chatId: deps.chatId,
+      archivedAt: now,
+      content,
+      deciders: sourceSkill,
+      status: 'open',
+    };
+    const existing = await deps.bitable.find({
       table: 'decision',
-      row: {
-        chat_id: deps.chatId,
-        key,
-        content,
-        importance,
-        source_skill: sourceSkill,
-        created_at: now,
-      },
+      where: { chatId: deps.chatId, title: key },
+      pageSize: 1,
     });
-    if (!insertResult.ok) {
-      deps.logger.warn('decision.write: bitable insert failed', {
-        code: insertResult.error.code,
-        message: insertResult.error.message,
+    if (!existing.ok) {
+      return JSON.stringify({ error: existing.error.message });
+    }
+
+    const existingRecord = existing.value.records[0];
+    if (existingRecord) {
+      const updateResult = await deps.bitable.update({
+        table: 'decision',
+        recordId: existingRecord.recordId,
+        patch: decisionRow,
       });
+      if (!updateResult.ok) return JSON.stringify({ error: updateResult.error.message });
+      bitableRecordId = existingRecord.recordId;
     } else {
+      const insertResult = await deps.bitable.insert({
+        table: 'decision',
+        row: decisionRow,
+      });
+      if (!insertResult.ok) return JSON.stringify({ error: insertResult.error.message });
       bitableRecordId = insertResult.value.recordId;
     }
   }

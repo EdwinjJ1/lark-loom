@@ -289,7 +289,12 @@ describe('decision.write', () => {
     expect(bitable.insert).toHaveBeenCalledWith(
       expect.objectContaining({
         table: 'decision',
-        row: expect.objectContaining({ chat_id: CHAT_ID, key: 'launch_date', content: '确认 6月1日上线' }),
+        row: expect.objectContaining({
+          chatId: CHAT_ID,
+          title: 'launch_date',
+          content: '确认 6月1日上线',
+          status: 'open',
+        }),
       }),
     );
     expect(store.write).toHaveBeenCalledWith(
@@ -309,7 +314,41 @@ describe('decision.write', () => {
     );
   });
 
-  it('bitable insert fails: logs warn but still writes memory, returns ok', async () => {
+  it('existing decision key: updates bitable row and still writes memory', async () => {
+    const store = makeStore();
+    const bitable = makeBitable({
+      find: vi.fn().mockResolvedValue(
+        ok({
+          records: [{ tableId: 'tbl_decision', recordId: 'rec_existing', chatId: CHAT_ID, title: 'launch_date' }],
+          hasMore: false,
+        }),
+      ),
+    });
+    const exec = makeExecutor({ store, bitable, chatId: CHAT_ID, logger: mockLogger, docsRoot: DOCS_ROOT });
+
+    const toolResult = await exec(
+      makeCall('decision.write', { key: 'launch_date', content: '确认延期到 6月8日' }),
+    );
+
+    const data = JSON.parse(toolResult.content) as { ok: boolean; bitableRecordId: string };
+    expect(data.ok).toBe(true);
+    expect(data.bitableRecordId).toBe('rec_existing');
+    expect(bitable.insert).not.toHaveBeenCalled();
+    expect(bitable.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'decision',
+        recordId: 'rec_existing',
+        patch: expect.objectContaining({
+          chatId: CHAT_ID,
+          title: 'launch_date',
+          content: '确认延期到 6月8日',
+        }),
+      }),
+    );
+    expect(store.write).toHaveBeenCalled();
+  });
+
+  it('bitable insert fails: returns error and does not write memory', async () => {
     const store = makeStore();
     const bitable = makeBitable({
       insert: vi.fn().mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'bitable down'))),
@@ -322,9 +361,9 @@ describe('decision.write', () => {
     );
 
     const data = JSON.parse(toolResult.content) as { ok: boolean };
-    expect(data.ok).toBe(true);
-    expect(logger.warn).toHaveBeenCalledWith('decision.write: bitable insert failed', expect.anything());
-    expect(store.write).toHaveBeenCalled();
+    expect(data).toEqual({ error: 'bitable down' });
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(store.write).not.toHaveBeenCalled();
   });
 
   it('missing key or content: returns error JSON', async () => {
@@ -335,6 +374,21 @@ describe('decision.write', () => {
 
     const data = JSON.parse(toolResult.content) as { error: string };
     expect(data.error).toContain('required');
+  });
+
+  it('invalid key: returns error before writing bitable or memory', async () => {
+    const store = makeStore();
+    const bitable = makeBitable();
+    const exec = makeExecutor({ store, bitable, chatId: CHAT_ID, logger: mockLogger, docsRoot: DOCS_ROOT });
+
+    const toolResult = await exec(
+      makeCall('decision.write', { key: 'bad key with space', content: '确认不做 PC 端' }),
+    );
+
+    const data = JSON.parse(toolResult.content) as { error: string };
+    expect(data.error).toContain('key must only contain');
+    expect(bitable.insert).not.toHaveBeenCalled();
+    expect(store.write).not.toHaveBeenCalled();
   });
 
   it('no bitable provided: skips bitable insert, still writes memory', async () => {
