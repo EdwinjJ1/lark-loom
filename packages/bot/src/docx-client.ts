@@ -408,43 +408,24 @@ export class LarkDocxClient implements DocxClient {
   /**
    * 改文档标题（issue #120 P6）。
    *
-   * 飞书 docx：文档显示的标题来自首个 H1 block 的内容。改 H1 = 改标题。
-   * 步骤：list 顶层 children → 找首个 block_type === 3 (heading1) → batchUpdate
-   * 把它的 elements 改成 [{ text_run: { content: newTitle } }]。
+   * 飞书 docx：**文件名（Drive metadata.title）来自根 block（block_type=1
+   * "page"）的 elements**，不是第一个 H1 block。改 H1 只改 doc 内显示，
+   * 不会同步到 Drive 文件名。改根 block 才能真正改文件名。
+   *
+   * E2E 实测验证：documentBlock.batchUpdate with block_id = document_id
+   * 立刻让 Drive metadata.title 同步成新值。
    */
   async renameTitle(docToken: string, newTitle: string): Promise<Result<void>> {
     if (!newTitle.trim()) return ok(undefined);
 
-    // 找首个 H1 block_id（用 documentBlock.list 不是 documentBlockChildren.list）
-    let h1BlockId: string | undefined;
-    try {
-      const res = await (this.client.docx.v1.documentBlock as any).list({
-        path: { document_id: docToken },
-        params: { page_size: 50 },
-      });
-      if (res.code !== 0) {
-        return err(makeError(ErrorCode.FEISHU_API_ERROR, `renameTitle list failed: ${res.msg}`));
-      }
-      const items =
-        (res.data?.items ?? []) as Array<{ block_id?: string; block_type?: number }>;
-      const h1 = items.find((c) => c.block_type === 3);
-      h1BlockId = h1?.block_id;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return err(makeError(ErrorCode.FEISHU_API_ERROR, `renameTitle list error: ${msg}`, e));
-    }
-    if (!h1BlockId) {
-      return err(makeError(ErrorCode.INVALID_INPUT, 'renameTitle: no H1 block found'));
-    }
-
-    // batchUpdate 改 H1 文本
     try {
       const res = await (this.client.docx.v1.documentBlock as any).batchUpdate({
         path: { document_id: docToken },
         data: {
           requests: [
             {
-              block_id: h1BlockId,
+              // block_id == document_id 就是根 page block（飞书内部叫 page block）
+              block_id: docToken,
               update_text_elements: {
                 elements: [{ text_run: { content: newTitle } }],
               },
