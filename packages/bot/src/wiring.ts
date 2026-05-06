@@ -196,7 +196,9 @@ async function handleWithHarness(
 
   const skillChoices = [...registeredSkillNames(skills), 'silent'].join('|');
   const decisionInstruction =
-    '请按需调用 skill.list / skill.read / memory.search，然后只输出 JSON：' +
+    '可调用工具：skill.list / skill.read / memory.search 用于检索，' +
+    'memory.write 用于把消息中的可记忆事实（项目目标/用户群体/截止日期/分工/关键决策/文档链接）写入记忆。' +
+    '工具调用完成后只输出 JSON：' +
     `{"skill":"${skillChoices}","reason":"一句话原因","args":{}}。` +
     '如果不应处理，skill 必须是 "silent"。不要输出 JSON 以外的文字。';
 
@@ -209,7 +211,8 @@ async function handleWithHarness(
     tools: getLLMTools(),
     executor,
     maxToolCallRounds: 5,
-    timeoutMs: 60_000,
+    model: 'lite', // 决策走 lite — pro 在长输出下经常 30s+，lite 通常 5-10s
+    timeoutMs: 600_000, // 10 分钟：留够长任务（PPT 生成等）的余地，LLM 自己也会写完结束
   });
 
   if (!result.ok) {
@@ -441,7 +444,7 @@ async function handlePassiveObserve(
     messages,
     [writeTool],
     executor,
-    30_000, // 被动观察用更短超时，30s 还回不来就放弃
+    600_000, // 10 分钟：与主动路径对齐，避免 LLM 写记忆中途被切
   );
 
   if (!result.ok) {
