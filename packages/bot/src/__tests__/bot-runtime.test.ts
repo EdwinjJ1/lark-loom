@@ -8,6 +8,7 @@ const mockMessageCreate = vi.fn();
 const mockMessageReply = vi.fn();
 const mockMessagePatch = vi.fn();
 const mockMessageList = vi.fn();
+const mockChatList = vi.fn();
 const mockChatMembersGet = vi.fn();
 const mockWsStart = vi.fn();
 const mockWsClose = vi.fn();
@@ -26,6 +27,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
             reply: mockMessageReply,
             patch: mockMessagePatch,
             list: mockMessageList,
+          },
+          chat: {
+            list: mockChatList,
           },
           v1: {
             chatMembers: {
@@ -346,5 +350,320 @@ describe('LarkBotRuntime', () => {
     expect(event.payload.user.userId).toBe('ou_user1');
     expect(event.payload.value).toEqual({ action: 'qa.reanswer', questionMessageId: 'msg_1' });
     await expect(actionHandler({})).resolves.toBeUndefined();
+  });
+});
+
+// ─── issue #86: backfill 兜底 ────────────────────────────────────────────────
+
+import { LRUSet, LarkBotRuntime as Runtime } from '../bot-runtime.js';
+
+describe('LRUSet', () => {
+  it('refreshes recency on re-add and evicts oldest at capacity', () => {
+    const s = new LRUSet<string>(3);
+    expect(s.add('a')).toBe(true);
+    expect(s.add('b')).toBe(true);
+    expect(s.add('c')).toBe(true);
+    expect(s.size()).toBe(3);
+    // re-add 'a' 刷新它的位置，下次淘汰应该淘汰 'b'
+    expect(s.add('a')).toBe(false);
+    expect(s.add('d')).toBe(true);
+    expect(s.has('a')).toBe(true);
+    expect(s.has('b')).toBe(false);
+    expect(s.has('c')).toBe(true);
+    expect(s.has('d')).toBe(true);
+  });
+
+  it('throws when capacity <= 0', () => {
+    expect(() => new LRUSet(0)).toThrow();
+  });
+});
+
+describe('LarkBotRuntime.backfillOnce()', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRegister.mockReturnValue(mockDispatcherInstance);
+    mockWsStart.mockResolvedValue(undefined);
+  });
+
+  function makeBackfillRuntime(): Runtime {
+    return new Runtime({
+      appId: 'app_id',
+      appSecret: 'app_secret',
+      backfillIntervalMs: 999_999, // 不让定时器在测试里自动跑
+      backfillPageSize: 10,
+    });
+  }
+
+  function listItem(id: string, chatId: string, ts: number, text = 'hi'): Record<string, unknown> {
+    return {
+      message_id: id,
+      chat_id: chatId,
+      chat_type: 'group',
+      message_type: 'text',
+      body: { content: JSON.stringify({ text }) },
+      create_time: String(ts),
+      mentions: [],
+      sender: { id: { open_id: 'ou_x', union_id: 'uid_x' } },
+    };
+  }
+
+  it('seed mode on first sight: populates seenIds + lastSeenAt but does NOT emit', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+
+    mockChatList.mockResolvedValue({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_old' }] },
+    });
+    mockMessageList.mockResolvedValue({
+      code: 0,
+      data: { items: [listItem('msg_old_1', 'oc_old', 1700000000000)] },
+    });
+
+    await runtime.backfillOnce();
+
+    expect(handler).not.toHaveBeenCalled();
+    // 第二次拉同群应当带上 since（lastSeenAt 已写入）
+    mockMessageList.mockClear();
+    mockMessageList.mockResolvedValue({ code: 0, data: { items: [] } });
+    await runtime.backfillOnce();
+    const params = mockMessageList.mock.calls[0]![0].params;
+    expect(params.start_time).toBeDefined();
+  });
+
+  it('emits messages in subsequent runs that are not in seenIds', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+
+    // seed
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_a' }] },
+    });
+    mockMessageList.mockResolvedValueOnce({ code: 0, data: { items: [] } });
+    await runtime.backfillOnce();
+    expect(handler).not.toHaveBeenCalled();
+
+    // 第二次：返回 2 条新消息
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_a' }] },
+    });
+    mockMessageList.mockResolvedValueOnce({
+      code: 0,
+      data: {
+        items: [
+          listItem('msg_1', 'oc_a', 1700000001000, 'one'),
+          listItem('msg_2', 'oc_a', 1700000002000, 'two'),
+        ],
+      },
+    });
+    await runtime.backfillOnce();
+
+    expect(handler).toHaveBeenCalledTimes(2);
+    const ids = (handler as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => (c[0] as { payload: { messageId: string } }).payload.messageId,
+    );
+    expect(ids).toEqual(['msg_1', 'msg_2']);
+  });
+
+  it('does NOT re-emit messages already pushed via WS', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+    await runtime.start();
+
+    // WS 推一条
+    const registered = mockRegister.mock.calls[0]![0] as Record<
+      string,
+      (data: unknown) => Promise<unknown>
+    >;
+    await registered['im.message.receive_v1']!({
+      sender: { sender_id: { open_id: 'ou_x' } },
+      message: {
+        message_id: 'msg_ws',
+        chat_id: 'oc_ws',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'from ws' }),
+        create_time: '1700000005000',
+        mentions: [],
+      },
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+    (handler as ReturnType<typeof vi.fn>).mockClear();
+
+    // backfill 返回同一条消息 + 一条新的
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_ws' }] },
+    });
+    mockMessageList.mockResolvedValueOnce({
+      code: 0,
+      data: {
+        items: [
+          listItem('msg_ws', 'oc_ws', 1700000005000, 'from ws'),
+          listItem('msg_new', 'oc_ws', 1700000006000, 'new one'),
+        ],
+      },
+    });
+    await runtime.backfillOnce();
+
+    // 只有 msg_new 被 emit
+    expect(handler).toHaveBeenCalledTimes(1);
+    const event = (handler as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+      payload: { messageId: string };
+    };
+    expect(event.payload.messageId).toBe('msg_new');
+
+    await runtime.stop();
+  });
+
+  it('continues when one chat fails: other chats still backfill', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+
+    // 把 oc_a seed 过了；oc_b 是新群
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_a' }] },
+    });
+    mockMessageList.mockResolvedValueOnce({ code: 0, data: { items: [] } });
+    await runtime.backfillOnce();
+
+    // 第二次：oc_a 成功（有 1 条新），oc_b 失败
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_a' }, { chat_id: 'oc_b' }] },
+    });
+    mockMessageList
+      .mockResolvedValueOnce({
+        code: 0,
+        data: { items: [listItem('msg_a1', 'oc_a', 1700000001000)] },
+      })
+      .mockResolvedValueOnce({ code: 99991401, msg: 'rate limited' });
+    await runtime.backfillOnce();
+
+    // oc_a 那条成功 emit，oc_b 失败但不阻断
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('chat.list failure aborts iteration but does not throw', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+
+    mockChatList.mockResolvedValueOnce({ code: 99991401, msg: 'rate limited' });
+
+    await expect(runtime.backfillOnce()).resolves.toBeUndefined();
+    expect(handler).not.toHaveBeenCalled();
+    expect(mockMessageList).not.toHaveBeenCalled();
+  });
+
+  it('bot-added event triggers immediate backfill', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+    await runtime.start();
+
+    mockChatList.mockResolvedValue({ code: 0, data: { items: [{ chat_id: 'oc_new' }] } });
+    mockMessageList.mockResolvedValue({
+      code: 0,
+      data: { items: [listItem('msg_seed', 'oc_new', 1700000000000)] },
+    });
+
+    const registered = mockRegister.mock.calls[0]![0] as Record<
+      string,
+      (data: unknown) => Promise<unknown>
+    >;
+    await registered['im.chat.member.bot.added_v1']!({
+      chat_id: 'oc_new',
+      operator_id: { open_id: 'ou_inviter' },
+    });
+
+    // 让 fire-and-forget 的 backfillOnce 跑完
+    await new Promise((r) => setTimeout(r, 0));
+
+    // botJoinedChat 事件 emit 1 次（同步）；backfill seed 模式不再 emit
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(mockChatList).toHaveBeenCalled();
+
+    await runtime.stop();
+  });
+
+  it('integration: seed [old, new], second run discovers 2 backfill messages in new chat (no dupe with WS)', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+    await runtime.start();
+
+    // seed：两个群都已知，无新消息
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_old' }, { chat_id: 'oc_new' }] },
+    });
+    mockMessageList
+      .mockResolvedValueOnce({ code: 0, data: { items: [] } })
+      .mockResolvedValueOnce({ code: 0, data: { items: [] } });
+    await runtime.backfillOnce();
+    expect(handler).not.toHaveBeenCalled();
+
+    // 模拟 WS 推一条 oc_old 的消息（已被 seen 标记）
+    const registered = mockRegister.mock.calls[0]![0] as Record<
+      string,
+      (data: unknown) => Promise<unknown>
+    >;
+    await registered['im.message.receive_v1']!({
+      sender: { sender_id: { open_id: 'ou_old' } },
+      message: {
+        message_id: 'msg_ws_dup',
+        chat_id: 'oc_old',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'old via ws' }),
+        create_time: '1700000010000',
+        mentions: [],
+      },
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    // 第二次 backfill：oc_old 拉到 ws 那条 + 1 条更新的；oc_new 拉到 2 条新
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_old' }, { chat_id: 'oc_new' }] },
+    });
+    mockMessageList
+      .mockResolvedValueOnce({
+        code: 0,
+        data: {
+          items: [
+            listItem('msg_ws_dup', 'oc_old', 1700000010000),
+            listItem('msg_old_new', 'oc_old', 1700000011000),
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        code: 0,
+        data: {
+          items: [
+            listItem('msg_new_1', 'oc_new', 1700000012000),
+            listItem('msg_new_2', 'oc_new', 1700000013000),
+          ],
+        },
+      });
+    await runtime.backfillOnce();
+
+    // 期望：handler 总共被调 4 次：
+    //   1 次 WS 推（msg_ws_dup） + 0 次 dupe + 1 次 msg_old_new + 2 次 msg_new_*
+    expect(handler).toHaveBeenCalledTimes(4);
+    const ids = (handler as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => (c[0] as { payload: { messageId: string } }).payload.messageId,
+    );
+    expect(ids).toEqual(['msg_ws_dup', 'msg_old_new', 'msg_new_1', 'msg_new_2']);
+
+    await runtime.stop();
   });
 });
