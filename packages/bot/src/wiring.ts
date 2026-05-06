@@ -86,24 +86,33 @@ export async function handleEvent(
       });
     });
   }
-  await handleWithSkillRouter(ctx, router, skills);
+  const handledBySkill = await handleWithSkillRouter(ctx, router, skills);
+  if (!handledBySkill && harness && shouldConsiderProactive(msg.text)) {
+    void handleProactiveLayer(ctx, msg, skills, harness).catch((e) => {
+      logger.warn('proactive layer threw', {
+        chatId: msg.chatId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    });
+  }
 }
 
 async function handleWithSkillRouter(
   ctx: SkillContext,
   router: SkillRouter,
   skills: Readonly<Partial<Record<SkillName, Skill>>>,
-): Promise<void> {
+): Promise<boolean> {
   const { event } = ctx;
-  if (event.type !== 'message') return;
+  if (event.type !== 'message') return false;
   const msg = event.payload;
   const intent = router.route(msg);
   const skillName = intentToSkill[intent];
-  if (!skillName) return;
+  if (!skillName) return false;
   const skill = skills[skillName];
-  if (!skill) return;
-  if (!(await skill.match(ctx))) return;
+  if (!skill) return false;
+  if (!(await skill.match(ctx))) return false;
   await runSkill(ctx, skill);
+  return true;
 }
 
 async function runSkill(ctx: SkillContext, skill: Skill): Promise<void> {
@@ -529,6 +538,17 @@ export function shouldObservePassively(text: string): boolean {
   return text.trim().length >= PASSIVE_MIN_TEXT_LENGTH;
 }
 
+const PROACTIVE_MIN_TEXT_LENGTH = 8;
+export const PROACTIVE_TIMEOUT_MS = 30_000;
+const PROACTIVE_SIGNAL_RE =
+  /(?:怎么|如何|有没有|哪里|找不到|不确定|不清楚|缺|需要什么|先做什么|下一步|资料|文档|链接|方案|规则|标准|口径|背景|参考|帮忙看看|卡住|blocked)/i;
+
+export function shouldConsiderProactive(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < PROACTIVE_MIN_TEXT_LENGTH) return false;
+  return PROACTIVE_SIGNAL_RE.test(trimmed);
+}
+
 async function handlePassiveObserve(
   ctx: SkillContext,
   msg: Message,
@@ -607,4 +627,139 @@ async function observeWithTimeout(
     model: 'lite', // 被动用便宜模型
     timeoutMs,
   });
+}
+
+type ProactiveDecision =
+  | { readonly action: 'silent'; readonly reason?: string }
+  | { readonly action: 'share' | 'clarify'; readonly text: string; readonly reason?: string };
+
+const PROACTIVE_TOOL_NAMES = new Set(['memory.search', 'skill.list', 'skill.read']);
+
+async function handleProactiveLayer(
+  ctx: SkillContext,
+  msg: Message,
+  skills: Readonly<Partial<Record<SkillName, Skill>>>,
+  harness: HarnessConfig,
+): Promise<void> {
+  const { llm, logger, runtime } = ctx;
+  const chatId = msg.chatId;
+
+  const tools = getLLMTools().filter((tool) => PROACTIVE_TOOL_NAMES.has(tool.name));
+  if (tools.length === 0) {
+    logger.warn('proactive layer: no tools available', { chatId });
+    return;
+  }
+
+  const executor = makeExecutor({
+    store: harness.memoryStore,
+    bitable: ctx.bitable,
+    skills: registeredSkillValues(skills),
+    chatId,
+    logger,
+    docsRoot: harness.docsRoot,
+    sourceSkill: 'proactive_layer',
+  });
+
+  const systemPrompt =
+    '你是 Lark Loom 的主动协作层。你只在群聊当前消息明显需要帮助时短暂介入。\n' +
+    '可做两件事：1) 主动给资料：先调用 memory.search 或 skill.read 查到相关信息，再用 1-3 句话给出链接/事实/下一步；' +
+    '2) 主动澄清：当信息不足且继续执行会误导时，只问一个具体澄清问题。\n' +
+    '不要主动推送未被触发的完整 skill 结果；不要编造资料；没有把握就 silent。\n' +
+    '输出必须是 JSON：{"action":"silent|share|clarify","text":"要发送到群里的短文本","reason":"一句话原因"}。' +
+    'action=silent 时可以省略 text。不要输出 JSON 以外的文字。';
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: msg.text },
+  ];
+
+  const result = await llm.chatWithTools(messages, {
+    tools,
+    executor,
+    maxToolCallRounds: 3,
+    model: 'lite',
+    timeoutMs: PROACTIVE_TIMEOUT_MS,
+  });
+
+  if (!result.ok) {
+    logger.warn('proactive layer failed', {
+      chatId,
+      code: result.error.code,
+      message: result.error.message,
+    });
+    return;
+  }
+
+  const decision = parseProactiveDecision(result.value.content);
+  if (!decision) {
+    logger.warn('proactive layer decision parse failed', {
+      chatId,
+      content: result.value.content,
+    });
+    return;
+  }
+
+  if (decision.action === 'silent') {
+    logger.info('proactive layer selected silent', { chatId, reason: decision.reason });
+    return;
+  }
+
+  if (decision.action === 'share' && !hasGroundingToolCall(result.value.toolCalls)) {
+    logger.warn('proactive layer share without grounding tool call', {
+      chatId,
+      reason: decision.reason,
+    });
+    return;
+  }
+
+  const text = decision.text.trim();
+  if (!text) {
+    logger.warn('proactive layer selected empty text', { chatId, action: decision.action });
+    return;
+  }
+
+  const sendResult = await runtime.sendText({ chatId, text });
+  if (!sendResult.ok) {
+    logger.error('proactive layer send text failed', {
+      chatId,
+      code: sendResult.error.code,
+      message: sendResult.error.message,
+    });
+    return;
+  }
+
+  logger.info('proactive layer replied', {
+    chatId,
+    action: decision.action,
+    reason: decision.reason,
+    rounds: result.value.rounds,
+    toolCallCount: result.value.toolCalls.length,
+  });
+}
+
+function hasGroundingToolCall(toolCalls: readonly ToolCall[]): boolean {
+  return toolCalls.some((call) => call.name === 'memory.search' || call.name === 'skill.read');
+}
+
+function parseProactiveDecision(raw: string): ProactiveDecision | null {
+  const trimmed = stripCodeFence(raw);
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      action?: unknown;
+      text?: unknown;
+      reason?: unknown;
+    };
+    if (parsed.action === 'silent') {
+      return typeof parsed.reason === 'string'
+        ? { action: 'silent', reason: parsed.reason }
+        : { action: 'silent' };
+    }
+    if (parsed.action !== 'share' && parsed.action !== 'clarify') return null;
+    if (typeof parsed.text !== 'string') return null;
+    let decision: ProactiveDecision = { action: parsed.action, text: parsed.text };
+    if (typeof parsed.reason === 'string') decision = { ...decision, reason: parsed.reason };
+    return decision;
+  } catch {
+    return null;
+  }
 }
