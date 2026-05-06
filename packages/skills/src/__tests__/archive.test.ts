@@ -644,4 +644,76 @@ describe('extractLinksFromMemory', () => {
     })) as unknown as BitableRow[];
     expect(extractLinksFromMemory(memories).length).toBeLessThanOrEqual(6);
   });
+
+  // ─── 实战 bug 修复回归 case（复赛实测 PR #116 后发现的）─────────────────────
+
+  // bug：同一个 PPT URL 在 3 条 memory 里出现（slides 写一次 + 群里被动观察捕获 2 次）
+  // → 原版会列 3 条（1 演示 PPT + 2 相关文档），UX 灾难
+  it('dedupes same URL across multiple memory entries — keeps prefixed entry', () => {
+    const sharedPptUrl = 'https://example.feishu.cn/slides/abc123';
+    const memories: BitableRow[] = [
+      {
+        content: '今天看一下 PPT 在这 ' + sharedPptUrl,
+        created_at: 1,
+      } as unknown as BitableRow,
+      {
+        content: `[slides] 期末汇报\n${sharedPptUrl}`,
+        created_at: 2,
+      } as unknown as BitableRow,
+      {
+        content: '@bot 这个 PPT ' + sharedPptUrl + ' 帮我看一下',
+        created_at: 3,
+      } as unknown as BitableRow,
+    ];
+    const links = extractLinksFromMemory(memories);
+    // 同 URL 只能出现 1 次，且必须是有 [slides] 前缀的"演示 PPT"标签
+    expect(links).toHaveLength(1);
+    expect(links[0]!.kind).toBe('slides');
+    expect(links[0]!.label).toBe('演示 PPT');
+    expect(links[0]!.url).toBe(sharedPptUrl);
+  });
+
+  // bug：没前缀的 PPT 链接被标"相关文档"，让用户失去信任
+  // → 改进后按 URL 路径推断：/slides/ → 演示 PPT
+  it('infers label from URL path for non-prefixed entries', () => {
+    const memories: BitableRow[] = [
+      {
+        content: '群里贴的链接 https://x.feishu.cn/slides/abc',
+        created_at: 1,
+      } as unknown as BitableRow,
+      {
+        content: '另一个 https://x.feishu.cn/sheets/xyz',
+        created_at: 2,
+      } as unknown as BitableRow,
+      {
+        content: '文档 https://x.feishu.cn/docx/doc1',
+        created_at: 3,
+      } as unknown as BitableRow,
+    ];
+    const links = extractLinksFromMemory(memories);
+    // 注意：inferred 桶最多 2 条，所以 3 条里只有 2 条入选（按 recordedAt 倒序）
+    expect(links.length).toBeLessThanOrEqual(2);
+    // 最新两条：docx + sheets
+    expect(links.find((l) => l.url.includes('/docx/'))?.label).toBe('飞书文档');
+    expect(links.find((l) => l.url.includes('/sheets/'))?.label).toBe('飞书表格');
+    // slides 那条因为按 recordedAt 排序排在第三位被截掉，没有任何 link 是 "相关文档"
+    expect(links.every((l) => l.label !== '相关文档')).toBe(true);
+  });
+
+  // canonical URL：feishu 链接带不带 query 参数都视为同一个
+  it('canonicalizes URL — same path with different query strings treated as one', () => {
+    const memories: BitableRow[] = [
+      {
+        content: '[需求文档] PRD\nhttps://x.feishu.cn/docx/abc?from=share',
+        created_at: 1,
+      } as unknown as BitableRow,
+      {
+        content: '另一个版本 https://x.feishu.cn/docx/abc#section',
+        created_at: 2,
+      } as unknown as BitableRow,
+    ];
+    const links = extractLinksFromMemory(memories);
+    expect(links).toHaveLength(1);
+    expect(links[0]!.kind).toBe('requirementDoc'); // 显式标注 win
+  });
 });
