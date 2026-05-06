@@ -29,7 +29,7 @@
  *   - 2025 Hallucination Survey (frontiersin.org)
  */
 
-import type { BitableRow, SchemaLike } from '@seedhac/contracts';
+import type { ArchiveLink, BitableRow, SchemaLike } from '@seedhac/contracts';
 
 // ─── ArchiveSummary Schema（5 字段）─────────────────────────────────────────
 
@@ -290,3 +290,208 @@ export function renderArchiveSummary(
 }
 
 export { EMPTY_SUMMARY };
+
+// ─── 防幻觉 verify（issue #114 加固）──────────────────────────────────────────
+//
+// 基于 2025 主流 hallucination 论文的 "decompose-then-verify" 思路的轻量实现：
+//   1. 把每条 claim 切成 2-gram（中文）+ 长 ASCII token
+//   2. 用相同方法把 memory + decision + todo 三表 content 拼成 source corpus
+//   3. claim grams 在 source 里的覆盖率 < threshold → drop
+//
+// 不验证 goal / whatWorkedWell / whatToImprove —— 这些字段允许抽象表述
+// （如"前端表单一次过"），strict 验证会误删合法内容。重点防 outcomes
+// （最容易出"完成了 OAuth 系统"这种具体名词幻觉）和 openIssues（理论上
+// 应能匹配 pending todos）。
+
+const VERIFY_THRESHOLD = 0.25; // 25% gram 覆盖率（保留 75% 假阴性，避免误删）
+
+function tokenizeForVerify(text: string): Set<string> {
+  const grams = new Set<string>();
+  // 中文 2-gram
+  const chineseSegments = text.match(/[一-龥]+/g) ?? [];
+  for (const segment of chineseSegments) {
+    for (let i = 0; i < segment.length - 1; i++) {
+      grams.add(segment.slice(i, i + 2));
+    }
+  }
+  // ASCII 单词长度 ≥ 3（"PRD" / "OAuth" / "iOS" 等都进来）
+  const asciiTokens = text.match(/[a-zA-Z]{3,}/g) ?? [];
+  for (const t of asciiTokens) grams.add(t.toLowerCase());
+  return grams;
+}
+
+function isClaimGrounded(claim: string, sourceGrams: Set<string>): boolean {
+  const claimGrams = tokenizeForVerify(claim);
+  if (claimGrams.size === 0) return true; // 全标点 / 短数字 → 无法判别，放行
+  let hits = 0;
+  for (const g of claimGrams) if (sourceGrams.has(g)) hits++;
+  return hits / claimGrams.size >= VERIFY_THRESHOLD;
+}
+
+export interface VerifyLogger {
+  warn(msg: string, meta?: Record<string, unknown>): void;
+}
+
+/**
+ * 把 LLM 输出的 ArchiveSummary 跟原始 memory/decision/todo 做 grounding 校验。
+ * 只过滤 outcomes 和 openIssues 两个字段（最易出具体名词幻觉的）。
+ */
+export function verifyArchiveSummary(
+  summary: ArchiveSummary,
+  memories: readonly BitableRow[],
+  decisions: readonly BitableRow[],
+  todos: readonly BitableRow[],
+  logger?: VerifyLogger,
+): { verified: ArchiveSummary; droppedCount: number } {
+  const sourceText = [
+    ...memories.map((r) => String(r['content'] ?? '')),
+    ...decisions.map((r) => String(r['content'] ?? '')),
+    ...todos.map((r) => String(r['content'] ?? '')),
+  ].join('\n');
+  const sourceGrams = tokenizeForVerify(sourceText);
+
+  let droppedCount = 0;
+  const filterField = (items: readonly string[], fieldName: string): string[] => {
+    const kept: string[] = [];
+    const dropped: string[] = [];
+    for (const item of items) {
+      if (isClaimGrounded(item, sourceGrams)) kept.push(item);
+      else dropped.push(item);
+    }
+    if (dropped.length > 0) {
+      droppedCount += dropped.length;
+      logger?.warn(`archive verify: dropped ${dropped.length} unverifiable claims`, {
+        field: fieldName,
+        dropped,
+      });
+    }
+    return kept;
+  };
+
+  return {
+    verified: {
+      goal: summary.goal,
+      outcomes: filterField(summary.outcomes, 'outcomes'),
+      whatWorkedWell: summary.whatWorkedWell, // 抽象表述，不验证
+      whatToImprove: summary.whatToImprove, // 抽象表述，不验证
+      openIssues: filterField(summary.openIssues, 'openIssues'),
+    },
+    droppedCount,
+  };
+}
+
+// ─── 飞书 Doc 渲染（issue #114）───────────────────────────────────────────────
+
+const DOC_LINK_ICONS: Record<NonNullable<ArchiveLink['kind']>, string> = {
+  requirementDoc: '📋',
+  slides: '🎯',
+  taskAssignment: '✅',
+  bitable: '📊',
+  other: '📎',
+};
+
+/**
+ * 把结构化归档数据渲染成 markdown，供 docx.createFromMarkdown 创建飞书 doc。
+ *
+ * 6 段结构（基于 PMI / Atlassian / SRE 共识 + 评委友好性）：
+ *   1. 摘要（summary text，含项目目标）
+ *   2. 项目产出（链接列表）
+ *   3. 顺利之处
+ *   4. 待改进
+ *   5. 关键决策（来自 decision 表）
+ *   6. 任务完成情况（来自 todo 表）
+ *   7. 遗留问题（openIssues + pending todos）
+ */
+export function renderArchiveDocMarkdown(input: {
+  readonly chatName: string;
+  readonly summary: ArchiveSummary;
+  readonly summaryText: string;
+  readonly links: readonly ArchiveLink[];
+  readonly decisions: readonly BitableRow[];
+  readonly todos: readonly BitableRow[];
+  readonly generatedAt: number;
+}): string {
+  const { chatName, summary, summaryText, links, decisions, todos, generatedAt } = input;
+
+  const dateStr = new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(generatedAt));
+
+  const lines: string[] = [];
+  lines.push(`# 项目交付报告 - ${chatName} - ${dateStr}`, '');
+  lines.push(`> 由 Lark Loom 于 ${dateStr} 自动生成`, '');
+
+  // 1. 摘要
+  lines.push('## 摘要', '');
+  if (summary.goal) {
+    lines.push(`**项目目标**：${summary.goal}`, '');
+  }
+  lines.push(summaryText, '');
+
+  // 2. 项目产出
+  if (links.length > 0) {
+    lines.push('## 项目产出', '');
+    for (const l of links) {
+      const icon = DOC_LINK_ICONS[l.kind ?? 'other'] ?? '📎';
+      lines.push(`- ${icon} [${l.label}](${l.url})`);
+    }
+    lines.push('');
+  }
+
+  // 3. 顺利之处
+  if (summary.whatWorkedWell.length > 0) {
+    lines.push('## 顺利之处', '');
+    summary.whatWorkedWell.forEach((w) => lines.push(`- ${w}`));
+    lines.push('');
+  }
+
+  // 4. 待改进
+  if (summary.whatToImprove.length > 0) {
+    lines.push('## 待改进', '');
+    summary.whatToImprove.forEach((w) => lines.push(`- ${w}`));
+    lines.push('');
+  }
+
+  // 5. 关键决策（来自 decision 表）
+  if (decisions.length > 0) {
+    lines.push('## 关键决策', '');
+    decisions.slice(0, 20).forEach((d, i) => {
+      const content = String(d['content'] ?? '').trim();
+      if (content) lines.push(`${i + 1}. ${content}`);
+    });
+    lines.push('');
+  }
+
+  // 6. 任务完成情况（来自 todo 表）
+  if (todos.length > 0) {
+    const doneCount = todos.filter((t) => t['status'] === 'done').length;
+    lines.push('## 任务完成情况', '');
+    lines.push(`总计 ${todos.length} 项任务，已完成 ${doneCount} 项。`, '');
+    todos.slice(0, 30).forEach((t) => {
+      const status = String(t['status'] ?? 'unknown');
+      const content = String(t['content'] ?? '').trim();
+      const owner = t['owner'] ? String(t['owner']) : '';
+      const ddl = t['ddl'] ? `（${String(t['ddl'])}）` : '';
+      const statusIcon = status === 'done' ? '✅' : status === 'blocked' ? '🚫' : '⏳';
+      const ownerPart = owner ? ` — ${owner}` : '';
+      lines.push(`- ${statusIcon} ${content}${ownerPart}${ddl}`);
+    });
+    lines.push('');
+  }
+
+  // 7. 遗留问题（openIssues + 未完成 todos）
+  const pendingTodos = todos.filter((t) => t['status'] !== 'done').slice(0, 10);
+  if (summary.openIssues.length > 0 || pendingTodos.length > 0) {
+    lines.push('## 遗留问题', '');
+    summary.openIssues.forEach((o) => lines.push(`- ${o}`));
+    pendingTodos.forEach((t) => {
+      const content = String(t['content'] ?? '').trim();
+      if (content) lines.push(`- ${content}`);
+    });
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}

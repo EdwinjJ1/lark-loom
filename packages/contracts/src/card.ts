@@ -140,6 +140,14 @@ export interface ArchiveCardInput {
   readonly taskStats?: string;
   /** 可选：决策数 */
   readonly decisionCount?: number;
+  /** 完整归档报告飞书 doc URL（issue #114）；有则渲染"查看完整报告"按钮 */
+  readonly reportDocUrl?: string;
+  /** loading 占位：先发出去拿 messageId，跑完后 patchCard 替换为终态 */
+  readonly isLoading?: boolean;
+  /** loading 时显示的预估时长（秒） */
+  readonly etaSeconds?: number;
+  /** error 终态：跑挂时把 loading 卡 patch 成失败提示 */
+  readonly errorMessage?: string;
 }
 
 // ── 附属链路 Input ────────────────────────────────────────────────────────────

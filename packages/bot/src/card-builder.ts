@@ -449,11 +449,43 @@ const ARCHIVE_LINK_ICONS: Record<NonNullable<ArchiveLink['kind']>, string> = {
 };
 
 function buildArchive(input: ArchiveCardInput): Card {
+  // ── loading 态（issue #114）：先发出去拿 messageId，跑完用 patchCard 替换 ──
+  if (input.isLoading) {
+    const etaLine = input.etaSeconds
+      ? `预计耗时约 ${input.etaSeconds} 秒，请稍候。`
+      : '通常需要 30-60 秒，请稍候。';
+    return card('archive', {
+      schema: '2.0',
+      header: { title: pt('归档进行中…'), template: 'blue' },
+      body: {
+        elements: [
+          md(`📦 正在整理项目交付报告\n\n${etaLine}`),
+          md('_我会汇总需求文档 / PPT / 会议决策 / 任务完成情况，生成一份正式归档报告。完成后这条卡片会自动更新。_'),
+        ],
+      },
+    });
+  }
+
+  // ── error 态：归档过程挂了，patch 上失败提示 ──────────────────────────
+  if (input.errorMessage) {
+    return card('archive', {
+      schema: '2.0',
+      header: { title: pt('归档失败'), template: 'red' },
+      body: {
+        elements: [
+          md(`⚠️ ${input.errorMessage}`),
+          md('_可以稍后再试一次，或 @bot 单独询问需要归档的内容。_'),
+        ],
+      },
+    });
+  }
+
+  // ── final 态 ────────────────────────────────────────────────────────────
   const elements: BodyElement[] = [
     md(`**${input.title}**${input.summary ? `\n\n${input.summary}` : ''}`),
   ];
 
-  // 产出物链接列表（issue #104 核心）：每条 markdown 渲染图标 + label + 可点击链接
+  // 产出物链接列表：每条 markdown 渲染图标 + label + 可点击链接
   if (input.links && input.links.length > 0) {
     elements.push(hr());
     const linkLines = input.links.map((l) => {
@@ -475,8 +507,13 @@ function buildArchive(input: ArchiveCardInput): Card {
   const tagLine = input.tags.length ? input.tags.map((t) => `\`${t}\``).join(' ') : '—';
   elements.push(hr(), md(`🏷 标签：${tagLine}\n📌 归档编号：\`${input.recordId}\``));
 
-  // bitableUrl 缺省：不渲染坏按钮，给纯文本 fallback（issue #104 验收标准）
-  if (input.bitableUrl) {
+  // 主按钮优先级：reportDocUrl（issue #114 完整报告）> bitableUrl（issue #104 表格）
+  if (input.reportDocUrl) {
+    elements.push(btn('查看完整报告', { action: 'open_url', url: input.reportDocUrl }, 'primary'));
+    if (input.bitableUrl) {
+      elements.push(btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'default'));
+    }
+  } else if (input.bitableUrl) {
     elements.push(btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'primary'));
   } else {
     elements.push(md('_归档详情已写入 memory，可通过 @bot 查询_'));

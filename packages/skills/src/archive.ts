@@ -1,19 +1,17 @@
 /**
- * archive — 项目交付归档（issue #104 复赛 MVP）
+ * archive — 项目交付归档（issue #104 / #114）
  *
  * 触发：群里出现 复盘 / 归档 / 项目结束 / 收尾 / 准备交付（被动监听，无需 @bot）
  *
- * 数据流：
- *   1. 并行拉 memory / decision / todo 三张表（chatId 过滤）
- *   2. 从 memory.content 提取本次产出物链接：[需求文档] / [slides] / [任务表] 前缀 + URL
- *   3. LLM 生成 100-200 字交付摘要
- *   4. 渲染 archive 卡：摘要 + 多链接列表 + 决策数 + 任务完成情况
- *   5. 写一条 kind=project 的归档 memory 作为审计
- *
- * 健壮性：
- *   - 任一 bitable.find 失败 → 用空数据继续（不阻断）
- *   - LLM 失败 → 降级摘要 "项目已收尾，详细产出请见上方链接"
- *   - 归档 memory 写入失败 → warn 不阻断卡片输出
+ * 数据流（issue #114 升级为 loading→doc→final 三阶段）：
+ *   1. sendCard loading 占位（让用户知道 bot 在工作）
+ *   2. 并行拉 memory / decision / todo 三张表
+ *   3. extractLinksFromMemory 收集产出物链接
+ *   4. askStructured + ArchiveSummarySchema → 5 字段摘要
+ *   5. verifyArchiveSummary（decompose-then-verify）过滤幻觉
+ *   6. renderArchiveDocMarkdown → 创建飞书归档 doc + 给群成员授权
+ *   7. patchCard 成 final 态：摘要 + 链接 + "查看完整报告"按钮
+ *   8. 任一中间失败 → patchCard 成 error 态，不阻塞
  */
 
 import {
@@ -32,7 +30,9 @@ import {
   ARCHIVE_SUMMARY_PROMPT,
   ArchiveSummarySchema,
   EMPTY_SUMMARY,
+  renderArchiveDocMarkdown,
   renderArchiveSummary,
+  verifyArchiveSummary,
 } from './prompts/archive.js';
 
 const TRIGGER_RE = /复盘|归档|项目结束|收尾|准备交付/i;
@@ -143,8 +143,28 @@ export const archiveSkill: Skill = {
       return err(makeError(ErrorCode.INVALID_INPUT, 'archive only handles message events'));
     }
     const { chatId } = ctx.event.payload;
-    // memory schema 用 chat_id（PR #96 修复后），但 decision/todo 仍是旧 chatId
-    // 这里 archive 三张表都查，filter 字段名按各自 schema 来。
+
+    // 0. loading 占位卡（issue #114）—— bot 收到指令立刻给反馈
+    const loadingCard = ctx.cardBuilder.build('archive', {
+      recordId: '',
+      title: '归档进行中',
+      bitableUrl: '',
+      tags: [],
+      isLoading: true,
+      etaSeconds: 30,
+    });
+    const loadingSent = await ctx.runtime.sendCard({ chatId, card: loadingCard });
+    if (!loadingSent.ok) return err(loadingSent.error);
+    const loadingMessageId = loadingSent.value.messageId;
+
+    // 设计：archive 全程降级路径，没有真正的"硬失败"需要 patch error 卡：
+    //   - bitable.find 失败 → 用空数据继续
+    //   - LLM 失败 → fallback summary
+    //   - doc 创建失败 → 卡片少一个按钮，仍然 patch final
+    //   - patch final 失败 → audit memory 仍然写入
+
+    // 1. 拉三张表（任一失败用空数据继续）
+    // memory schema 用 chat_id（PR #96 后），decision/todo 仍是旧 chatId
     const memoryFilter = `AND(CurrentValue.[chat_id]="${chatId}")`;
     const legacyFilter = `AND(CurrentValue.[chatId]="${chatId}")`;
 
@@ -174,12 +194,10 @@ export const archiveSkill: Skill = {
       taskCompletion: todos.length > 0 ? `${doneCount}/${todos.length}` : null,
     };
 
-    // 数据严重不足（< 3 条总记录）→ 跳过 LLM，走静态 fallback。
-    // 既省 token 又彻底防止 LLM 在空数据上幻觉编造。
+    // 2. LLM 摘要（< 3 条记录直接跳过，避免空数据幻觉）
     const totalRecords = memories.length + decisions.length + todos.length;
     let summary = EMPTY_SUMMARY;
     if (totalRecords >= 3) {
-      // askStructured + JSON schema 约束：豆包必须按 5 字段填，不能瞎扯
       const llmResult = await ctx.llm.askStructured(
         ARCHIVE_SUMMARY_PROMPT(memories, decisions, todos),
         ArchiveSummarySchema,
@@ -187,6 +205,14 @@ export const archiveSkill: Skill = {
       );
       if (llmResult.ok) {
         summary = llmResult.value;
+        // 3. decompose-then-verify：把 outcomes / openIssues 跟 source 做 grounding 校验
+        const verifyRes = verifyArchiveSummary(summary, memories, decisions, todos, ctx.logger);
+        summary = verifyRes.verified;
+        if (verifyRes.droppedCount > 0) {
+          ctx.logger.info('archive: verify dropped unverifiable claims', {
+            droppedCount: verifyRes.droppedCount,
+          });
+        }
       } else {
         ctx.logger.warn('archive: structured LLM failed, using fallback summary', {
           error: llmResult.error.message,
@@ -200,16 +226,56 @@ export const archiveSkill: Skill = {
       });
     }
 
-    // 渲染：structured object → 100-200 字自然语言（JS 模板，不过二次 LLM）
     const summaryText = renderArchiveSummary(summary, computed);
 
+    // 4. 创建飞书归档 doc（issue #114）
     const now = Date.now();
     const recordId = `archive_${chatId}_${now}`;
-    // BITABLE_ARCHIVE_URL 是个总入口（多维表格 dashboard 链接），缺省时卡片
-    // 自动降级为纯文本说明，不渲染坏按钮（issue #104 验收标准）
-    const bitableUrl = process.env['BITABLE_ARCHIVE_URL']?.trim() ?? '';
+    const docTitle = `项目交付报告 - ${new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date(now))}`;
+    const docMarkdown = renderArchiveDocMarkdown({
+      chatName: '本群',
+      summary,
+      summaryText,
+      links,
+      decisions,
+      todos,
+      generatedAt: now,
+    });
 
-    const card = ctx.cardBuilder.build('archive', {
+    let reportDocUrl: string | undefined;
+    let reportDocToken: string | undefined;
+    const docResult = await ctx.docx.createFromMarkdown(docTitle, docMarkdown);
+    if (!docResult.ok) {
+      ctx.logger.warn('archive: create feishu doc failed, fall back to card without doc', {
+        error: docResult.error.message,
+      });
+    } else {
+      reportDocUrl = docResult.value.url;
+      reportDocToken = docResult.value.docToken;
+
+      // 给群成员授 edit 权限（复用 slides / requirementDoc 的模式）
+      const membersRes = await ctx.runtime.fetchMembers({ chatId });
+      if (membersRes.ok && membersRes.value.members.length > 0) {
+        const memberIds = membersRes.value.members.map((m) => m.userId);
+        const grantRes = await ctx.docx.grantMembersEdit(reportDocToken, 'docx', memberIds);
+        if (!grantRes.ok) {
+          ctx.logger.warn('archive: grant members edit failed', {
+            code: grantRes.error.code,
+            message: grantRes.error.message,
+          });
+        } else {
+          ctx.logger.info('archive: granted members edit', { memberCount: memberIds.length });
+        }
+      }
+    }
+
+    // 5. patchCard 成 final 态
+    const bitableUrl = process.env['BITABLE_ARCHIVE_URL']?.trim() ?? '';
+    const finalCard = ctx.cardBuilder.build('archive', {
       recordId,
       title: '项目已交付',
       bitableUrl,
@@ -218,11 +284,24 @@ export const archiveSkill: Skill = {
       links,
       decisionCount: computed.decisionCount,
       ...(computed.taskCompletion ? { taskStats: `${computed.taskCompletion} 已完成` } : {}),
+      ...(reportDocUrl ? { reportDocUrl } : {}),
     });
+    const patchRes = await ctx.runtime.patchCard({
+      messageId: loadingMessageId,
+      card: finalCard,
+    });
+    if (!patchRes.ok) {
+      ctx.logger.warn('archive: patch final card failed', {
+        code: patchRes.error.code,
+        message: patchRes.error.message,
+      });
+      // patch 失败不阻塞 audit memory 写入；用户至少能在 memory 里看到归档
+    }
 
-    // 写归档 memory（audit + 后续 QA / recall 可检索）— 失败不阻断
+    // 6. 写归档 memory（含 doc URL）— 失败不阻断
     const auditContent = [
       `[archive] ${summaryText}`,
+      ...(reportDocUrl ? [`完整报告: ${reportDocUrl}`] : []),
       ...links.map((l) => `${l.label}: ${l.url}`),
     ].join('\n');
     const memInsert = await ctx.bitable.insert({
@@ -232,7 +311,7 @@ export const archiveSkill: Skill = {
         kind: 'project',
         chat_id: chatId,
         content: auditContent,
-        importance: 8, // 交付归档：高优先级
+        importance: 8,
         last_access: now,
         created_at: now,
         source_skill: 'archive',
@@ -241,9 +320,9 @@ export const archiveSkill: Skill = {
     if (!memInsert.ok)
       ctx.logger.warn('archive: insert audit memory failed', { error: memInsert.error.message });
 
+    // 不返回 card —— 上面已经 patchCard 完成。返回空 SkillResult 防止 wiring 重发
     return ok({
-      card,
-      reasoning: `归档 ${decisions.length} 条决策，${todos.length} 条任务（${doneCount} 完成），收集 ${links.length} 条产出物链接`,
+      reasoning: `归档 ${decisions.length} 条决策，${todos.length} 条任务（${doneCount} 完成），收集 ${links.length} 条产出物链接${reportDocUrl ? '，已生成报告 doc' : ''}`,
     });
   },
 };
