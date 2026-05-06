@@ -591,6 +591,8 @@ async function handlePassiveObserve(
     '你是一个静默的记忆观察者。读到的消息**不要回复用户**。\n' +
     '如果消息包含值得群组长期记住的事实（项目目标/用户群体/截止日期/分工/关键文档/重要决策），' +
     '调用 memory.write 写入；importance 只在很重要时（≥7）才指定。\n' +
+    'key 命名规范：用稳定的语义英文短语（snake_case），相同主题复用同一 key 实现覆盖更新，避免写重复条目。\n' +
+    '示例：截止日期 → "project_deadline"；分工 → "task_owner_<姓名拼音>"；项目目标 → "project_goal"。\n' +
     '若消息是闲聊/重复/没有事实信息，什么都不调，直接输出 SKIP。';
 
   const messages: ChatMessage[] = [
