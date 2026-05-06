@@ -375,6 +375,15 @@ function buildSummary(input: SummaryCardInput): Card {
     elements.push(md('未在群历史中识别到明确的决策、行动项或会议结论，可补充后再触发。'));
   }
 
+  // 混合方案：卡片显示决策/行动项摘要，按钮跳转完整会议纪要文档
+  if (input.docUrl) {
+    elements.push(
+      hr(),
+      btn('打开完整纪要', { action: 'open_url', url: input.docUrl }, 'primary'),
+      md('_仅群内成员可查看与编辑_'),
+    );
+  }
+
   return card('summary', {
     schema: '2.0',
     header: { title: pt('会议纪要已就绪'), template: HEADER_TEMPLATE },

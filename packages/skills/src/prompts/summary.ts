@@ -280,6 +280,64 @@ export function SUMMARY_PROMPT(history: readonly Message[]): string {
   ].join('\n');
 }
 
+// ─── 渲染器：structured → 飞书文档 markdown ───────────────────────────────────
+//
+// 仿 requirementDoc 的 renderRequirementDocMarkdown，给会议纪要做长版文档归档。
+// 走 JS 模板不过 LLM，避免二次幻觉。
+
+export function renderMeetingMinutesMarkdown(
+  s: SummaryExtraction,
+  meta: { readonly chatTitle?: string; readonly generatedAt: number },
+): string {
+  const lines: string[] = [];
+  const dateStr = new Date(meta.generatedAt).toLocaleDateString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+
+  const title = meta.chatTitle ? `${meta.chatTitle} 会议纪要` : '会议纪要';
+  lines.push(`# ${title}（${dateStr}）`, '');
+
+  if (s.summary && s.summary.trim()) {
+    lines.push(`> ${s.summary.trim()}`, '');
+  }
+
+  if (s.decisions.length) {
+    lines.push('## ✅ 决策', '', ...s.decisions.map((d) => `- ${d}`), '');
+  }
+
+  if (s.actionItems.length) {
+    lines.push('## 🔲 行动项', '');
+    for (const a of s.actionItems) {
+      const owner = a.owner ? `**@${a.owner}**` : '*待指定*';
+      const ddl = a.ddl ? `（截止 ${a.ddl}）` : '';
+      lines.push(`- ${owner}: ${a.content}${ddl}`);
+    }
+    lines.push('');
+  }
+
+  if (s.issues.length) {
+    lines.push('## 🔍 遗留问题', '', ...s.issues.map((i) => `- ${i}`), '');
+  }
+
+  if (s.nextSteps.length) {
+    lines.push('## ⏭️ 下一步', '', ...s.nextSteps.map((n) => `- ${n}`), '');
+  }
+
+  if (
+    !s.summary &&
+    !s.decisions.length &&
+    !s.actionItems.length &&
+    !s.issues.length &&
+    !s.nextSteps.length
+  ) {
+    lines.push('（未在群历史中识别到明确的决策、行动项或会议结论。）');
+  }
+
+  return lines.join('\n');
+}
+
 // ─── 渲染器：structured → 卡片 summary 字段（不再过 LLM）──────────────────────
 //
 // 跟 archive 一样：渲染走 JS 模板，避免二次幻觉。

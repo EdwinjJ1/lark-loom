@@ -102,6 +102,8 @@ export interface SummaryCardInput {
   readonly followUps: readonly string[];
   /** 一句话/一段话整体摘要，渲染在顶部，结构化字段为空时仍能给用户可读的输出 */
   readonly summary?: string;
+  /** 完整会议纪要飞书文档链接（混合方案：卡片内嵌 + 长版文档归档）*/
+  readonly docUrl?: string;
   readonly isLoading?: boolean;
   readonly errorMessage?: string;
 }

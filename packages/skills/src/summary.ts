@@ -28,6 +28,7 @@ import {
   EMPTY_EXTRACTION,
   SummaryExtractionSchema,
   renderSummaryProse,
+  renderMeetingMinutesMarkdown,
   type SummaryExtraction,
 } from './prompts/summary.js';
 import {
@@ -141,6 +142,61 @@ async function extractSummary(
   return ok(llmResult.value);
 }
 
+/**
+ * 把抽取结果落成飞书文档，并给当前群成员授「可编辑」。任何步骤失败只 warn，
+ * 卡片照常 patch 成不带 docUrl 的版本（degrade 不阻断）。
+ */
+async function createMeetingMinutesDoc(
+  ctx: SkillContext,
+  summary: SummaryExtraction,
+): Promise<string | undefined> {
+  if (ctx.event.type !== 'message') return undefined;
+  const { chatId } = ctx.event.payload;
+
+  const markdown = renderMeetingMinutesMarkdown(summary, { generatedAt: Date.now() });
+  const dateStr = new Date().toLocaleDateString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  const docTitle = `会议纪要 ${dateStr}`;
+
+  const fileResult = await ctx.docx.createFromMarkdown(docTitle, markdown);
+  if (!fileResult.ok) {
+    ctx.logger.warn('summary: createFromMarkdown failed; degrade to card-only', {
+      code: fileResult.error.code,
+      message: fileResult.error.message,
+    });
+    return undefined;
+  }
+
+  // 给当前群成员授可编辑权限（仿 requirementDoc）— 失败仅 warn 不阻断
+  const membersRes = await ctx.runtime.fetchMembers({ chatId });
+  if (membersRes.ok && membersRes.value.members.length > 0) {
+    const memberIds = membersRes.value.members.map((m) => m.userId);
+    const grantRes = await ctx.docx.grantMembersEdit(fileResult.value.docToken, 'docx', memberIds);
+    if (!grantRes.ok) {
+      ctx.logger.warn('summary: grant members edit failed', {
+        code: grantRes.error.code,
+        message: grantRes.error.message,
+      });
+    } else {
+      ctx.logger.info('summary: granted members edit', { memberCount: memberIds.length });
+    }
+  } else if (!membersRes.ok) {
+    ctx.logger.warn('summary: fetchMembers failed; skip granting edit', {
+      code: membersRes.error.code,
+      message: membersRes.error.message,
+    });
+  }
+
+  ctx.logger.info('summary: created feishu meeting minutes doc', {
+    docToken: fileResult.value.docToken,
+    title: docTitle,
+  });
+  return fileResult.value.url;
+}
+
 export const summarySkill: Skill = {
   name: 'summary',
   metadata: {
@@ -220,7 +276,16 @@ export const summarySkill: Skill = {
     }
     const summary = extractResult.value;
 
-    // d. patch 成最终卡片 — 优先做这一步，让用户最快看到结果；后面的写入是异步副作用
+    // d. 创建飞书文档（混合方案）— 失败仅 warn，卡片仍照常 patch（degrade 到无 docUrl）
+    //    若群里全是闲聊（4 字段全空），跳过建 doc，避免产生空文档
+    const hasContent =
+      summary.decisions.length > 0 ||
+      summary.actionItems.length > 0 ||
+      summary.issues.length > 0 ||
+      summary.nextSteps.length > 0;
+    const docUrl = hasContent ? await createMeetingMinutesDoc(ctx, summary) : undefined;
+
+    // e. patch 成最终卡片 — 让用户最快看到结果；后面的写入是异步副作用
     const finalCard = ctx.cardBuilder.build('summary', {
       title: '会议纪要',
       summary: renderSummaryProse(summary),
@@ -232,6 +297,7 @@ export const summarySkill: Skill = {
         ...(a.ddl !== undefined ? { due: a.ddl } : {}),
       })),
       followUps: [...summary.issues, ...summary.nextSteps],
+      ...(docUrl ? { docUrl } : {}),
     });
     const patchRes = await ctx.runtime.patchCard({ messageId: loadingMessageId, card: finalCard });
     if (!patchRes.ok) {
@@ -246,6 +312,7 @@ export const summarySkill: Skill = {
         loadingMessageId,
         decisions: summary.decisions.length,
         actionItems: summary.actionItems.length,
+        docUrl: docUrl ?? '(none)',
       });
     }
 
@@ -274,6 +341,7 @@ export const summarySkill: Skill = {
     }
 
     // memory 记一条 chat 类型 audit（PR #96 后所有 skill 字段对齐 MemoryRecord）
+    // 含 docUrl 时把 [会议纪要] 前缀 + URL 嵌进 content，archive skill 能识别为产出物
     const now = Date.now();
     const memRes = await ctx.bitable.insert({
       table: 'memory',
@@ -282,7 +350,7 @@ export const summarySkill: Skill = {
         kind: 'chat',
         chat_id: chatId,
         content: [
-          summary.summary,
+          docUrl ? `[会议纪要] ${summary.summary || '会议纪要已生成'}\n${docUrl}` : summary.summary,
           summary.decisions.length ? `决策：${summary.decisions.join('；')}` : '',
           summary.actionItems.length
             ? `行动项：${summary.actionItems.map((a) => `${a.owner || '?'}: ${a.content}`).join('；')}`
@@ -302,7 +370,7 @@ export const summarySkill: Skill = {
     return ok({
       reasoning: `提取到 ${summary.decisions.length} 条决策，${summary.actionItems.length} 条行动项${
         summary.issues.length ? `，${summary.issues.length} 个待澄清` : ''
-      }`,
+      }${docUrl ? '；已归档至飞书文档' : ''}`,
     });
   },
 };
