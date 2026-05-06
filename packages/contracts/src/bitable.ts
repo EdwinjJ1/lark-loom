@@ -40,6 +40,8 @@ export interface MemoryRecord {
   readonly user_id?: string;
   readonly key: string;
   readonly content: string;
+  /** 原始文字，写入前提炼时保留；未提炼时为 undefined */
+  readonly raw?: string;
   readonly importance: number;
   readonly last_access: number;
   readonly created_at: number;

@@ -294,6 +294,8 @@ export class MemoryStore implements IMemoryStore {
     const now = this.now();
     const summarized = await this.summarizeContent(input.content);
     const content = truncateBytes(summarized, MEMORY_MAX_CONTENT_BYTES);
+    // 提炼后内容与原文不同时保留原文，供查阅还原
+    const raw = summarized !== input.content ? input.content : undefined;
 
     // 查现有
     const existing = await this.read(input.kind, input.chat_id, input.key);
@@ -307,6 +309,7 @@ export class MemoryStore implements IMemoryStore {
         patch: {
           content,
           last_access: now,
+          ...(raw !== undefined && { raw }),
           ...(input.importance !== undefined && { importance: input.importance }),
         },
       });
@@ -315,6 +318,7 @@ export class MemoryStore implements IMemoryStore {
         ...existing.value,
         content,
         last_access: now,
+        ...(raw !== undefined && { raw }),
         ...(input.importance !== undefined && { importance: input.importance }),
       });
     }
@@ -332,6 +336,7 @@ export class MemoryStore implements IMemoryStore {
       source_skill: input.source_skill,
     };
     if (input.user_id !== undefined) row.user_id = input.user_id;
+    if (raw !== undefined) row.raw = raw;
 
     const insertResult = await this.bitable.insert({ table: MEMORY_TABLE, row });
     if (!insertResult.ok) return insertResult;
@@ -347,6 +352,7 @@ export class MemoryStore implements IMemoryStore {
       created_at: now,
       source_skill: input.source_skill,
       ...(input.user_id !== undefined && { user_id: input.user_id }),
+      ...(raw !== undefined && { raw }),
     };
 
     // 评分队列（仅未指定 importance 且 LLM 可用时）
@@ -611,6 +617,7 @@ export class MemoryStore implements IMemoryStore {
       ...(typeof row.user_id === 'string' && row.user_id ? { user_id: row.user_id } : {}),
       key: String(row.key ?? ''),
       content: String(row.content ?? ''),
+      ...(typeof row.raw === 'string' && row.raw ? { raw: row.raw } : {}),
       importance: typeof row.importance === 'number' ? row.importance : MEMORY_PENDING_SCORE,
       last_access: typeof row.last_access === 'number' ? row.last_access : 0,
       created_at: typeof row.created_at === 'number' ? row.created_at : 0,
