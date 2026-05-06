@@ -39,6 +39,7 @@ export const MEMORY_MAX_PER_CHAT_KIND = 200;
 export const MEMORY_MAX_TOTAL = 2000;
 export const MEMORY_SCORE_FLUSH_MS = 30_000;
 export const MEMORY_MAX_QUERY_LENGTH = 64;
+export const MEMORY_SUMMARIZE_THRESHOLD_BYTES = 400;
 const MEMORY_TABLE = 'memory' as const;
 const MEMORY_PENDING_SCORE = -1;
 
@@ -380,9 +381,8 @@ export class MemoryStore implements IMemoryStore {
    * LLM 不可用或失败时静默回退到原文，不阻断写入。
    */
   private async summarizeContent(content: string): Promise<string> {
-    const SUMMARIZE_THRESHOLD_BYTES = 400;
     if (!this.llm) return content;
-    if (new TextEncoder().encode(content).length <= SUMMARIZE_THRESHOLD_BYTES) return content;
+    if (new TextEncoder().encode(content).length <= MEMORY_SUMMARIZE_THRESHOLD_BYTES) return content;
     // 已是结构化 JSON（skill_log / chat 等），跳过提炼
     if (content.trimStart().startsWith('{')) return content;
 

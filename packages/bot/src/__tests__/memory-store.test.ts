@@ -4,6 +4,7 @@ import {
   MEMORY_MAX_CONTENT_BYTES,
   MEMORY_MAX_PER_CHAT_KIND,
   MEMORY_MAX_TOTAL,
+  MEMORY_SUMMARIZE_THRESHOLD_BYTES,
   evictScore,
 } from '../memory/memory-store.js';
 import type { BitableClient, LLMClient, Result, AppError } from '@seedhac/contracts';
@@ -613,9 +614,9 @@ describe('MemoryStore — 评分队列批量化', () => {
 });
 
 describe('MemoryStore — 写入前 LLM 提炼', () => {
-  it('content 超过 400 字节的纯文本会被 LLM 提炼后存入', async () => {
+  it('content 超过阈值的纯文本会被 LLM 提炼，content 存摘要，raw 存原文', async () => {
     const bitable = new FakeBitable();
-    const longText = 'A'.repeat(401);
+    const longText = 'A'.repeat(MEMORY_SUMMARIZE_THRESHOLD_BYTES + 1);
     const summary = '这是摘要';
     const llm = {
       ask: vi.fn().mockResolvedValue(ok(summary)),
@@ -634,7 +635,10 @@ describe('MemoryStore — 写入前 LLM 提炼', () => {
     });
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.content).toBe(summary);
+    if (result.ok) {
+      expect(result.value.content).toBe(summary);
+      expect(result.value.raw).toBe(longText);
+    }
     expect(llm.ask).toHaveBeenCalledOnce();
   });
 
