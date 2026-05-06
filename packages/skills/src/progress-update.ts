@@ -23,6 +23,7 @@ import {
   type ProgressUpdateExtraction,
   type ProgressItem,
 } from './prompts/task-assignment.js';
+import { clamp, clampKeyPart } from './utils/clamp.js';
 
 const TRIGGER_RE =
   /完成|搞定|做完|写完|弄完|忙完|已完成|已经完成|进展汇报|进度更新|汇报一下进展|更新进度/;
@@ -159,14 +160,21 @@ async function processUpdate(ctx: SkillContext, chatId: string, item: ProgressIt
   }
 
   // 不论是否匹配都写 memory（避免进展信号丢失，QA / archive 仍可读到）
+  // owner / task 来自 LLM 输出，必须截断：owner 进 key 用 clampKeyPart，content 整体走 LONG
   const now = Date.now();
+  const ownerKey = clampKeyPart(item.owner);
+  const ownerLabel = clamp(item.owner, 'MEDIUM');
+  const taskLabel = clamp(item.task, 'MEDIUM');
   const memRes = await ctx.bitable.insert({
     table: 'memory',
     row: {
       kind: 'project',
       chat_id: chatId,
-      key: `progress-${chatId}-${now}-${item.owner}`,
-      content: `${item.owner} ${item.status === 'done' ? '完成' : '推进'} ${item.task}`,
+      key: `progress-${chatId}-${now}-${ownerKey}`,
+      content: clamp(
+        `${ownerLabel} ${item.status === 'done' ? '完成' : '推进'} ${taskLabel}`,
+        'LONG',
+      ),
       importance: 5,
       last_access: now,
       created_at: now,

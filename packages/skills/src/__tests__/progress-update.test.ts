@@ -256,6 +256,50 @@ describe('progressUpdateSkill.run() — degraded paths', () => {
   });
 });
 
+describe('progressUpdateSkill.run() — defensive length handling', () => {
+  it('clamps super long owner / task before writing memory (防 LLM 幻觉超长)', async () => {
+    const longOwner = 'A'.repeat(2000);
+    const longTask = '任务'.repeat(2000);
+    const ctx = makeCtx(makeEvent('A 完成'), {
+      extraction: {
+        updates: [{ owner: longOwner, task: longTask, status: 'done', confidence: 0.9 }],
+      },
+      todos: [],
+    });
+
+    await progressUpdateSkill.run(ctx);
+
+    const insert = ctx.bitable.insert as unknown as ReturnType<typeof vi.fn>;
+    expect(insert).toHaveBeenCalledOnce();
+    const row = insert.mock.calls[0]![0].row;
+
+    // key: owner 部分应被 SHORT (64) 限制，整个 key 不会无界增长
+    expect(row.key.length).toBeLessThan(200);
+    // content: 应在 LONG (2000) 范围内
+    expect(row.content.length).toBeLessThanOrEqual(2000);
+    // 确认实际触发了截断
+    expect(row.content.endsWith('…')).toBe(true);
+  });
+
+  it('handles owner with control chars / pipes safely in key', async () => {
+    const trickyOwner = `A|B\n${String.fromCharCode(0x07)}C`;
+    const ctx = makeCtx(makeEvent('A 完成'), {
+      extraction: {
+        updates: [{ owner: trickyOwner, task: '任务', status: 'done', confidence: 0.9 }],
+      },
+      todos: [],
+    });
+
+    await progressUpdateSkill.run(ctx);
+
+    const insert = ctx.bitable.insert as unknown as ReturnType<typeof vi.fn>;
+    const row = insert.mock.calls[0]![0].row;
+    expect(row.key).not.toContain('|');
+    expect(row.key).not.toContain('\n');
+    expect(row.key).not.toMatch(/[\x00-\x1f]/);
+  });
+});
+
 describe('progressUpdateSkill metadata', () => {
   it('has required metadata fields', () => {
     expect(progressUpdateSkill.metadata.description).toBeTruthy();

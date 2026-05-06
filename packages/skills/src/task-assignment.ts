@@ -23,6 +23,7 @@ import {
   type TaskAssignmentExtraction,
   type TaskItem,
 } from './prompts/task-assignment.js';
+import { clamp } from './utils/clamp.js';
 
 const TRIGGER_RE = /负责|DDL|deadline|截止日期|截止时间|验收标准|交付物|分工/i;
 
@@ -32,12 +33,6 @@ const HISTORY_PAGE_SIZE = 20;
 function bitableUrlFromEnv(): string {
   const token = process.env['BITABLE_APP_TOKEN'];
   return token ? `https://feishu.cn/base/${token}` : '';
-}
-
-const MAX_FIELD_CHARS = 500;
-function clamp(value: string | undefined): string {
-  if (!value) return '';
-  return value.length > MAX_FIELD_CHARS ? value.slice(0, MAX_FIELD_CHARS) : value;
 }
 
 async function extract(
@@ -143,10 +138,13 @@ export const taskAssignmentSkill: Skill = {
       return ok({ reasoning: '写入分工表失败，跳过卡片' });
     }
 
-    // 2. 写 memory（统一 MemoryRecord schema）
-    const memContent = tasks
-      .map((t) => `${t.owner} → ${t.task}${t.ddl ? ` (DDL ${t.ddl})` : ''}`)
-      .join(' | ');
+    // 2. 写 memory（统一 MemoryRecord schema）—— content 走 LONG 截断，防多任务拼接超长
+    const memContent = clamp(
+      tasks
+        .map((t) => `${t.owner} → ${t.task}${t.ddl ? ` (DDL ${t.ddl})` : ''}`)
+        .join(' | '),
+      'LONG',
+    );
     const memRes = await ctx.bitable.insert({
       table: 'memory',
       row: {

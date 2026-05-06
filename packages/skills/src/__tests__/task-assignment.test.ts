@@ -296,6 +296,51 @@ describe('taskAssignmentSkill.run() — degraded paths', () => {
   });
 });
 
+describe('taskAssignmentSkill.run() — defensive length handling', () => {
+  it('clamps each task field to MEDIUM (500 chars) before writing todo', async () => {
+    const longTask = 'task '.repeat(500);
+    const longDeliv = 'd'.repeat(2000);
+    const ctx = makeCtx(makeEvent('A 负责...'), {
+      extraction: {
+        tasks: [
+          {
+            owner: 'A',
+            task: longTask,
+            deliverable: longDeliv,
+            acceptance: 'b'.repeat(2000),
+            confidence: 0.9,
+          },
+        ],
+      },
+    });
+
+    await taskAssignmentSkill.run(ctx);
+
+    const batchInsert = ctx.bitable.batchInsert as unknown as ReturnType<typeof vi.fn>;
+    const row = batchInsert.mock.calls[0]![0].rows[0];
+    expect(row.content.length).toBeLessThanOrEqual(500);
+    expect(row.deliverable.length).toBeLessThanOrEqual(500);
+    expect(row.acceptance.length).toBeLessThanOrEqual(500);
+  });
+
+  it('clamps memory content to LONG (2000 chars) when many tasks pile up', async () => {
+    const tasks = Array.from({ length: 200 }, (_, i) => ({
+      owner: `member_${i}`,
+      task: `任务 ${i} 的描述非常详细需要写很多字`,
+      ddl: '2026-05-07',
+      confidence: 0.9,
+    }));
+    const ctx = makeCtx(makeEvent('一堆分工'), { extraction: { tasks } });
+
+    await taskAssignmentSkill.run(ctx);
+
+    const insert = ctx.bitable.insert as unknown as ReturnType<typeof vi.fn>;
+    const row = insert.mock.calls[0]![0].row;
+    expect(row.content.length).toBeLessThanOrEqual(2000);
+    expect(row.content.endsWith('…')).toBe(true);
+  });
+});
+
 describe('taskAssignmentSkill metadata', () => {
   it('has required metadata fields', () => {
     expect(taskAssignmentSkill.metadata.description).toBeTruthy();
