@@ -163,8 +163,8 @@ describe('handleEvent wiring', () => {
       match: () => true,
       run: vi.fn().mockResolvedValue(ok({ text: 'x' })),
     };
-    // 分工讨论触发 taskAssignment，intentToSkill 无 taskAssignment 映射
-    const msg = makeMessage({ text: '张三负责前端，李四负责后端', mentions: [] });
+    // 普通闲聊，router 返回 silent，不应触发任何 skill
+    const msg = makeMessage({ text: '今天天气真好啊', mentions: [] });
     const ctx = makeCtx(makeEvent(msg));
 
     await handleEvent(ctx, router, { qa: mockSkill } as unknown as Record<SkillName, Skill>);
@@ -172,95 +172,40 @@ describe('handleEvent wiring', () => {
     expect(mockSkill.run).not.toHaveBeenCalled();
   });
 
-  // 4a. taskAssignment intent → 写 bitable.memory 副作用（无 skill 不触发 run）
-  it('taskAssignment intent → bitable.insert called with memory side-effect', async () => {
-    const mockSkill: Skill = {
+  // 4a. taskAssignment intent → 调对应 skill.run（不再走 fire-and-forget memory 副作用）
+  it('taskAssignment intent → taskAssignment skill.run called', async () => {
+    const taskSkill: Skill = {
       ...qaSkill,
+      name: 'taskAssignment' as SkillName,
       match: () => true,
-      run: vi.fn().mockResolvedValue(ok({ text: 'x' })),
+      run: vi.fn().mockResolvedValue(ok({ reasoning: 'task picked up' })),
     };
-    // 「我来负责前端」命中 taskAssignment pattern
     const msg = makeMessage({ text: '我来负责前端，李四来负责后端', mentions: [] });
     const ctx = makeCtx(makeEvent(msg));
 
-    await handleEvent(ctx, router, { qa: mockSkill } as unknown as Record<SkillName, Skill>);
-    // fire-and-forget，等微任务跑完
-    await new Promise((resolve) => setImmediate(resolve));
+    await handleEvent(ctx, router, {
+      taskAssignment: taskSkill,
+    } as unknown as Record<SkillName, Skill>);
 
-    expect(mockSkill.run).not.toHaveBeenCalled();
-    expect(ctx.bitable.insert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        table: 'memory',
-        row: expect.objectContaining({
-          chatId: msg.chatId,
-          type: 'taskAssignment',
-          content: msg.text,
-        }),
-      }),
-    );
+    expect(taskSkill.run).toHaveBeenCalledOnce();
   });
 
-  // 4b. progressUpdate intent → 写 bitable.memory 副作用
-  it('progressUpdate intent → bitable.insert called with memory side-effect', async () => {
-    const mockSkill: Skill = {
+  // 4b. progressUpdate intent → 调对应 skill.run
+  it('progressUpdate intent → progressUpdate skill.run called', async () => {
+    const progressSkill: Skill = {
       ...qaSkill,
+      name: 'progressUpdate' as SkillName,
       match: () => true,
-      run: vi.fn().mockResolvedValue(ok({ text: 'x' })),
+      run: vi.fn().mockResolvedValue(ok({ reasoning: 'progress picked up' })),
     };
     const msg = makeMessage({ text: '前端模块已完成，下周联调', mentions: [] });
     const ctx = makeCtx(makeEvent(msg));
 
-    await handleEvent(ctx, router, { qa: mockSkill } as unknown as Record<SkillName, Skill>);
-    await new Promise((resolve) => setImmediate(resolve));
+    await handleEvent(ctx, router, {
+      progressUpdate: progressSkill,
+    } as unknown as Record<SkillName, Skill>);
 
-    expect(mockSkill.run).not.toHaveBeenCalled();
-    expect(ctx.bitable.insert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        table: 'memory',
-        row: expect.objectContaining({ type: 'progressUpdate' }),
-      }),
-    );
-  });
-
-  // 4c. side-effect bitable 返回 err Result 时不 throw，仅 logger.warn
-  it('side-effect bitable insert returns err → warn but does not throw', async () => {
-    const failingBitable = {
-      insert: vi
-        .fn()
-        .mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'bitable down'))),
-    } as unknown as SkillContext['bitable'];
-    const msg = makeMessage({ text: '我来负责前端', mentions: [] });
-    const ctx = { ...makeCtx(makeEvent(msg)), bitable: failingBitable };
-
-    await expect(
-      handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>),
-    ).resolves.toBeUndefined();
-    await new Promise((resolve) => setImmediate(resolve));
-
-    expect(ctx.logger.warn as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
-      'bitable insert failed',
-      expect.objectContaining({ intent: 'taskAssignment', code: ErrorCode.FEISHU_API_ERROR }),
-    );
-  });
-
-  // 4d. side-effect bitable.insert 真 reject（网络/认证异常）→ catch 兜住，不触发 unhandled rejection
-  it('side-effect bitable insert rejects → caught, warn but does not throw', async () => {
-    const throwingBitable = {
-      insert: vi.fn().mockRejectedValue(new Error('network ETIMEDOUT')),
-    } as unknown as SkillContext['bitable'];
-    const msg = makeMessage({ text: '我来负责前端', mentions: [] });
-    const ctx = { ...makeCtx(makeEvent(msg)), bitable: throwingBitable };
-
-    // 关键：handleEvent 自身不能 throw，且不能产生 unhandled rejection
-    await expect(
-      handleEvent(ctx, router, {} as unknown as Record<SkillName, Skill>),
-    ).resolves.toBeUndefined();
-    await new Promise((resolve) => setImmediate(resolve));
-
-    expect(ctx.logger.warn as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(
-      'bitable insert threw',
-      expect.objectContaining({ intent: 'taskAssignment', error: 'network ETIMEDOUT' }),
-    );
+    expect(progressSkill.run).toHaveBeenCalledOnce();
   });
 
   // 5. skill.run() 返回 err → 不 crash，logger.error 被调用
