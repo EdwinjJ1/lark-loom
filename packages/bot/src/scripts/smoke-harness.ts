@@ -135,6 +135,7 @@ const ctx: SkillContext = {
     createFromMarkdown: async () => ok({ docToken: 'doc', url: 'https://example.test/doc' }),
     readContent: async () => ok(''),
     grantMembersEdit: async () => ok(undefined),
+    appendToSection: async () => ok(undefined),
   },
   cardBuilder: larkCardBuilder,
   retrievers: {},

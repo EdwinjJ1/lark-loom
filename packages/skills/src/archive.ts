@@ -40,6 +40,43 @@ const TRIGGER_RE = /复盘|归档|项目结束|收尾|准备交付/i;
 // 飞书域名 URL 提取（docs / wiki / lark / sheets / bitable）
 const FEISHU_URL_RE = /https?:\/\/[^\s)>]+(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/g;
 
+const CORE_DOC_PREFIX_RE = /^\[核心文档\]/;
+const CORE_DOC_TOKEN_RE = /\/docx\/([a-zA-Z0-9]+)/;
+const CORE_DOC_MAX_CHARS = 8000;
+
+/**
+ * 从 memory 找到项目核心文档（issue #120）并读取正文，作为 archive 的 Tier-1 输入。
+ * 失败 / 找不到都返回 undefined，archive 退化为只用 Tier-2（memory/decision/todo）。
+ */
+async function fetchCoreDocContent(
+  ctx: SkillContext,
+  memories: readonly BitableRow[],
+): Promise<string | undefined> {
+  // 找最新的 [核心文档] memory 条目
+  const candidates = memories
+    .filter((m) => CORE_DOC_PREFIX_RE.test(String(m['content'] ?? '')))
+    .sort((a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0));
+  if (candidates.length === 0) return undefined;
+
+  const content = String(candidates[0]!['content'] ?? '');
+  const tokenMatch = content.match(CORE_DOC_TOKEN_RE);
+  if (!tokenMatch) return undefined;
+  const docToken = tokenMatch[1]!;
+
+  const readRes = await ctx.docx.readContent(docToken, 'doc');
+  if (!readRes.ok) {
+    ctx.logger.warn('archive: read core doc failed, fall back to no Tier-1', {
+      error: readRes.error.message,
+    });
+    return undefined;
+  }
+  const text = readRes.value.trim();
+  if (!text) return undefined;
+  return text.length > CORE_DOC_MAX_CHARS
+    ? `${text.slice(0, CORE_DOC_MAX_CHARS)}\n…（已截断）`
+    : text;
+}
+
 interface ExtractedLink extends ArchiveLink {
   /** memory 写入时的 created_at，用于排序取最新 */
   readonly recordedAt: number;
@@ -252,12 +289,16 @@ export const archiveSkill: Skill = {
       taskCompletion: todos.length > 0 ? `${doneCount}/${todos.length}` : null,
     };
 
+    // 1.5. 找项目核心文档（issue #120）—— 把它当 Tier-1 喂给 LLM
+    //      失败 / 找不到 → coreDocContent = undefined，prompt 退化为单 Tier
+    const coreDocContent = await fetchCoreDocContent(ctx, memories);
+
     // 2. LLM 摘要（< 3 条记录直接跳过，避免空数据幻觉）
     const totalRecords = memories.length + decisions.length + todos.length;
     let summary = EMPTY_SUMMARY;
     if (totalRecords >= 3) {
       const llmResult = await ctx.llm.askStructured(
-        ARCHIVE_SUMMARY_PROMPT(memories, decisions, todos),
+        ARCHIVE_SUMMARY_PROMPT(memories, decisions, todos, coreDocContent),
         ArchiveSummarySchema,
         { model: 'pro', timeoutMs: 60_000 },
       );

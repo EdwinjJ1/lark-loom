@@ -287,6 +287,98 @@ export class LarkDocxClient implements DocxClient {
 
     return ok(createRes.value);
   }
+
+  /**
+   * 在指定 H2 section 末尾追加 blocks（issue #120）。
+   *
+   * 飞书 docx 是 flat children 结构（H2 不会"包含"它后面的段落，是 sibling）。
+   * 实现思路：
+   *   1. 列出 doc 顶层 children
+   *   2. 找到 sectionTitle 对应的 heading2 block index
+   *   3. 找下一个 heading2 的 index（或 children 长度，如果是最后一段）
+   *   4. 调 documentBlockChildren.create 时传 index = nextH2Index
+   *      → 新 blocks 插入到下一个 H2 之前 = 当前 section 末尾
+   *
+   * 找不到 section → 退化为 appendBlocks（追加到文档末尾）+ warn level 不报错。
+   */
+  async appendToSection(
+    docToken: string,
+    sectionTitle: string,
+    blocks: readonly DocBlock[],
+  ): Promise<Result<void>> {
+    if (blocks.length === 0) return ok(undefined);
+
+    // 1. 列出 doc 顶层 children
+    let children: Array<{ block_id?: string; block_type?: number; heading2?: { elements?: Array<{ text_run?: { content?: string } }> } }> = [];
+    try {
+      const res = await (this.client.docx.v1.documentBlockChildren as any).list({
+        path: { document_id: docToken, block_id: docToken },
+        params: { page_size: 200 },
+      });
+      if (res.code !== 0) {
+        // 列表失败也别死，降级为整体 append
+        return this.appendBlocks(docToken, blocks);
+      }
+      children = res.data?.items ?? [];
+    } catch {
+      return this.appendBlocks(docToken, blocks);
+    }
+
+    // 2. 找 sectionTitle 对应的 H2 index
+    // block_type 4 = heading2
+    let sectionIdx = -1;
+    let nextH2Idx = children.length;
+    for (let i = 0; i < children.length; i++) {
+      const c = children[i]!;
+      if (c.block_type === 4) {
+        const txt = c.heading2?.elements?.[0]?.text_run?.content ?? '';
+        if (sectionIdx < 0 && txt === sectionTitle) {
+          sectionIdx = i;
+        } else if (sectionIdx >= 0) {
+          nextH2Idx = i;
+          break;
+        }
+      }
+    }
+
+    if (sectionIdx < 0) {
+      // 找不到 section，退化为整体 append
+      return this.appendBlocks(docToken, blocks);
+    }
+
+    // 3. 构造 children payload + 调 create with index
+    const safeBlocks = blocks.filter((b) => b.text && b.text.trim().length > 0);
+    if (safeBlocks.length === 0) return ok(undefined);
+
+    const childrenPayload = safeBlocks.map((block) => {
+      switch (block.type) {
+        case 'heading1':
+          return { block_type: 3, heading1: { elements: [{ text_run: { content: block.text } }] } };
+        case 'heading2':
+          return { block_type: 4, heading2: { elements: [{ text_run: { content: block.text } }] } };
+        case 'paragraph':
+          return { block_type: 2, text: { elements: [{ text_run: { content: block.text } }] } };
+        case 'bullet':
+          return { block_type: 12, bullet: { elements: [{ text_run: { content: block.text } }] } };
+      }
+    });
+
+    try {
+      const res = await (this.client.docx.v1.documentBlockChildren as any).create({
+        path: { document_id: docToken, block_id: docToken },
+        data: { children: childrenPayload, index: nextH2Idx },
+      });
+      if (res.code !== 0) {
+        return err(
+          makeError(ErrorCode.FEISHU_API_ERROR, `appendToSection failed: ${res.msg}`),
+        );
+      }
+      return ok(undefined);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(makeError(ErrorCode.FEISHU_API_ERROR, `appendToSection error: ${msg}`, e));
+    }
+  }
 }
 
 export function createDocxClient(): LarkDocxClient {
