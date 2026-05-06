@@ -10,7 +10,7 @@ import type {
   SkillName,
 } from '@seedhac/contracts';
 import { SkillRouter } from '../skill-router.js';
-import { handleEvent, type HarnessConfig } from '../wiring.js';
+import { handleEvent, shouldObservePassively, PASSIVE_MIN_TEXT_LENGTH, type HarnessConfig } from '../wiring.js';
 import { NullMemoryStore } from '../memory/memory-store.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -770,8 +770,6 @@ describe('onboarding flow', () => {
 });
 
 // ─── shouldObservePassively ───────────────────────────────────────────────────
-
-import { shouldObservePassively, PASSIVE_MIN_TEXT_LENGTH } from '../wiring.js';
 
 describe('shouldObservePassively', () => {
   it('长度达标的普通对话消息应被观察', () => {
