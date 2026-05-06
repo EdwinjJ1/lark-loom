@@ -10,7 +10,13 @@ import type {
   SkillName,
 } from '@seedhac/contracts';
 import { SkillRouter } from '../skill-router.js';
-import { handleEvent, shouldObservePassively, PASSIVE_MIN_TEXT_LENGTH, type HarnessConfig } from '../wiring.js';
+import {
+  handleEvent,
+  shouldConsiderProactive,
+  shouldObservePassively,
+  PASSIVE_MIN_TEXT_LENGTH,
+  type HarnessConfig,
+} from '../wiring.js';
 import { NullMemoryStore } from '../memory/memory-store.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -752,6 +758,20 @@ describe('shouldObservePassively', () => {
   });
 });
 
+// ─── shouldConsiderProactive ─────────────────────────────────────────────────
+
+describe('shouldConsiderProactive', () => {
+  it('明显需要资料/澄清的消息应进入主动层候选', () => {
+    expect(shouldConsiderProactive('这个资料在哪里？')).toBe(true);
+    expect(shouldConsiderProactive('下一步我们先做什么')).toBe(true);
+  });
+
+  it('短闲聊或无工作信号的消息不进入主动层', () => {
+    expect(shouldConsiderProactive('好的')).toBe(false);
+    expect(shouldConsiderProactive('今天大家辛苦了')).toBe(false);
+  });
+});
+
 // ─── handlePassiveObserve（通过 handleEvent 集成） ────────────────────────────
 
 describe('handleEvent — passive observe', () => {
@@ -825,5 +845,90 @@ describe('handleEvent — passive observe', () => {
     // Harness 可能调 chatWithTools，但 passive observe 不应额外再调一次
     // 每条 @mention 消息 chatWithTools 调用次数 ≤ 1（只有 Harness，没有 passive observe）
     expect(chatWithTools.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+});
+
+// ─── handleEvent — proactive layer ───────────────────────────────────────────
+
+describe('handleEvent — proactive layer', () => {
+  const router = new SkillRouter(BOT_ID);
+
+  it('非 @mention 且无 skill 接管时，可主动发送资料提示', async () => {
+    const msg = makeMessage({ text: '这个资料在哪里？', mentions: [] });
+    const runtime = makeRuntime();
+    const chatWithTools = vi.fn().mockResolvedValue(
+      ok({
+        content: JSON.stringify({
+          action: 'share',
+          text: '我找到一条相关资料：项目 PRD 在飞书文档里，先看“验收标准”那节。',
+          reason: '用户在找资料',
+        }),
+        toolCalls: [{ id: 'tc1', name: 'memory.search', argumentsRaw: '{}' }],
+        rounds: 1,
+      }),
+    );
+    const ctx = makeCtx(makeEvent(msg), runtime, { chatWithTools });
+
+    await handleEvent(ctx, router, {}, makeHarness());
+    await vi.waitFor(() => expect(runtime.sendText).toHaveBeenCalledOnce());
+
+    expect(chatWithTools).toHaveBeenCalledOnce();
+    const [, opts] = chatWithTools.mock.calls[0]!;
+    const toolNames = (opts as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+    expect(toolNames.sort()).toEqual(['memory.search', 'skill.list', 'skill.read']);
+    expect(toolNames).not.toContain('memory.write');
+    expect(toolNames).not.toContain('decision.write');
+    expect(runtime.sendText).toHaveBeenCalledWith({
+      chatId: 'oc_chat1',
+      text: '我找到一条相关资料：项目 PRD 在飞书文档里，先看“验收标准”那节。',
+    });
+  });
+
+  it('非 @mention 且 skill 已接管时，不额外触发主动层', async () => {
+    const msg = makeMessage({ text: '我来负责资料吗？', mentions: [] });
+    const runtime = makeRuntime();
+    const chatWithTools = vi.fn().mockResolvedValue(
+      ok({ content: JSON.stringify({ action: 'clarify', text: 'x' }), toolCalls: [], rounds: 1 }),
+    );
+    const ctx = makeCtx(makeEvent(msg), runtime, { chatWithTools });
+    const taskSkill: Skill = {
+      ...qaSkill,
+      name: 'taskAssignment' as SkillName,
+      match: vi.fn().mockReturnValue(true),
+      run: vi.fn().mockResolvedValue(ok({ reasoning: 'assignment captured' })),
+    };
+
+    await handleEvent(ctx, router, { taskAssignment: taskSkill }, makeHarness());
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(taskSkill.run).toHaveBeenCalledOnce();
+    expect(chatWithTools).not.toHaveBeenCalled();
+  });
+
+  it('share 没有实际检索工具调用时不发送，避免编造资料', async () => {
+    const msg = makeMessage({ text: '这个资料在哪里？', mentions: [] });
+    const runtime = makeRuntime();
+    const chatWithTools = vi.fn().mockResolvedValue(
+      ok({
+        content: JSON.stringify({
+          action: 'share',
+          text: '资料在这里。',
+          reason: '用户在找资料',
+        }),
+        toolCalls: [],
+        rounds: 1,
+      }),
+    );
+    const ctx = makeCtx(makeEvent(msg), runtime, { chatWithTools });
+
+    await handleEvent(ctx, router, {}, makeHarness());
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(chatWithTools).toHaveBeenCalledOnce();
+    expect(runtime.sendText).not.toHaveBeenCalled();
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      'proactive layer share without grounding tool call',
+      expect.objectContaining({ reason: '用户在找资料' }),
+    );
   });
 });
