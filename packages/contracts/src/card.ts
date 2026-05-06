@@ -80,11 +80,16 @@ export interface DocPushCardInput {
 
 export interface TablePushCardInput {
   readonly tableTitle: string;
+  /** 终态分工表 URL；loading / error 态可为空字符串 */
   readonly bitableUrl: string;
   readonly taskCount: number;
   readonly members: readonly string[];
   /** 最近一个 DDL，格式 YYYY-MM-DD */
   readonly nearestDue?: string;
+  /** loading 占位：先 sendCard 拿 messageId，跑完后 patchCard 替换为终态 */
+  readonly isLoading?: boolean;
+  /** error 终态：跑挂时把 loading 卡片 patch 成失败提示 */
+  readonly errorMessage?: string;
 }
 
 export interface QaCardInput {
