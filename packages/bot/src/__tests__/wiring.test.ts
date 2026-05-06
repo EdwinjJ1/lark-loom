@@ -768,3 +768,37 @@ describe('onboarding flow', () => {
     expect(ctx.bitable.insert).toHaveBeenCalledOnce();
   });
 });
+
+// ─── shouldObservePassively ───────────────────────────────────────────────────
+
+import { shouldObservePassively, PASSIVE_MIN_TEXT_LENGTH } from '../wiring.js';
+
+describe('shouldObservePassively', () => {
+  it('长度达标的普通对话消息应被观察', () => {
+    expect(shouldObservePassively('我们明天把这个功能做完吧')).toBe(true);
+  });
+
+  it('不含关键字但有事实信息的消息也应被观察', () => {
+    expect(shouldObservePassively('小明你来写登录页，小红负责接口')).toBe(true);
+  });
+
+  it('恰好等于最小长度的消息应被观察', () => {
+    const text = 'a'.repeat(PASSIVE_MIN_TEXT_LENGTH);
+    expect(shouldObservePassively(text)).toBe(true);
+  });
+
+  it('过短的消息（闲聊/表情）应被跳过', () => {
+    expect(shouldObservePassively('好的')).toBe(false);
+    expect(shouldObservePassively('👍')).toBe(false);
+    expect(shouldObservePassively('ok')).toBe(false);
+  });
+
+  it('纯空白消息应被跳过', () => {
+    expect(shouldObservePassively('   ')).toBe(false);
+  });
+
+  it('trim 后长度不足的消息应被跳过', () => {
+    const padded = '   ' + 'a'.repeat(PASSIVE_MIN_TEXT_LENGTH - 1) + '   ';
+    expect(shouldObservePassively(padded)).toBe(false);
+  });
+});
