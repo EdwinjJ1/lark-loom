@@ -33,6 +33,8 @@ export interface LLMConfig {
   readonly modelIds: {
     readonly lite: string;
     readonly pro: string;
+    /** 可选：embedding 模型 ID；配置后启用语义检索，否则降级到字符串匹配 */
+    readonly embedding?: string;
   };
   readonly baseUrl?: string;
 }
@@ -346,6 +348,51 @@ export class VolcanoLLMClient implements LLMClient {
     // 达到 maxRounds 仍有 tool_calls 未处理完 → 返回最后一次 content + 历史
     console.warn(`[LLMClient] chatWithTools hit maxRounds=${maxRounds}, returning last content`);
     return ok({ content: lastContent, toolCalls: allToolCalls, rounds });
+  }
+
+  async embed(text: string): Promise<Result<readonly number[]>> {
+    const embeddingModelId = this.config.modelIds.embedding;
+    if (!embeddingModelId) {
+      return err(makeError(ErrorCode.CONFIG_MISSING, 'embed: ARK_MODEL_EMBEDDING not configured'));
+    }
+
+    const body = JSON.stringify({ model: embeddingModelId, input: text });
+    let lastErr: unknown;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+      try {
+        const resp = await fetch(`${this.config.baseUrl}/embeddings`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.config.apiKey}`,
+          },
+          body,
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(`HTTP ${resp.status}: ${t}`);
+        }
+        const data = (await resp.json()) as { data?: Array<{ embedding?: number[] }> };
+        const vector = data.data?.[0]?.embedding;
+        if (!Array.isArray(vector) || vector.length === 0) {
+          throw new Error('embed: empty or missing embedding vector in response');
+        }
+        return ok(vector as readonly number[]);
+      } catch (e) {
+        clearTimeout(timer);
+        lastErr = e;
+        if (attempt < 2) await sleep(RETRY_DELAYS_MS[attempt] ?? 1000);
+      }
+    }
+
+    return err(
+      makeError(ErrorCode.LLM_INVALID_RESPONSE, 'embed: failed after 3 attempts', lastErr),
+    );
   }
 
   async askStructured<T>(

@@ -64,13 +64,20 @@ function buildDeps() {
   const runtime = createBotRuntime({ logger });
   const router = new SkillRouter(envTrim('LARK_BOT_OPEN_ID'));
 
+  const embeddingModel = envTrim('ARK_MODEL_EMBEDDING');
   const llm = new VolcanoLLMClient({
     apiKey: envTrim('ARK_API_KEY'),
     modelIds: {
       lite: envTrim('ARK_MODEL_LITE'),
       pro: envTrim('ARK_MODEL_PRO'),
+      ...(embeddingModel && { embedding: embeddingModel }),
     },
   });
+  if (!embeddingModel) {
+    logger.warn(
+      'ARK_MODEL_EMBEDDING not set — memory search will fall back to keyword matching',
+    );
+  }
 
   const bitable = new LarkBitableClient({
     appId,

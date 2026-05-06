@@ -476,6 +476,7 @@ function withFallbackSystemPrompt(ctx: SkillContext, harness: HarnessConfig): Sk
         systemPrompt: opts?.systemPrompt ?? overview,
       }),
     chatWithTools: (messages, opts) => ctx.llm.chatWithTools(messages, opts),
+    embed: (text) => ctx.llm.embed(text),
   };
   return { ...ctx, llm };
 }

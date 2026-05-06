@@ -22,6 +22,7 @@ function makeLLM(askImpl: LLMClient['ask']): LLMClient {
     chat: vi.fn(),
     askStructured: vi.fn(),
     chatWithTools: vi.fn(),
+    embed: vi.fn(),
   };
 }
 
