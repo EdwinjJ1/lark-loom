@@ -38,7 +38,10 @@ import {
 const TRIGGER_RE = /复盘|归档|项目结束|收尾|准备交付/i;
 
 // 飞书域名 URL 提取（docs / wiki / lark / sheets / bitable）
-const FEISHU_URL_RE = /https?:\/\/[^\s)>]+(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/g;
+// 注意：`[^\s)>]*`（不是 `+`）—— 必须允许域名前 0 字符，否则
+// `https://feishu.cn/...`（无 tenant 子域）不会被匹配。
+const FEISHU_URL_RE =
+  /https?:\/\/[^\s)>]*(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/g;
 
 const CORE_DOC_PREFIX_RE = /^\[核心文档\]/;
 const CORE_DOC_TOKEN_RE = /\/docx\/([a-zA-Z0-9]+)/;
