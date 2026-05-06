@@ -103,18 +103,52 @@ export const taskAssignmentSkill: Skill = {
     }
     const { chatId } = ctx.event.payload;
 
+    // 0. 立刻发 loading 卡片占位（仿 summary / requirementDoc / slides）
+    const loadingCard = ctx.cardBuilder.build('tablePush', {
+      tableTitle: '项目分工表',
+      bitableUrl: '',
+      taskCount: 0,
+      members: [],
+      isLoading: true,
+    });
+    const loadingSent = await ctx.runtime.sendCard({ chatId, card: loadingCard });
+    if (!loadingSent.ok) return err(loadingSent.error);
+    const loadingMessageId = loadingSent.value.messageId;
+
+    const patchToError = async (message: string): Promise<void> => {
+      const errCard = ctx.cardBuilder.build('tablePush', {
+        tableTitle: '项目分工表',
+        bitableUrl: '',
+        taskCount: 0,
+        members: [],
+        errorMessage: message,
+      });
+      const patchRes = await ctx.runtime.patchCard({ messageId: loadingMessageId, card: errCard });
+      if (!patchRes.ok) {
+        ctx.logger.warn('taskAssignment: patch error card failed', {
+          code: patchRes.error.code,
+          message: patchRes.error.message,
+        });
+      }
+    };
+
+    // 1. LLM 抽取
     const extractResult = await extract(ctx, chatId);
-    if (!extractResult.ok) return err(extractResult.error);
+    if (!extractResult.ok) {
+      await patchToError(`抽取失败：${extractResult.error.message}`);
+      return err(extractResult.error);
+    }
 
     const tasks = filterValidTasks(extractResult.value.tasks);
     if (tasks.length === 0) {
       ctx.logger.warn('taskAssignment: no valid tasks extracted', { chatId });
-      return ok({ reasoning: '未识别到明确分工，跳过' });
+      await patchToError('本次未识别到明确的分工（owner / 任务都需要明确）');
+      return ok({ reasoning: '未识别到明确分工' });
     }
 
     const now = Date.now();
 
-    // 1. 写 todo 表（失败降级，但不发卡 — 表是状态源，没写进去发卡反而误导）
+    // 2. 写 todo 表（失败 patch 错误卡，告知用户表写失败）
     //    LLM 输出字段做硬截断，防止 prompt-injected 长串撑爆 Bitable 行
     const insertResult = await ctx.bitable.batchInsert({
       table: 'todo',
@@ -137,10 +171,12 @@ export const taskAssignmentSkill: Skill = {
         code: insertResult.error.code,
         message: insertResult.error.message,
       });
-      return ok({ reasoning: '写入分工表失败，跳过卡片' });
+      await patchToError(`写入分工表失败：${insertResult.error.message}`);
+      return ok({ reasoning: '写入分工表失败' });
     }
 
-    // 2. 写 memory（统一 MemoryRecord schema）—— content 走 LONG 截断，防多任务拼接超长
+    // 3. 写 memory（统一 MemoryRecord schema）—— content 走 LONG 截断，防多任务拼接超长
+    //    失败仅 warn，不阻断卡片输出
     const memContent = clamp(
       tasks
         .map((t) => `${t.owner} → ${t.task}${t.ddl ? ` (DDL ${t.ddl})` : ''}`)
@@ -168,27 +204,38 @@ export const taskAssignmentSkill: Skill = {
       });
     }
 
-    // 3. tablePush 卡片 — 没有 BITABLE_APP_TOKEN 就不发卡（避免按钮坏链）
+    // 4. patch 成最终卡 — 没有 BITABLE_APP_TOKEN 时按钮没有链接，patch 成 error 态
     const bitableUrl = bitableUrlFromEnv();
     if (!bitableUrl) {
-      ctx.logger.warn('taskAssignment: BITABLE_APP_TOKEN missing, skip card', { chatId });
+      ctx.logger.warn('taskAssignment: BITABLE_APP_TOKEN missing', { chatId });
+      await patchToError('Bitable URL 未配置，无法生成查看链接（已写入 todo 表）');
       return ok({
-        reasoning: `抽取到 ${tasks.length} 条分工，但 Bitable URL 未配置，跳过卡片`,
+        reasoning: `抽取到 ${tasks.length} 条分工，但 Bitable URL 未配置`,
       });
     }
 
     const owners = Array.from(new Set(tasks.map((t) => t.owner)));
     const nearestDue = pickNearestDue(tasks);
-    const card = ctx.cardBuilder.build('tablePush', {
+    const finalCard = ctx.cardBuilder.build('tablePush', {
       tableTitle: '项目分工表',
       bitableUrl,
       taskCount: tasks.length,
       members: owners,
       ...(nearestDue ? { nearestDue } : {}),
     });
+    const patchRes = await ctx.runtime.patchCard({
+      messageId: loadingMessageId,
+      card: finalCard,
+    });
+    if (!patchRes.ok) {
+      ctx.logger.warn('taskAssignment: patch final card failed; final card not visible', {
+        code: patchRes.error.code,
+        message: patchRes.error.message,
+      });
+    }
 
+    // 不再返回 card：已通过 patchCard 替换 loading 卡，wiring 不需要再发一条
     return ok({
-      card,
       reasoning: `抽取到 ${tasks.length} 条分工，涉及 ${owners.length} 位成员`,
     });
   },

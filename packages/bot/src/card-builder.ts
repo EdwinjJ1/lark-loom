@@ -272,17 +272,47 @@ function buildDocPush(input: DocPushCardInput): Card {
  * UI：列出成员和最近 DDL，突出"查看表格"入口
  */
 function buildTablePush(input: TablePushCardInput): Card {
+  // 三态共用同一个模板色，仅 header 标题区分；与 summary / slides 的「两态同色」对齐
+  const HEADER_TEMPLATE = 'yellow' as const;
+
+  if (input.isLoading) {
+    return card('tablePush', {
+      schema: '2.0',
+      header: { title: pt('分工表生成中'), template: HEADER_TEMPLATE },
+      body: {
+        elements: [
+          md(
+            `**${input.tableTitle}**\n\n正在识别群里讨论的分工（owner / 任务 / DDL / 验收标准），通常需要 30-60 秒。`,
+          ),
+          md('_整理完会自动替换这条卡片。_'),
+        ],
+      },
+    });
+  }
+
+  if (input.errorMessage) {
+    return card('tablePush', {
+      schema: '2.0',
+      header: { title: pt('分工表生成失败'), template: 'red' },
+      body: {
+        elements: [md(`**${input.tableTitle}**\n\n${input.errorMessage}`)],
+      },
+    });
+  }
+
   const memberLine = input.members.map((m) => `@${m}`).join('  ');
   const dueLine = input.nearestDue ? `\n⏰ 最近截止：**${input.nearestDue}**` : '';
+  // 注：分工表是项目共享 bitable（所有群共用同一个 base），目前**无法**做到
+  // "仅群内成员可查看与编辑"——按钮点开就是整张 base。要做真正的隔离需要
+  // 每群独立 bitable 或 per-chat filter view，单开 issue 跟进。
   return card('tablePush', {
     schema: '2.0',
-    header: { title: pt('分工表已生成'), template: 'yellow' },
+    header: { title: pt('分工表已生成'), template: HEADER_TEMPLATE },
     body: {
       elements: [
         md(`**${input.tableTitle}**\n共 ${input.taskCount} 个任务 · 成员：${memberLine}${dueLine}`),
         hr(),
         btn('查看分工表', { action: 'open_url', url: input.bitableUrl }, 'primary'),
-        md('_仅群内成员可查看与编辑_'),
       ],
     },
   });

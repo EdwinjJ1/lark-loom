@@ -135,6 +135,35 @@ describe('tablePush card', () => {
     expect(j).toContain('@Antares');
     expect(j).toContain('2026-05-06');
     expect(j).toContain('查看分工表');
+    // 不应该再有「仅群内成员可查看与编辑」这条虚假宣传 —— 共享 bitable 做不到
+    expect(j).not.toContain('仅群内成员可查看与编辑');
+  });
+
+  it('renders loading state', () => {
+    const card = larkCardBuilder.build('tablePush', {
+      tableTitle: '项目分工表',
+      bitableUrl: '',
+      taskCount: 0,
+      members: [],
+      isLoading: true,
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    expect(j).toContain('分工表生成中');
+    expect(j).toContain('整理完会自动替换');
+  });
+
+  it('renders error state', () => {
+    const card = larkCardBuilder.build('tablePush', {
+      tableTitle: '项目分工表',
+      bitableUrl: '',
+      taskCount: 0,
+      members: [],
+      errorMessage: '本次未识别到明确的分工',
+    });
+    const j = json(card);
+    expect(j).toContain('分工表生成失败');
+    expect(j).toContain('未识别到明确的分工');
   });
 });
 
