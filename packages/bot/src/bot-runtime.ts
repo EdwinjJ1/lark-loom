@@ -78,6 +78,45 @@ class RateLimiter {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 简易 LRU Set —— 用于 backfill 去重。
+ *
+ * 容量满时淘汰最久未 add 的元素。Map 的插入顺序天然就是 access 顺序（每次 add 已存在
+ * 元素时会 delete + set 重新插到末尾），所以 keys().next() 拿到的就是最旧的那个。
+ */
+export class LRUSet<T> {
+  private readonly capacity: number;
+  private readonly map = new Map<T, true>();
+
+  constructor(capacity: number) {
+    if (capacity <= 0) throw new Error('LRUSet capacity must be > 0');
+    this.capacity = capacity;
+  }
+
+  has(item: T): boolean {
+    return this.map.has(item);
+  }
+
+  /** 返回 true 表示是新加的，false 表示已存在（recency 已刷新） */
+  add(item: T): boolean {
+    if (this.map.has(item)) {
+      this.map.delete(item);
+      this.map.set(item, true);
+      return false;
+    }
+    this.map.set(item, true);
+    if (this.map.size > this.capacity) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) this.map.delete(oldest);
+    }
+    return true;
+  }
+
+  size(): number {
+    return this.map.size;
+  }
+}
+
 function parseMsgType(raw: string): MessageContentType {
   const map: Record<string, MessageContentType> = {
     text: 'text',
@@ -152,6 +191,35 @@ function parseMessage(data: Record<string, unknown>): Message {
   };
 }
 
+/**
+ * 把 im.message.list / chat-history API 返回的 item 转为 Message。
+ *
+ * im.message.list 的 item 字段名跟 receive_v1 不同（content 在 body.content / sender.id
+ * 直接挂 sender 上 / 等等），这里把它对齐到 parseMessage 期望的 receive_v1 形状。
+ */
+function parseListItem(item: Record<string, unknown>): Message {
+  const sender = (item.sender as Record<string, unknown> | undefined) ?? {};
+  const senderId = (sender.id as Record<string, unknown> | undefined) ?? {};
+  return parseMessage({
+    message: {
+      message_id: item.message_id,
+      chat_id: item.chat_id,
+      chat_type: item.chat_type,
+      message_type: item.message_type ?? item.msg_type,
+      content: item.body ? (item.body as Record<string, unknown>).content : item.content,
+      create_time: item.create_time,
+      mentions: item.mentions ?? [],
+      parent_id: item.parent_id,
+    },
+    sender: {
+      sender_id: {
+        open_id: senderId.open_id ?? (sender.id as string | undefined),
+        union_id: senderId.union_id,
+      },
+    },
+  });
+}
+
 function parseCardAction(data: Record<string, unknown>): CardAction {
   const context = (data.context ?? {}) as Record<string, unknown>;
   const action = (data.action ?? {}) as Record<string, unknown>;
@@ -196,6 +264,15 @@ export class LarkBotRuntime implements BotRuntime {
   /** patchCard 节流：messageId → 上次 patch 完成的时间 */
   private readonly patchTimes = new Map<string, number>();
 
+  // ─── issue #86: backfill 兜底（WSClient 长连接漏推消息时的轮询补救）
+  /** 已经被 emit 过的 messageId（无论来源是 WS 还是 backfill），防止 backfill 重复 emit */
+  private readonly seenMessageIds: LRUSet<string>;
+  /** chatId → 该群最后已知消息时间戳（毫秒）；下次 backfill 用作 since 起点 */
+  private readonly lastSeenAt = new Map<string, number>();
+  private backfillTimer: NodeJS.Timeout | null = null;
+  private readonly backfillIntervalMs: number;
+  private readonly backfillPageSize: number;
+
   constructor(
     private readonly env: {
       appId: string;
@@ -205,6 +282,10 @@ export class LarkBotRuntime implements BotRuntime {
       logLevel?: lark.LoggerLevel;
       logger?: Logger;
       quotaTracker?: QuotaTracker;
+      /** 测试 / 显式覆盖：默认从 env 读 BOT_BACKFILL_INTERVAL_MS / BOT_BACKFILL_PAGE_SIZE */
+      backfillIntervalMs?: number;
+      backfillPageSize?: number;
+      seenIdsCapacity?: number;
     },
   ) {
     this.client = new lark.Client({
@@ -219,6 +300,11 @@ export class LarkBotRuntime implements BotRuntime {
     this.tracker = env.quotaTracker ?? globalQuotaTracker;
     this.limiter = new RateLimiter(this.tracker);
     this.logger = env.logger;
+    this.backfillIntervalMs =
+      env.backfillIntervalMs ?? (Number(process.env['BOT_BACKFILL_INTERVAL_MS']) || 30_000);
+    this.backfillPageSize =
+      env.backfillPageSize ?? (Number(process.env['BOT_BACKFILL_PAGE_SIZE']) || 20);
+    this.seenMessageIds = new LRUSet<string>(env.seenIdsCapacity ?? 1000);
   }
 
   /** 暴露给测试 / 监控用，运行时可读取当前配额观测。 */
@@ -250,16 +336,18 @@ export class LarkBotRuntime implements BotRuntime {
       }).register({
         'im.message.receive_v1': async (data) => {
           const msg = parseMessage(data as unknown as Record<string, unknown>);
+          this.markMessageSeen(msg);
           this.emit({ type: 'message', payload: msg });
           return { code: 0 };
         },
         'im.chat.member.bot.added_v1': async (data) => {
           const d = data as unknown as Record<string, unknown>;
           const operatorId = (d.operator_id ?? {}) as Record<string, unknown>;
+          const chatId = (d.chat_id as string | undefined) ?? '';
           this.emit({
             type: 'botJoinedChat',
             payload: {
-              chatId: (d.chat_id as string | undefined) ?? '',
+              chatId,
               inviter: {
                 userId: (operatorId.open_id as string | undefined) ?? '',
                 ...((operatorId.union_id as string | undefined) !== undefined && {
@@ -269,6 +357,17 @@ export class LarkBotRuntime implements BotRuntime {
               timestamp: Date.now(),
             },
           });
+          // issue #86：bot 被拉进新群后 WS 长连接订阅集不会自动刷新，新群消息推不到
+          // 客户端。立即触发一次 backfill，把这个新群的最近消息从 HTTP API 拉回来。
+          // 不重连 WS（重连本身有丢事件窗口），只额外补一道 HTTP 兜底。
+          if (chatId) {
+            void this.backfillOnce().catch((e) => {
+              this.logger?.warn('[BotRuntime] immediate backfill on bot-added failed', {
+                chatId,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            });
+          }
           return { code: 0 };
         },
         p2p_chat_create: async (data) => {
@@ -293,6 +392,8 @@ export class LarkBotRuntime implements BotRuntime {
 
       // WSClient.start() 是长期阻塞的，用 fire-and-forget 启动
       void this.wsClient.start({ eventDispatcher: dispatcher });
+      // issue #86：开 backfill 兜底循环（WS 漏推时定时从 HTTP API 拉回来）
+      this.startBackfillLoop();
       return ok(undefined);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -301,7 +402,166 @@ export class LarkBotRuntime implements BotRuntime {
   }
 
   async stop(): Promise<void> {
+    this.stopBackfillLoop();
     this.wsClient.close();
+  }
+
+  // ─── backfill (issue #86) ───────────────────────────────────────────────────
+
+  /**
+   * 标记某条消息已被 emit 过。WS 推 + backfill 拉都会调，避免后续 backfill 重复 emit。
+   */
+  private markMessageSeen(msg: Message): void {
+    if (msg.messageId) this.seenMessageIds.add(msg.messageId);
+    if (msg.chatId && msg.timestamp > 0) {
+      const prev = this.lastSeenAt.get(msg.chatId) ?? 0;
+      if (msg.timestamp > prev) this.lastSeenAt.set(msg.chatId, msg.timestamp);
+    }
+  }
+
+  /**
+   * 跑一次 backfill：列出 bot 所在的所有群，对每个群拉 lastSeenAt 之后的新消息，
+   * emit 没在 seenMessageIds 里的。第一次见到某个群时进 seed 模式，只把现有消息的 id
+   * 灌进去防止把历史消息当新消息 emit。
+   *
+   * 暴露为 public 是为了：1) 单元测试直接调；2) 在 bot 入群事件后立即触发一次。
+   */
+  async backfillOnce(): Promise<void> {
+    let chats: Array<{ chat_id?: string }> = [];
+    try {
+      const res = await (
+        this.client.im.chat as unknown as {
+          list: (p: unknown) => Promise<{
+            code?: number;
+            msg?: string;
+            data?: { items?: Array<{ chat_id?: string }>; has_more?: boolean };
+          }>;
+        }
+      ).list({ params: { page_size: 100 } });
+      if (res.code !== 0) {
+        this.logger?.warn('[BotRuntime] backfill: chat.list failed', {
+          code: res.code,
+          msg: res.msg,
+        });
+        return;
+      }
+      chats = res.data?.items ?? [];
+    } catch (e) {
+      this.logger?.warn('[BotRuntime] backfill: chat.list threw', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return;
+    }
+
+    for (const chat of chats) {
+      const chatId = chat.chat_id;
+      if (!chatId) continue;
+      await this.backfillChat(chatId);
+    }
+  }
+
+  private async backfillChat(chatId: string): Promise<void> {
+    const since = this.lastSeenAt.get(chatId);
+    // 第一次见这个群：seed 模式，把现有消息灌进 seenMessageIds，但不 emit
+    const seedMode = since === undefined;
+
+    let res: {
+      code?: number;
+      msg?: string;
+      data?: { items?: Array<Record<string, unknown>>; has_more?: boolean };
+    };
+    try {
+      await this.limiter.acquire();
+      res = await (
+        this.client.im.message as unknown as {
+          list: (p: unknown) => Promise<typeof res>;
+        }
+      ).list({
+        params: {
+          container_id: chatId,
+          container_id_type: 'chat',
+          page_size: this.backfillPageSize,
+          ...(since !== undefined && { start_time: String(Math.floor(since / 1000)) }),
+          sort_type: 'ByCreateTimeAsc',
+        },
+      });
+    } catch (e) {
+      this.logger?.warn('[BotRuntime] backfill: message.list threw', {
+        chatId,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return;
+    }
+
+    if (res.code !== 0) {
+      this.logger?.warn('[BotRuntime] backfill: message.list failed', {
+        chatId,
+        code: res.code,
+        msg: res.msg,
+      });
+      return;
+    }
+
+    const items = res.data?.items ?? [];
+    let maxTs = since ?? 0;
+    let emitted = 0;
+
+    for (const item of items) {
+      const messageId = item.message_id as string | undefined;
+      if (!messageId) continue;
+      if (this.seenMessageIds.has(messageId)) continue;
+
+      let parsed: Message;
+      try {
+        parsed = parseListItem(item);
+      } catch (e) {
+        this.logger?.warn('[BotRuntime] backfill: parseListItem failed', {
+          chatId,
+          messageId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        continue;
+      }
+
+      this.seenMessageIds.add(messageId);
+      if (parsed.timestamp > maxTs) maxTs = parsed.timestamp;
+
+      if (!seedMode) {
+        this.emit({ type: 'message', payload: parsed });
+        emitted += 1;
+      }
+    }
+
+    // 即便 items 为空也要把 lastSeenAt 推进到"现在"，否则下次 seedMode 还会再触发一遍
+    if (maxTs > 0) {
+      this.lastSeenAt.set(chatId, maxTs);
+    } else if (seedMode) {
+      this.lastSeenAt.set(chatId, Date.now());
+    }
+
+    if (emitted > 0) {
+      this.logger?.info('[BotRuntime] backfill recovered messages', { chatId, count: emitted });
+    }
+  }
+
+  private startBackfillLoop(): void {
+    if (this.backfillTimer) return;
+    this.backfillTimer = setInterval(() => {
+      void this.backfillOnce().catch((e) => {
+        this.logger?.warn('[BotRuntime] backfill iteration failed', {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      });
+    }, this.backfillIntervalMs);
+    // 在 Node 里允许 process 在没有其它工作时仍然退出
+    if (typeof this.backfillTimer.unref === 'function') this.backfillTimer.unref();
+  }
+
+  private stopBackfillLoop(): void {
+    if (this.backfillTimer) {
+      clearInterval(this.backfillTimer);
+      this.backfillTimer = null;
+    }
   }
 
   async sendText(params: SendTextParams): Promise<Result<SentMessage>> {
@@ -434,29 +694,7 @@ export class LarkBotRuntime implements BotRuntime {
       }
 
       const items = res.data?.items ?? [];
-      const messages: Message[] = items.map((item) => {
-        // im.message.list 的 item 字段名与 receive_v1 不同，手动对齐
-        const sender = (item.sender as Record<string, unknown> | undefined) ?? {};
-        const senderId = (sender.id as Record<string, unknown> | undefined) ?? {};
-        return parseMessage({
-          message: {
-            message_id: item.message_id,
-            chat_id: item.chat_id,
-            chat_type: item.chat_type,
-            message_type: item.message_type ?? item.msg_type,
-            content: item.body ? (item.body as Record<string, unknown>).content : item.content,
-            create_time: item.create_time,
-            mentions: item.mentions ?? [],
-            parent_id: item.parent_id,
-          },
-          sender: {
-            sender_id: {
-              open_id: senderId.open_id ?? (sender.id as string | undefined),
-              union_id: senderId.union_id,
-            },
-          },
-        });
-      });
+      const messages: Message[] = items.map((item) => parseListItem(item));
 
       const nextPageToken = res.data?.page_token;
       return ok({
