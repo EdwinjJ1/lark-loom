@@ -302,6 +302,7 @@ async function handleWithHarness(
   const systemPrompt = harness.promptCache.build({ chatId, mention: true });
   const executor = makeExecutor({
     store: harness.memoryStore,
+    bitable: ctx.bitable,
     skills: registeredSkillValues(skills),
     chatId,
     logger,
@@ -311,7 +312,8 @@ async function handleWithHarness(
   const skillChoices = [...registeredSkillNames(skills), 'silent'].join(' | ');
   const decisionInstruction =
     '可调用工具：skill.list / skill.read / memory.search 用于检索，' +
-    'memory.write 用于把消息中的可记忆事实（项目目标/用户群体/截止日期/分工/关键决策/文档链接）写入记忆。' +
+    'memory.write 用于把消息中的可记忆事实（项目目标/用户群体/截止日期/分工/文档链接）写入记忆，' +
+    'decision.write 用于记录明确决策（"我们决定…""最终确认…""不做…""验收标准是…"）。' +
     '工具调用完成后只输出 JSON：' +
     `{"skill":"<以下之一: ${skillChoices}>","reason":"一句话原因","args":{}}。` +
     `skill 字段必须是 ${skillChoices} 中的一个，不要输出其他值。` +
@@ -521,6 +523,7 @@ async function handleSchedule(
 export const PASSIVE_MIN_TEXT_LENGTH = 12;
 
 const MEMORY_WRITE_TOOL_NAME = 'memory.write';
+const DECISION_WRITE_TOOL_NAME = 'decision.write';
 
 export function shouldObservePassively(text: string): boolean {
   return text.trim().length >= PASSIVE_MIN_TEXT_LENGTH;
@@ -534,15 +537,18 @@ async function handlePassiveObserve(
   const { llm, logger } = ctx;
   const chatId = msg.chatId;
 
-  // 只暴露 memory.write，不暴露 search/read/skill.* — 避免模型走偏
-  const writeTool = getLLMTools().find((t) => t.name === MEMORY_WRITE_TOOL_NAME);
-  if (!writeTool) {
-    logger.warn('passive observe: memory.write tool missing', { chatId });
+  // 只暴露 memory.write + decision.write，不暴露 search/read/skill.* — 避免模型走偏
+  const allTools = getLLMTools();
+  const writeTool = allTools.find((t) => t.name === MEMORY_WRITE_TOOL_NAME);
+  const decisionTool = allTools.find((t) => t.name === DECISION_WRITE_TOOL_NAME);
+  if (!writeTool || !decisionTool) {
+    logger.warn('passive observe: required tools missing', { chatId });
     return;
   }
 
   const executor = makeExecutor({
     store: harness.memoryStore,
+    bitable: ctx.bitable,
     chatId,
     logger,
     docsRoot: harness.docsRoot,
@@ -551,8 +557,9 @@ async function handlePassiveObserve(
 
   const systemPrompt =
     '你是一个静默的记忆观察者。读到的消息**不要回复用户**。\n' +
-    '如果消息包含值得群组长期记住的事实（项目目标/用户群体/截止日期/分工/关键文档/重要决策），' +
+    '如果消息包含值得群组长期记住的事实（项目目标/用户群体/截止日期/分工/关键文档），' +
     '调用 memory.write 写入；importance 只在很重要时（≥7）才指定。\n' +
+    '如果消息包含明确决策（"我们决定…""最终确认…""不做…""验收标准是…"），调用 decision.write 记录。\n' +
     'key 命名规范：用稳定的语义英文短语（snake_case），相同主题复用同一 key 实现覆盖更新，避免写重复条目。\n' +
     '示例：截止日期 → "project_deadline"；分工 → "task_owner_<姓名拼音>"；项目目标 → "project_goal"。\n' +
     '若消息是闲聊/重复/没有事实信息，什么都不调，直接输出 SKIP。';
@@ -565,7 +572,7 @@ async function handlePassiveObserve(
   const result = await observeWithTimeout(
     llm,
     messages,
-    [writeTool],
+    [writeTool, decisionTool],
     executor,
     600_000, // 10 分钟：与主动路径对齐，避免 LLM 写记忆中途被切
   );
