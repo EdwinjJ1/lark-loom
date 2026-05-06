@@ -100,6 +100,10 @@ export interface SummaryCardInput {
   readonly decisions: readonly string[];
   readonly todos: readonly { text: string; assignee?: string; due?: string }[];
   readonly followUps: readonly string[];
+  /** 一句话/一段话整体摘要，渲染在顶部，结构化字段为空时仍能给用户可读的输出 */
+  readonly summary?: string;
+  readonly isLoading?: boolean;
+  readonly errorMessage?: string;
 }
 
 export interface SlidesCardInput {

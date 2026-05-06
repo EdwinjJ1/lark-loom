@@ -185,6 +185,60 @@ describe('summary card', () => {
     expect(j).toContain('待跟进');
     expect(j).toContain('@Antares');
   });
+
+  it('renders prose summary at top when present', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      summary: '本次会议确定供应商选型，李工本周一前出方案。',
+      topics: [],
+      decisions: ['供应商选型采用 B 方案'],
+      todos: [],
+      followUps: [],
+    });
+    const j = json(card);
+    expect(j).toContain('确定供应商选型');
+    expect(j).toContain('B 方案');
+  });
+
+  it('renders loading state', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      topics: [],
+      decisions: [],
+      todos: [],
+      followUps: [],
+      isLoading: true,
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    expect(j).toContain('会议纪要整理中');
+  });
+
+  it('renders error state', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      topics: [],
+      decisions: [],
+      todos: [],
+      followUps: [],
+      errorMessage: 'LLM 提取失败：timeout',
+    });
+    const j = json(card);
+    expect(j).toContain('会议纪要整理失败');
+    expect(j).toContain('timeout');
+  });
+
+  it('renders explicit fallback when all fields empty (no silent blank card)', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      topics: [],
+      decisions: [],
+      todos: [],
+      followUps: [],
+    });
+    const j = json(card);
+    expect(j).toContain('未在群历史中识别到');
+  });
 });
 
 describe('slides card', () => {

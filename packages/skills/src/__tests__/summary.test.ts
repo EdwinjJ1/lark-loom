@@ -2,13 +2,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { summarySkill } from '../summary.js';
 import type { SkillContext, BotEvent, Message } from '@seedhac/contracts';
 
-const mockLLMAsk = vi.fn();
+const mockAskStructured = vi.fn();
 const mockFetchHistory = vi.fn();
+const mockFetchMessage = vi.fn();
+const mockSendCard = vi.fn();
+const mockPatchCard = vi.fn();
 const mockBitableBatchInsert = vi.fn();
 const mockBitableInsert = vi.fn();
-const mockCardBuilderBuild = vi.fn().mockReturnValue({ templateName: 'summary', content: { built: true } });
+const mockCardBuilderBuild = vi
+  .fn()
+  .mockReturnValue({ templateName: 'summary', content: { built: true } });
 
-function makeMessage(text: string): Message {
+function makeMessage(text: string, overrides: Partial<Message> = {}): Message {
   return {
     messageId: 'msg_1',
     chatId: 'chat_1',
@@ -19,6 +24,7 @@ function makeMessage(text: string): Message {
     rawContent: text,
     mentions: [],
     timestamp: Date.now(),
+    ...overrides,
   };
 }
 
@@ -29,9 +35,26 @@ function makeEvent(text: string): BotEvent {
 function makeCtx(event: BotEvent): SkillContext {
   return {
     event,
-    runtime: { fetchHistory: mockFetchHistory, sendText: vi.fn(), sendCard: vi.fn(), patchCard: vi.fn(), on: vi.fn(), start: vi.fn(), stop: vi.fn() },
-    llm: { ask: mockLLMAsk, chat: vi.fn(), askStructured: vi.fn() },
-    bitable: { find: vi.fn(), insert: mockBitableInsert, batchInsert: mockBitableBatchInsert, update: vi.fn(), delete: vi.fn(), link: vi.fn() },
+    runtime: {
+      fetchHistory: mockFetchHistory,
+      fetchMessage: mockFetchMessage,
+      sendText: vi.fn(),
+      sendCard: mockSendCard,
+      patchCard: mockPatchCard,
+      on: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      fetchMembers: vi.fn(),
+    },
+    llm: { ask: vi.fn(), chat: vi.fn(), askStructured: mockAskStructured, chatWithTools: vi.fn() },
+    bitable: {
+      find: vi.fn(),
+      insert: mockBitableInsert,
+      batchInsert: mockBitableBatchInsert,
+      update: vi.fn(),
+      delete: vi.fn(),
+      link: vi.fn(),
+    },
     docx: {} as SkillContext['docx'],
     cardBuilder: { build: mockCardBuilderBuild },
     retrievers: {},
@@ -39,92 +62,205 @@ function makeCtx(event: BotEvent): SkillContext {
   } as unknown as SkillContext;
 }
 
-const VALID_LLM_RESPONSE = JSON.stringify({
-  decisions: ['采用方案A', '预算定为 10 万'],
+const VALID_EXTRACTION = {
+  summary: '本次会议决定采用方案 A。',
+  decisions: ['采用方案A'],
   actionItems: [{ owner: 'Alice', content: '完成前端开发', ddl: '2026-05-10' }],
   issues: ['后端接口未确认'],
   nextSteps: ['下周召开评审会'],
-});
+};
 
-describe('summarySkill', () => {
+const EMPTY_EXTRACTION_VALUE = {
+  summary: '本次群聊未识别到决策。',
+  decisions: [],
+  actionItems: [],
+  issues: [],
+  nextSteps: [],
+};
+
+describe('summarySkill.match', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('match returns true when message contains 会议纪要', () => {
+  it('matches 会议纪要', () => {
     expect(summarySkill.match(makeCtx(makeEvent('会议纪要已发，请大家查看')))).toBe(true);
   });
 
-  it('match returns true when message contains 妙记', () => {
+  it('matches 妙记', () => {
     expect(summarySkill.match(makeCtx(makeEvent('妙记链接来了')))).toBe(true);
   });
 
-  it('match returns false for unrelated message', () => {
+  it('does not match unrelated message', () => {
     expect(summarySkill.match(makeCtx(makeEvent('今天需要完成前端开发')))).toBe(false);
   });
 
-  it('match returns false for non-message event', () => {
-    const ctx = makeCtx({ type: 'botJoinedChat', payload: { chatId: 'c', inviter: { userId: 'u' }, timestamp: 0 } });
+  it('does not match non-message event', () => {
+    const ctx = makeCtx({
+      type: 'botJoinedChat',
+      payload: { chatId: 'c', inviter: { userId: 'u' }, timestamp: 0 },
+    });
     expect(summarySkill.match(ctx)).toBe(false);
   });
+});
 
-  it('run normal path: batchInsert called, summary card returned', async () => {
-    mockFetchHistory.mockResolvedValueOnce({ ok: true, value: { messages: [makeMessage('会议纪要如下')], hasMore: false } });
-    mockLLMAsk.mockResolvedValueOnce({ ok: true, value: VALID_LLM_RESPONSE });
+describe('summarySkill.run pipeline', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('happy path: sends loading card, extracts, patches final, writes side effects', async () => {
+    mockSendCard.mockResolvedValueOnce({
+      ok: true,
+      value: { messageId: 'load_msg', chatId: 'chat_1', timestamp: 0 },
+    });
+    mockFetchHistory.mockResolvedValueOnce({
+      ok: true,
+      value: { messages: [makeMessage('会议纪要如下')], hasMore: false },
+    });
+    mockAskStructured.mockResolvedValueOnce({ ok: true, value: VALID_EXTRACTION });
+    mockPatchCard.mockResolvedValue({ ok: true, value: undefined });
     mockBitableBatchInsert.mockResolvedValue({ ok: true, value: [] });
-    mockBitableInsert.mockResolvedValueOnce({ ok: true, value: { tableId: 't', recordId: 'r' } });
+    mockBitableInsert.mockResolvedValueOnce({
+      ok: true,
+      value: { tableId: 't', recordId: 'r' },
+    });
 
     const result = await summarySkill.run(makeCtx(makeEvent('本次会议总结')));
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.card?.templateName).toBe('summary');
+    // 第 1 次 build：loading 卡（isLoading: true）
+    expect(mockCardBuilderBuild).toHaveBeenNthCalledWith(
+      1,
+      'summary',
+      expect.objectContaining({ isLoading: true }),
+    );
+    // 第 2 次 build：最终卡（带 decisions / todos / summary prose）
+    expect(mockCardBuilderBuild).toHaveBeenNthCalledWith(
+      2,
+      'summary',
+      expect.objectContaining({
+        decisions: ['采用方案A'],
+        summary: expect.stringContaining('方案 A'),
+      }),
+    );
+    expect(mockSendCard).toHaveBeenCalledOnce();
+    expect(mockPatchCard).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'load_msg' }),
+    );
     expect(mockBitableBatchInsert).toHaveBeenCalledTimes(2); // decision + todo
-    expect(mockCardBuilderBuild).toHaveBeenCalledWith('summary', expect.objectContaining({
-      decisions: ['采用方案A', '预算定为 10 万'],
-    }));
   });
 
-  it('run: LLM failure returns err, batchInsert not called', async () => {
-    mockFetchHistory.mockResolvedValueOnce({ ok: true, value: { messages: [], hasMore: false } });
-    mockLLMAsk.mockResolvedValueOnce({ ok: false, error: { code: 'LLM_TIMEOUT', message: 'timeout' } });
+  it('LLM failure: patches error card and returns err', async () => {
+    mockSendCard.mockResolvedValueOnce({
+      ok: true,
+      value: { messageId: 'load_msg', chatId: 'chat_1', timestamp: 0 },
+    });
+    mockFetchHistory.mockResolvedValueOnce({
+      ok: true,
+      value: { messages: [], hasMore: false },
+    });
+    mockAskStructured.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'LLM_TIMEOUT', message: 'timeout' },
+    });
+    mockPatchCard.mockResolvedValue({ ok: true, value: undefined });
 
     const result = await summarySkill.run(makeCtx(makeEvent('会议总结')));
 
     expect(result.ok).toBe(false);
     expect(mockBitableBatchInsert).not.toHaveBeenCalled();
+    // patch 出去的是 error 卡
+    expect(mockCardBuilderBuild).toHaveBeenCalledWith(
+      'summary',
+      expect.objectContaining({ errorMessage: expect.stringContaining('LLM 提取失败') }),
+    );
+    expect(mockPatchCard).toHaveBeenCalledOnce();
   });
 
-  it('run: fetchHistory failure returns err', async () => {
-    mockFetchHistory.mockResolvedValueOnce({ ok: false, error: { code: 'FEISHU_API_ERROR', message: 'fail' } });
+  it('fetchHistory failure: patches error card and returns err', async () => {
+    mockSendCard.mockResolvedValueOnce({
+      ok: true,
+      value: { messageId: 'load_msg', chatId: 'chat_1', timestamp: 0 },
+    });
+    mockFetchHistory.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'FEISHU_API_ERROR', message: 'fail' },
+    });
+    mockPatchCard.mockResolvedValue({ ok: true, value: undefined });
 
     const result = await summarySkill.run(makeCtx(makeEvent('会议纪要')));
 
     expect(result.ok).toBe(false);
-    expect(mockLLMAsk).not.toHaveBeenCalled();
+    expect(mockAskStructured).not.toHaveBeenCalled();
+    expect(mockCardBuilderBuild).toHaveBeenCalledWith(
+      'summary',
+      expect.objectContaining({ errorMessage: expect.stringContaining('拉群历史失败') }),
+    );
   });
 
-  it('run: bitable write failure does not block card output', async () => {
-    mockFetchHistory.mockResolvedValueOnce({ ok: true, value: { messages: [], hasMore: false } });
-    mockLLMAsk.mockResolvedValueOnce({ ok: true, value: VALID_LLM_RESPONSE });
-    mockBitableBatchInsert.mockResolvedValue({ ok: false, error: { code: 'FEISHU_API_ERROR', message: 'bitable down' } });
-    mockBitableInsert.mockResolvedValueOnce({ ok: false, error: { code: 'FEISHU_API_ERROR', message: 'bitable down' } });
+  it('loading card send failure: returns err without further work', async () => {
+    mockSendCard.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'FEISHU_API_ERROR', message: 'send fail' },
+    });
+
+    const result = await summarySkill.run(makeCtx(makeEvent('会议纪要')));
+
+    expect(result.ok).toBe(false);
+    expect(mockFetchHistory).not.toHaveBeenCalled();
+    expect(mockAskStructured).not.toHaveBeenCalled();
+    expect(mockPatchCard).not.toHaveBeenCalled();
+  });
+
+  it('bitable write failure: still patches final card and returns ok', async () => {
+    mockSendCard.mockResolvedValueOnce({
+      ok: true,
+      value: { messageId: 'load_msg', chatId: 'chat_1', timestamp: 0 },
+    });
+    mockFetchHistory.mockResolvedValueOnce({
+      ok: true,
+      value: { messages: [], hasMore: false },
+    });
+    mockAskStructured.mockResolvedValueOnce({ ok: true, value: VALID_EXTRACTION });
+    mockPatchCard.mockResolvedValue({ ok: true, value: undefined });
+    mockBitableBatchInsert.mockResolvedValue({
+      ok: false,
+      error: { code: 'FEISHU_API_ERROR', message: 'bitable down' },
+    });
+    mockBitableInsert.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'FEISHU_API_ERROR', message: 'bitable down' },
+    });
 
     const result = await summarySkill.run(makeCtx(makeEvent('本次会议')));
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.card?.templateName).toBe('summary');
+    expect(mockPatchCard).toHaveBeenCalled();
   });
 
-  it('run: LLM returns invalid JSON → falls back to empty extraction, still returns card', async () => {
-    mockFetchHistory.mockResolvedValueOnce({ ok: true, value: { messages: [], hasMore: false } });
-    mockLLMAsk.mockResolvedValueOnce({ ok: true, value: 'not json' });
-    mockBitableInsert.mockResolvedValueOnce({ ok: true, value: { tableId: 't', recordId: 'r' } });
+  it('empty extraction: still patches final card with prose fallback', async () => {
+    mockSendCard.mockResolvedValueOnce({
+      ok: true,
+      value: { messageId: 'load_msg', chatId: 'chat_1', timestamp: 0 },
+    });
+    mockFetchHistory.mockResolvedValueOnce({
+      ok: true,
+      value: { messages: [], hasMore: false },
+    });
+    mockAskStructured.mockResolvedValueOnce({ ok: true, value: EMPTY_EXTRACTION_VALUE });
+    mockPatchCard.mockResolvedValue({ ok: true, value: undefined });
+    mockBitableInsert.mockResolvedValueOnce({
+      ok: true,
+      value: { tableId: 't', recordId: 'r' },
+    });
 
     const result = await summarySkill.run(makeCtx(makeEvent('会议纪要')));
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.card?.templateName).toBe('summary');
-    expect(mockBitableBatchInsert).not.toHaveBeenCalled(); // empty arrays → no batchInsert
-    expect(mockCardBuilderBuild).toHaveBeenCalledWith('summary', expect.objectContaining({
-      decisions: [],
-    }));
+    expect(mockBitableBatchInsert).not.toHaveBeenCalled();
+    expect(mockCardBuilderBuild).toHaveBeenCalledWith(
+      'summary',
+      expect.objectContaining({
+        decisions: [],
+        summary: expect.stringContaining('未识别到'),
+      }),
+    );
   });
 });

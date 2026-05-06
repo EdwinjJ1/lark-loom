@@ -315,7 +315,32 @@ function buildQa(input: QaCardInput): Card {
  * UI：议题 / 决策 / 待办 / 待跟进四段，强制可见
  */
 function buildSummary(input: SummaryCardInput): Card {
-  const elements: BodyElement[] = [md(`**${input.title}**`), hr()];
+  if (input.isLoading) {
+    return card('summary', {
+      schema: '2.0',
+      header: { title: pt('会议纪要整理中'), template: 'orange' },
+      body: {
+        elements: [
+          md(`**${input.title}**\n正在分析群历史并提取决策 / 行动项 / 遗留问题，预计 30-90 秒。`),
+        ],
+      },
+    });
+  }
+
+  if (input.errorMessage) {
+    return card('summary', {
+      schema: '2.0',
+      header: { title: pt('会议纪要整理失败'), template: 'red' },
+      body: {
+        elements: [md(`**${input.title}**\n${input.errorMessage}`)],
+      },
+    });
+  }
+
+  const elements: BodyElement[] = [md(`**${input.title}**`)];
+  if (input.summary) elements.push(md(input.summary));
+  elements.push(hr());
+
   if (input.topics.length)
     elements.push(md(`**📋 议题**\n${input.topics.map((t) => `- ${t}`).join('\n')}`));
   if (input.decisions.length)
@@ -331,6 +356,19 @@ function buildSummary(input: SummaryCardInput): Card {
   }
   if (input.followUps.length)
     elements.push(hr(), md(`**🔍 待跟进**\n${input.followUps.map((f) => `- ${f}`).join('\n')}`));
+
+  // 全部结构化字段都空 + 也没 prose summary：给用户一个明确的"无可总结"提示，
+  // 避免渲染出一张只有标题的空卡片
+  if (
+    !input.summary &&
+    !input.topics.length &&
+    !input.decisions.length &&
+    !input.todos.length &&
+    !input.followUps.length
+  ) {
+    elements.push(md('未在群历史中识别到明确的决策、行动项或会议结论，可补充后再触发。'));
+  }
+
   return card('summary', {
     schema: '2.0',
     header: { title: pt('会议 / 阶段总结'), template: 'green' },
