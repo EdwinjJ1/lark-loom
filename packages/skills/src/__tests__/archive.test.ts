@@ -10,6 +10,13 @@ const mockCardBuilderBuild = vi
   .fn()
   .mockReturnValue({ templateName: 'archive', content: { built: true } });
 
+// issue #114 三阶段 pipeline 新引入的依赖
+const mockSendCard = vi.fn();
+const mockPatchCard = vi.fn();
+const mockFetchMembers = vi.fn();
+const mockDocxCreate = vi.fn();
+const mockDocxGrant = vi.fn();
+
 function makeMessage(text: string): Message {
   return {
     messageId: 'msg_1',
@@ -33,9 +40,10 @@ function makeCtx(event: BotEvent): SkillContext {
     event,
     runtime: {
       fetchHistory: vi.fn(),
+      fetchMembers: mockFetchMembers,
       sendText: vi.fn(),
-      sendCard: vi.fn(),
-      patchCard: vi.fn(),
+      sendCard: mockSendCard,
+      patchCard: mockPatchCard,
       on: vi.fn(),
       start: vi.fn(),
       stop: vi.fn(),
@@ -49,7 +57,10 @@ function makeCtx(event: BotEvent): SkillContext {
       delete: vi.fn(),
       link: vi.fn(),
     },
-    docx: {} as SkillContext['docx'],
+    docx: {
+      createFromMarkdown: mockDocxCreate,
+      grantMembersEdit: mockDocxGrant,
+    },
     cardBuilder: { build: mockCardBuilderBuild },
     retrievers: {},
     logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -63,6 +74,21 @@ describe('archiveSkill', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockBitableInsert.mockResolvedValue(OK_INSERT);
+    // 默认 happy path：所有外部依赖都成功
+    mockSendCard.mockResolvedValue({
+      ok: true,
+      value: { messageId: 'card_msg_1', chatId: 'chat_1', timestamp: 0 },
+    });
+    mockPatchCard.mockResolvedValue({ ok: true, value: undefined });
+    mockFetchMembers.mockResolvedValue({
+      ok: true,
+      value: { members: [{ userId: 'u1', name: 'Alice' }] },
+    });
+    mockDocxCreate.mockResolvedValue({
+      ok: true,
+      value: { docToken: 'doc_tok_1', url: 'https://x.feishu.cn/docx/doc_tok_1' },
+    });
+    mockDocxGrant.mockResolvedValue({ ok: true, value: undefined });
   });
 
   it('match returns true when message contains 归档', () => {
@@ -131,10 +157,11 @@ describe('archiveSkill', () => {
       ok: true,
       value: {
         goal: '业务探索的小项目',
-        outcomes: ['PRD 已落地', 'PPT 已生成'],
+        // outcomes 必须 grounded —— issue #114 verify 会 drop 不在 source 里的条目
+        outcomes: ['业务探索文档已落地', '期末汇报材料已生成'],
         whatWorkedWell: ['前端表单一次过'],
         whatToImprove: ['UI 改稿次数偏多'],
-        openIssues: ['设计 UI 还在 pending'],
+        openIssues: ['设计 UI 已搞定'],
       },
     });
 
@@ -144,15 +171,16 @@ describe('archiveSkill', () => {
     expect(mockBitableFind).toHaveBeenCalledTimes(3);
 
     // 卡片必须有 links（issue #104 验收：至少 2 条）
-    const buildArgs = mockCardBuilderBuild.mock.calls[0]![1];
+    // 第一个 build 是 loading 卡，最后一个是 final 卡（issue #114 三阶段）
+    const buildArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
     expect(buildArgs.links).toHaveLength(2);
     expect(buildArgs.links[0]).toMatchObject({ kind: 'requirementDoc', label: '需求文档' });
     expect(buildArgs.links[1]).toMatchObject({ kind: 'slides', label: '演示 PPT' });
     expect(buildArgs.taskStats).toBe('1/2 已完成');
     expect(buildArgs.decisionCount).toBe(1);
-    // summary 由模板渲染：必须含 goal + outcomes
+    // summary 由模板渲染：必须含 goal + grounded outcomes
     expect(buildArgs.summary).toContain('业务探索');
-    expect(buildArgs.summary).toContain('PRD 已落地');
+    expect(buildArgs.summary).toContain('期末汇报');
 
     // 写归档 memory（audit）
     expect(mockBitableInsert).toHaveBeenCalledWith(
@@ -190,8 +218,9 @@ describe('archiveSkill', () => {
     const result = await archiveSkill.run(makeCtx(makeEvent('收尾归档')));
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.card?.templateName).toBe('archive');
-    const buildArgs = mockCardBuilderBuild.mock.calls[0]![1];
+    // issue #114：archive 不再返回 card（loading + patchCard 已直接发送）
+    expect(mockPatchCard).toHaveBeenCalled();
+    const buildArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
     expect(buildArgs.summary).toContain('已收尾');
   });
 
@@ -203,7 +232,8 @@ describe('archiveSkill', () => {
 
     expect(result.ok).toBe(true);
     expect(mockLLMAskStructured).not.toHaveBeenCalled(); // 完全没调 LLM
-    const buildArgs = mockCardBuilderBuild.mock.calls[0]![1];
+    // 第一个 build 是 loading 卡，最后一个是 final 卡（issue #114 三阶段）
+    const buildArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
     expect(buildArgs.summary).toContain('已收尾');
   });
 
@@ -218,7 +248,8 @@ describe('archiveSkill', () => {
     const result = await archiveSkill.run(makeCtx(makeEvent('归档')));
 
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.value.card?.templateName).toBe('archive');
+    // patchCard 仍然完成（cardBuilder 至少被调过 2 次：loading + final）
+    expect(mockCardBuilderBuild.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it('run: bitable.find partial failure — uses available data, still proceeds', async () => {
@@ -253,7 +284,8 @@ describe('archiveSkill', () => {
     const result = await archiveSkill.run(makeCtx(makeEvent('归档')));
 
     expect(result.ok).toBe(true);
-    const buildArgs = mockCardBuilderBuild.mock.calls[0]![1];
+    // 第一个 build 是 loading 卡，最后一个是 final 卡（issue #114 三阶段）
+    const buildArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
     expect(buildArgs.links).toEqual([]);
   });
 
@@ -297,9 +329,131 @@ describe('archiveSkill', () => {
 
     await archiveSkill.run(makeCtx(makeEvent('归档')));
 
-    const buildArgs = mockCardBuilderBuild.mock.calls[0]![1];
+    // 第一个 build 是 loading 卡，最后一个是 final 卡（issue #114 三阶段）
+    const buildArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
     expect(buildArgs.decisionCount).toBe(3); // 实际 decisions.length，不是 LLM 给的
     expect(buildArgs.taskStats).toBe('3/4 已完成'); // 3 done out of 4 todos
+  });
+
+  // ─── issue #114 新增：三阶段 pipeline + doc 生成 ──────────────────────
+
+  it('issue #114: sendCard loading first, then patchCard final with doc URL', async () => {
+    mockBitableFind.mockResolvedValue({
+      ok: true,
+      value: {
+        records: [
+          {
+            recordId: 'r1',
+            content: '[需求文档] 项目 PRD\nhttps://x.feishu.cn/docx/abc',
+            created_at: 1,
+          },
+          { recordId: 'r2', content: '记录 2' },
+          { recordId: 'r3', content: '记录 3' },
+        ],
+        hasMore: false,
+      },
+    });
+    mockLLMAskStructured.mockResolvedValueOnce({
+      ok: true,
+      value: {
+        goal: 'test goal',
+        outcomes: ['outcome'],
+        whatWorkedWell: [],
+        whatToImprove: [],
+        openIssues: [],
+      },
+    });
+
+    await archiveSkill.run(makeCtx(makeEvent('项目结束了，归档一下')));
+
+    // 1. sendCard 一次（loading）
+    expect(mockSendCard).toHaveBeenCalledOnce();
+    const loadingArgs = mockCardBuilderBuild.mock.calls[0]![1];
+    expect(loadingArgs.isLoading).toBe(true);
+    expect(loadingArgs.etaSeconds).toBeGreaterThan(0);
+
+    // 2. docx.createFromMarkdown 被调（生成报告 doc）
+    expect(mockDocxCreate).toHaveBeenCalledOnce();
+    const [docTitle, docMarkdown] = mockDocxCreate.mock.calls[0]!;
+    expect(docTitle).toContain('项目交付报告');
+    expect(docMarkdown).toContain('## 摘要');
+    expect(docMarkdown).toContain('## 项目产出');
+
+    // 3. fetchMembers + grantMembersEdit 被调（给群成员授权）
+    expect(mockFetchMembers).toHaveBeenCalledOnce();
+    expect(mockDocxGrant).toHaveBeenCalledWith('doc_tok_1', 'docx', ['u1']);
+
+    // 4. patchCard 一次（final）
+    expect(mockPatchCard).toHaveBeenCalledOnce();
+    const finalArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
+    expect(finalArgs.isLoading).toBeUndefined();
+    expect(finalArgs.reportDocUrl).toBe('https://x.feishu.cn/docx/doc_tok_1');
+  });
+
+  it('issue #114: docx 创建失败 → final 卡 patch 时不带 reportDocUrl', async () => {
+    mockBitableFind.mockResolvedValue({
+      ok: true,
+      value: {
+        records: [{ content: 'a' }, { content: 'b' }, { content: 'c' }],
+        hasMore: false,
+      },
+    });
+    mockLLMAskStructured.mockResolvedValueOnce({
+      ok: true,
+      value: { goal: 'g', outcomes: [], whatWorkedWell: [], whatToImprove: [], openIssues: [] },
+    });
+    mockDocxCreate.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'FEISHU_API_ERROR', message: 'doc create failed' },
+    });
+
+    await archiveSkill.run(makeCtx(makeEvent('归档')));
+
+    expect(mockPatchCard).toHaveBeenCalledOnce(); // 仍然 patch final，不走 error
+    const finalArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
+    expect(finalArgs.reportDocUrl).toBeUndefined(); // 没 doc URL
+    expect(finalArgs.errorMessage).toBeUndefined(); // 也不是 error 态
+  });
+
+  it('issue #114 verify: outcomes 不在 source 里 → 被 drop', async () => {
+    mockBitableFind
+      .mockResolvedValueOnce({
+        ok: true,
+        value: {
+          records: [{ content: '校园打卡 App 项目，决定用高德 SDK' }],
+          hasMore: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        value: { records: [{ content: '采用 高德 方案' }], hasMore: false },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        value: { records: [{ content: '完成 定位 集成', status: 'done' }], hasMore: false },
+      });
+    // LLM 返回一个真实条目 + 一个完全不在 source 里的虚构条目
+    mockLLMAskStructured.mockResolvedValueOnce({
+      ok: true,
+      value: {
+        goal: '校园打卡 App',
+        outcomes: [
+          '完成 高德 定位 集成', // ✓ 跟 source 大量重合
+          '完成了 OAuth 微信登录支付系统', // ✗ source 完全没提
+        ],
+        whatWorkedWell: [],
+        whatToImprove: [],
+        openIssues: [],
+      },
+    });
+
+    await archiveSkill.run(makeCtx(makeEvent('归档')));
+
+    const finalArgs = mockCardBuilderBuild.mock.calls.at(-1)![1];
+    // 模板渲染应该只包含 grounded 那条
+    expect(finalArgs.summary).toContain('高德');
+    expect(finalArgs.summary).not.toContain('OAuth');
+    expect(finalArgs.summary).not.toContain('微信');
   });
 });
 

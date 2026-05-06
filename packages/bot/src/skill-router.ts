@@ -9,7 +9,7 @@
  *   - 其余意图     纯被动监听，无需 @bot
  *
  * 优先级（高→低）：
- *   qa > taskAssignment > progressUpdate > meetingNotes > slides > requirementDoc > silent
+ *   qa > archive > taskAssignment > progressUpdate > meetingNotes > slides > requirementDoc > silent
  */
 
 import type { Message } from '@seedhac/contracts';
@@ -22,6 +22,7 @@ export type RouteIntent =
   | 'meetingNotes' // 会议纪要读取 — 纪要进群
   | 'slides' // 演示文稿生成 — 听到 PPT 需求
   | 'requirementDoc' // 需求整理 — 听到项目需求/资料
+  | 'archive' // 项目交付归档 — 听到归档/复盘/结束/收尾
   | 'silent'; // 不处理
 
 interface RouteRule {
@@ -62,6 +63,14 @@ const RULES: readonly RouteRule[] = [
       /能不能/,
       /可以吗/,
     ],
+  },
+
+  // ── archive：项目交付归档（被动）放在 progressUpdate 之前避免 "项目结束" 被
+  // 误判为 progressUpdate（"完成"类信号与"结束"语义有交叠）───────────────
+  {
+    intent: 'archive',
+    requireMention: false,
+    patterns: [/复盘/, /归档/, /项目结束/, /收尾/, /准备交付/],
   },
 
   // ── taskAssignment：分工讨论（被动）───────────────────────────────
