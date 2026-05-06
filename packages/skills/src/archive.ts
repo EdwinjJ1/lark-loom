@@ -28,7 +28,12 @@ import {
   ErrorCode,
   makeError,
 } from '@seedhac/contracts';
-import { ARCHIVE_PROMPT } from './prompts/archive.js';
+import {
+  ARCHIVE_SUMMARY_PROMPT,
+  ArchiveSummarySchema,
+  EMPTY_SUMMARY,
+  renderArchiveSummary,
+} from './prompts/archive.js';
 
 const TRIGGER_RE = /复盘|归档|项目结束|收尾|准备交付/i;
 
@@ -163,17 +168,40 @@ export const archiveSkill: Skill = {
     const links = extractLinksFromMemory(memories);
     const doneCount = todos.filter((t) => t['status'] === 'done').length;
 
-    // LLM 摘要 — 失败降级，不阻断卡片输出
-    const llmResult = await ctx.llm.ask(ARCHIVE_PROMPT(memories, decisions, todos), {
-      model: 'pro',
-    });
-    const summaryText = llmResult.ok
-      ? llmResult.value.trim()
-      : '项目已收尾，详细产出请见上方链接。如需进一步复盘可 @bot 提问。';
-    if (!llmResult.ok)
-      ctx.logger.warn('archive: LLM summary failed, using fallback', {
-        error: llmResult.error.message,
+    // 计算字段（不让 LLM 碰，物理隔离防幻觉）
+    const computed = {
+      decisionCount: decisions.length,
+      taskCompletion: todos.length > 0 ? `${doneCount}/${todos.length}` : null,
+    };
+
+    // 数据严重不足（< 3 条总记录）→ 跳过 LLM，走静态 fallback。
+    // 既省 token 又彻底防止 LLM 在空数据上幻觉编造。
+    const totalRecords = memories.length + decisions.length + todos.length;
+    let summary = EMPTY_SUMMARY;
+    if (totalRecords >= 3) {
+      // askStructured + JSON schema 约束：豆包必须按 5 字段填，不能瞎扯
+      const llmResult = await ctx.llm.askStructured(
+        ARCHIVE_SUMMARY_PROMPT(memories, decisions, todos),
+        ArchiveSummarySchema,
+        { model: 'pro', timeoutMs: 60_000 },
+      );
+      if (llmResult.ok) {
+        summary = llmResult.value;
+      } else {
+        ctx.logger.warn('archive: structured LLM failed, using fallback summary', {
+          error: llmResult.error.message,
+        });
+      }
+    } else {
+      ctx.logger.info('archive: total records < 3, skip LLM, use fallback', {
+        memories: memories.length,
+        decisions: decisions.length,
+        todos: todos.length,
       });
+    }
+
+    // 渲染：structured object → 100-200 字自然语言（JS 模板，不过二次 LLM）
+    const summaryText = renderArchiveSummary(summary, computed);
 
     const now = Date.now();
     const recordId = `archive_${chatId}_${now}`;
@@ -188,8 +216,8 @@ export const archiveSkill: Skill = {
       tags: [],
       summary: summaryText,
       links,
-      decisionCount: decisions.length,
-      ...(todos.length > 0 ? { taskStats: `${doneCount}/${todos.length} 已完成` } : {}),
+      decisionCount: computed.decisionCount,
+      ...(computed.taskCompletion ? { taskStats: `${computed.taskCompletion} 已完成` } : {}),
     });
 
     // 写归档 memory（audit + 后续 QA / recall 可检索）— 失败不阻断
