@@ -256,6 +256,89 @@ describe('handleEvent wiring', () => {
     expect(ctx.logger.info).not.toHaveBeenCalledWith(expect.stringContaining('replied'));
   });
 
+  it('writes skill_log and qa chat memory after successful skill run', async () => {
+    const memoryStore = {
+      read: vi.fn(),
+      search: vi.fn(),
+      list: vi.fn(),
+      write: vi.fn().mockResolvedValue(ok({})),
+      delete: vi.fn(),
+      score: vi.fn(),
+    };
+    const runtime = makeRuntime();
+    const skill: Skill = {
+      ...qaSkill,
+      match: () => true,
+      run: vi.fn().mockResolvedValue(ok({ text: 'answer', reasoning: 'answered from context' })),
+    };
+    const msg = makeMessage({
+      text: '这是什么？',
+      mentions: [{ user: { userId: BOT_ID }, key: '@_bot' }],
+    });
+    const ctx: SkillContext = {
+      ...makeCtx(makeEvent(msg), runtime),
+      memoryStore,
+    } as unknown as SkillContext;
+
+    await handleEvent(ctx, router, { qa: skill } as unknown as Record<SkillName, Skill>);
+    await vi.waitFor(() => expect(memoryStore.write).toHaveBeenCalledTimes(2));
+
+    // skill_log + chat 并行写入；不显式传 importance（让 store 异步 LLM 评分）。
+    const writeKinds = memoryStore.write.mock.calls.map(
+      (call) => (call[0] as { kind: string }).kind,
+    );
+    expect(writeKinds.sort()).toEqual(['chat', 'skill_log']);
+    expect(memoryStore.write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'skill_log', source_skill: 'qa' }),
+    );
+    expect(memoryStore.write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'chat', source_skill: 'qa' }),
+    );
+    for (const call of memoryStore.write.mock.calls) {
+      expect((call[0] as { importance?: number }).importance).toBeUndefined();
+    }
+  });
+
+  it('schedule event sends selected skill output to the scheduled chat', async () => {
+    const runtime = makeRuntime();
+    const skill: Skill = {
+      ...qaSkill,
+      name: 'weekly',
+      match: vi.fn().mockReturnValue(true),
+      run: vi
+        .fn()
+        .mockResolvedValue(ok({ card: { templateName: 'weekly', content: { weekly: true } } })),
+    };
+    const ctx = makeCtx(
+      {
+        type: 'schedule',
+        payload: { chatId: 'oc_chat1', skillName: 'weekly', timestamp: 123 },
+      },
+      runtime,
+    );
+    const memoryStore = {
+      read: vi.fn(),
+      search: vi.fn(),
+      list: vi.fn(),
+      write: vi.fn().mockResolvedValue(ok({})),
+      delete: vi.fn(),
+      score: vi.fn(),
+    };
+    const scheduleCtx = { ...ctx, memoryStore } as unknown as SkillContext;
+
+    await handleEvent(scheduleCtx, router, { weekly: skill } as unknown as Record<
+      SkillName,
+      Skill
+    >);
+
+    expect(skill.run).toHaveBeenCalledOnce();
+    expect(runtime.sendCard).toHaveBeenCalledWith({
+      chatId: 'oc_chat1',
+      card: { templateName: 'weekly', content: { weekly: true } },
+    });
+    expect(memoryStore.write).not.toHaveBeenCalled();
+  });
+
   // 6. intent='silent'（非 qa/meetingNotes 等消息）→ 不触发任何 skill
   it('silent intent → no skill triggered', async () => {
     const mockSkill: Skill = {
@@ -389,7 +472,7 @@ describe('handleEvent wiring', () => {
     const userMessage = (messages as Array<{ role: string; content: string }>).find(
       (m) => m.role === 'user',
     );
-    expect(userMessage?.content).toContain('"skill":"qa|silent"');
+    expect(userMessage?.content).toContain('"skill":"<以下之一: qa | silent>"');
     expect(userMessage?.content).not.toContain('weekly');
     expect(userMessage?.content).not.toContain('requirementDoc');
   });

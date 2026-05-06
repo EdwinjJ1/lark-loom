@@ -16,6 +16,7 @@
 import type {
   ActivationCardInput,
   ArchiveCardInput,
+  ArchiveLink,
   Card,
   CardBuilder,
   CardButton,
@@ -314,7 +315,38 @@ function buildQa(input: QaCardInput): Card {
  * UI：议题 / 决策 / 待办 / 待跟进四段，强制可见
  */
 function buildSummary(input: SummaryCardInput): Card {
-  const elements: BodyElement[] = [md(`**${input.title}**`), hr()];
+  // 三态共用同一个模板色，仅 header 标题区分；与 slides 的「两态同色」保持一致
+  const HEADER_TEMPLATE = 'blue' as const;
+
+  if (input.isLoading) {
+    return card('summary', {
+      schema: '2.0',
+      header: { title: pt('会议纪要整理中'), template: HEADER_TEMPLATE },
+      body: {
+        elements: [
+          md(
+            `**${input.title}**\n\n正在分析群历史并提取决策 / 行动项 / 遗留问题，通常需要 30-90 秒。`,
+          ),
+          md('_我会从群聊上下文里提取关键信息，整理完会自动替换这条卡片。_'),
+        ],
+      },
+    });
+  }
+
+  if (input.errorMessage) {
+    return card('summary', {
+      schema: '2.0',
+      header: { title: pt('会议纪要整理失败'), template: 'red' },
+      body: {
+        elements: [md(`**${input.title}**\n\n${input.errorMessage}`)],
+      },
+    });
+  }
+
+  const elements: BodyElement[] = [md(`**${input.title}**`)];
+  if (input.summary) elements.push(md(input.summary));
+  elements.push(hr());
+
   if (input.topics.length)
     elements.push(md(`**📋 议题**\n${input.topics.map((t) => `- ${t}`).join('\n')}`));
   if (input.decisions.length)
@@ -330,9 +362,31 @@ function buildSummary(input: SummaryCardInput): Card {
   }
   if (input.followUps.length)
     elements.push(hr(), md(`**🔍 待跟进**\n${input.followUps.map((f) => `- ${f}`).join('\n')}`));
+
+  // 全部结构化字段都空 + 也没 prose summary：给用户一个明确的"无可总结"提示，
+  // 避免渲染出一张只有标题的空卡片
+  if (
+    !input.summary &&
+    !input.topics.length &&
+    !input.decisions.length &&
+    !input.todos.length &&
+    !input.followUps.length
+  ) {
+    elements.push(md('未在群历史中识别到明确的决策、行动项或会议结论，可补充后再触发。'));
+  }
+
+  // 混合方案：卡片显示决策/行动项摘要，按钮跳转完整会议纪要文档
+  if (input.docUrl) {
+    elements.push(
+      hr(),
+      btn('打开完整纪要', { action: 'open_url', url: input.docUrl }, 'primary'),
+      md('_仅群内成员可查看与编辑_'),
+    );
+  }
+
   return card('summary', {
     schema: '2.0',
-    header: { title: pt('会议 / 阶段总结'), template: 'green' },
+    header: { title: pt('会议纪要已就绪'), template: HEADER_TEMPLATE },
     body: { elements },
   });
 }
@@ -385,14 +439,86 @@ function buildSlides(input: SlidesCardInput): Card {
  * 目的：宣告项目结束，提供完整产出物入口，方便复盘
  * UI：成果摘要 + 标签 + 查看按钮，有仪式感
  */
+/** 产出物 kind → 显示图标，让评委一眼区分文档 / PPT / 表格 */
+const ARCHIVE_LINK_ICONS: Record<NonNullable<ArchiveLink['kind']>, string> = {
+  requirementDoc: '📋',
+  slides: '🎯',
+  taskAssignment: '✅',
+  bitable: '📊',
+  other: '📎',
+};
+
 function buildArchive(input: ArchiveCardInput): Card {
-  const tagLine = input.tags.length ? input.tags.map((t) => `\`${t}\``).join(' ') : '—';
+  // ── loading 态（issue #114）：先发出去拿 messageId，跑完用 patchCard 替换 ──
+  if (input.isLoading) {
+    const etaLine = input.etaSeconds
+      ? `预计耗时约 ${input.etaSeconds} 秒，请稍候。`
+      : '通常需要 30-60 秒，请稍候。';
+    return card('archive', {
+      schema: '2.0',
+      header: { title: pt('归档进行中…'), template: 'blue' },
+      body: {
+        elements: [
+          md(`📦 正在整理项目交付报告\n\n${etaLine}`),
+          md('_我会汇总需求文档 / PPT / 会议决策 / 任务完成情况，生成一份正式归档报告。完成后这条卡片会自动更新。_'),
+        ],
+      },
+    });
+  }
+
+  // ── error 态：归档过程挂了，patch 上失败提示 ──────────────────────────
+  if (input.errorMessage) {
+    return card('archive', {
+      schema: '2.0',
+      header: { title: pt('归档失败'), template: 'red' },
+      body: {
+        elements: [
+          md(`⚠️ ${input.errorMessage}`),
+          md('_可以稍后再试一次，或 @bot 单独询问需要归档的内容。_'),
+        ],
+      },
+    });
+  }
+
+  // ── final 态 ────────────────────────────────────────────────────────────
   const elements: BodyElement[] = [
     md(`**${input.title}**${input.summary ? `\n\n${input.summary}` : ''}`),
-    hr(),
-    md(`🏷 标签：${tagLine}\n📌 归档编号：\`${input.recordId}\``),
-    btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'primary'),
   ];
+
+  // 产出物链接列表：每条 markdown 渲染图标 + label + 可点击链接
+  if (input.links && input.links.length > 0) {
+    elements.push(hr());
+    const linkLines = input.links.map((l) => {
+      const icon = ARCHIVE_LINK_ICONS[l.kind ?? 'other'] ?? '📎';
+      return `${icon} [${l.label}](${l.url})`;
+    });
+    elements.push(md(`**📦 项目产出**\n${linkLines.join('\n')}`));
+  }
+
+  // 关键指标（决策数 / 任务完成情况）
+  if (input.decisionCount !== undefined || input.taskStats) {
+    const stats: string[] = [];
+    if (input.decisionCount !== undefined) stats.push(`关键决策 **${input.decisionCount}** 条`);
+    if (input.taskStats) stats.push(`任务 ${input.taskStats}`);
+    elements.push(md(stats.join(' · ')));
+  }
+
+  // 标签 + 归档编号
+  const tagLine = input.tags.length ? input.tags.map((t) => `\`${t}\``).join(' ') : '—';
+  elements.push(hr(), md(`🏷 标签：${tagLine}\n📌 归档编号：\`${input.recordId}\``));
+
+  // 主按钮优先级：reportDocUrl（issue #114 完整报告）> bitableUrl（issue #104 表格）
+  if (input.reportDocUrl) {
+    elements.push(btn('查看完整报告', { action: 'open_url', url: input.reportDocUrl }, 'primary'));
+    if (input.bitableUrl) {
+      elements.push(btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'default'));
+    }
+  } else if (input.bitableUrl) {
+    elements.push(btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'primary'));
+  } else {
+    elements.push(md('_归档详情已写入 memory，可通过 @bot 查询_'));
+  }
+
   return card('archive', {
     schema: '2.0',
     header: { title: pt('项目已归档 🎉'), template: 'indigo' },

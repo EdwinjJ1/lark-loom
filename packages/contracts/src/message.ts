@@ -74,9 +74,17 @@ export interface BotJoinedChat {
   readonly timestamp: number;
 }
 
+/** Runtime 内部计划任务事件，例如 weekly cron。 */
+export interface ScheduleEvent {
+  readonly chatId: string;
+  readonly skillName: string;
+  readonly timestamp: number;
+}
+
 /** Bot 进程对外暴露的事件 union — 主程序 router 按 type 分发 */
 export type BotEvent =
   | { readonly type: 'message'; readonly payload: Message }
   | { readonly type: 'cardAction'; readonly payload: CardAction }
   | { readonly type: 'p2pChatCreated'; readonly payload: P2PChatCreated }
-  | { readonly type: 'botJoinedChat'; readonly payload: BotJoinedChat };
+  | { readonly type: 'botJoinedChat'; readonly payload: BotJoinedChat }
+  | { readonly type: 'schedule'; readonly payload: ScheduleEvent };

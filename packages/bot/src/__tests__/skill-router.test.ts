@@ -296,6 +296,23 @@ describe('priority', () => {
     expect(router.route(plain('本次会议纪要和ppt都整理好了'))).toBe('meetingNotes');
   });
 
+  // archive 路由（issue #104 上线后实测发现 router 缺这个 intent）
+  it('archive：项目结束了 → archive', () => {
+    expect(router.route(plain('项目结束了，归档一下'))).toBe('archive');
+  });
+
+  it('archive：复盘 → archive', () => {
+    expect(router.route(plain('我们做个复盘'))).toBe('archive');
+  });
+
+  it('archive：准备交付 → archive', () => {
+    expect(router.route(plain('准备交付，整理一下成果'))).toBe('archive');
+  });
+
+  it('archive > progressUpdate：项目结束 优先于 已完成', () => {
+    expect(router.route(plain('项目结束了，已完成所有任务'))).toBe('archive');
+  });
+
   it('无 @bot 时 qa 规则不生效 → 按后续规则路由', () => {
     expect(router.route(plain('这个项目需求是什么'))).toBe('requirementDoc');
   });

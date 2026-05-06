@@ -185,6 +185,60 @@ describe('summary card', () => {
     expect(j).toContain('待跟进');
     expect(j).toContain('@Antares');
   });
+
+  it('renders prose summary at top when present', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      summary: '本次会议确定供应商选型，李工本周一前出方案。',
+      topics: [],
+      decisions: ['供应商选型采用 B 方案'],
+      todos: [],
+      followUps: [],
+    });
+    const j = json(card);
+    expect(j).toContain('确定供应商选型');
+    expect(j).toContain('B 方案');
+  });
+
+  it('renders loading state', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      topics: [],
+      decisions: [],
+      todos: [],
+      followUps: [],
+      isLoading: true,
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    expect(j).toContain('会议纪要整理中');
+  });
+
+  it('renders error state', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      topics: [],
+      decisions: [],
+      todos: [],
+      followUps: [],
+      errorMessage: 'LLM 提取失败：timeout',
+    });
+    const j = json(card);
+    expect(j).toContain('会议纪要整理失败');
+    expect(j).toContain('timeout');
+  });
+
+  it('renders explicit fallback when all fields empty (no silent blank card)', () => {
+    const card = larkCardBuilder.build('summary', {
+      title: '会议纪要',
+      topics: [],
+      decisions: [],
+      todos: [],
+      followUps: [],
+    });
+    const j = json(card);
+    expect(j).toContain('未在群历史中识别到');
+  });
 });
 
 describe('slides card', () => {
@@ -238,6 +292,52 @@ describe('archive card', () => {
     expect(j).toContain('2026-Q2');
     expect(j).toContain('完成了需求验证');
     expect(j).toContain('查看归档表格');
+  });
+
+  // issue #104：多产出物链接展示
+  it('renders multiple output links with category icons', () => {
+    const card = larkCardBuilder.build('archive', {
+      recordId: 'rec_002',
+      title: '项目已交付',
+      bitableUrl: 'https://feishu.cn/bitable/x',
+      tags: [],
+      summary: '完成。',
+      links: [
+        { kind: 'requirementDoc', label: '需求文档', url: 'https://x.feishu.cn/req' },
+        { kind: 'slides', label: '演示 PPT', url: 'https://x.feishu.cn/ppt' },
+        { kind: 'taskAssignment', label: '任务分工表', url: 'https://x.feishu.cn/task' },
+      ],
+      decisionCount: 5,
+      taskStats: '8/10 已完成',
+    });
+    const j = json(card);
+    expect(j).toContain('项目产出');
+    expect(j).toContain('需求文档');
+    expect(j).toContain('演示 PPT');
+    expect(j).toContain('任务分工表');
+    expect(j).toContain('https://x.feishu.cn/req');
+    expect(j).toContain('5');
+    expect(j).toContain('8/10');
+    // 图标
+    expect(j).toContain('📋'); // requirementDoc
+    expect(j).toContain('🎯'); // slides
+    expect(j).toContain('✅'); // taskAssignment
+  });
+
+  // issue #104 验收：bitableUrl 缺省 → 不渲染坏按钮
+  it('falls back to text when bitableUrl is empty', () => {
+    const card = larkCardBuilder.build('archive', {
+      recordId: 'rec_003',
+      title: '项目已交付',
+      bitableUrl: '', // 缺省
+      tags: [],
+      summary: '完成。',
+    });
+    const j = json(card);
+    expect(j).not.toContain('查看归档表格'); // 没按钮
+    expect(j).toContain('已写入 memory');
+    const btns = schema(card).body.elements.filter((e) => e.tag === 'button');
+    expect(btns.length).toBe(0);
   });
 });
 
