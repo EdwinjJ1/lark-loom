@@ -32,4 +32,18 @@ export interface DocxClient {
     sectionTitle: string,
     blocks: readonly DocBlock[],
   ): Promise<Result<void>>;
+  /**
+   * 用新 blocks 替换某个 H2 section 下的所有内容（issue #120 重构）。
+   *
+   * 先批量删除 [section H2 之后, 下一个 H2 之前) 的所有 block，再插入新 blocks。
+   * 这是"rewrite-from-data" 类 section（项目状态 / 已交付产出 / 阻塞与风险等）
+   * 的基本操作 —— 每次都重新渲染当前快照，不留历史包袱。
+   *
+   * 找不到 section → no-op + warn。
+   */
+  replaceSection(
+    docToken: string,
+    sectionTitle: string,
+    blocks: readonly DocBlock[],
+  ): Promise<Result<void>>;
 }

@@ -51,31 +51,108 @@ export async function handleBotJoinedChat(
  * Section 顺序很关键 —— skill 后续 appendToSection 时按 H2 标题精确匹配，
  * 顺序保证完整时间线永远在最后（reverse chronological 拼接最容易）。
  */
+/**
+ * 项目核心文档 10 段结构（issue #120 重构版）。
+ *
+ * 设计依据（中外大厂模式融合）：
+ *   - 字节跳动 OKR 顶部：每个文档第一段写 O + KR
+ *   - Atlassian Project Poster：Problem Space + Validation + 一句话定义
+ *   - Linear Project Doc：健康度（On track / At risk / Off track）
+ *   - 华为 PMP：干系人 + 风险段必须显式
+ *   - 阿里 GRAI：复盘四步（项目结束才填）
+ *   - Keep a Changelog：最近动态时间线
+ *
+ * Section 顺序刻意安排：评委 / 上级翻这份文档时，自顶向下"什么是 → 现在到哪
+ * → 为什么 → 已交付 → 谁负责 → 风险 → 复盘 → 详情"。
+ */
 export const CORE_DOC_SECTIONS = [
-  '项目摘要',
-  '决策日志',
-  '项目里程碑',
-  '阻塞与风险',
-  '完整时间线',
+  '🎯 项目 OKR',
+  '一句话定义',
+  '项目状态',
+  '项目背景与目标',
+  '关键决策',
+  '已交付产出',
+  '👥 干系人 / 团队',
+  '⚠️ 阻塞与风险',
+  '📋 GRAI 复盘',
+  '最近动态',
 ] as const;
 
 export type CoreDocSection = (typeof CORE_DOC_SECTIONS)[number];
 
-/** 初始化的核心文档 markdown blocks —— 每个 section 一个空 placeholder paragraph。 */
+/**
+ * 初始化的核心文档 blocks。每个 section 一个 H2 + 一个引导性 placeholder。
+ *
+ * Placeholder 文案是有意写的"提示性占位"而非空文字 —— 让用户翻文档时
+ * 一眼就知道每段会被什么 skill 填充，而不是看到一堆空段以为坏了。
+ */
 function buildCoreDocInitialBlocks(chatName: string, createdAtIso: string): DocBlock[] {
   return [
     { type: 'heading1', text: '项目核心文档' },
-    { type: 'paragraph', text: `${chatName} · 由 Lark Loom 自动维护 · 创建于 ${createdAtIso}` },
-    { type: 'heading2', text: '项目摘要' },
-    { type: 'paragraph', text: `项目：${chatName} · 状态：进行中 · 最后更新：${createdAtIso}` },
-    { type: 'heading2', text: '决策日志' },
-    { type: 'paragraph', text: '（暂无关键决策。当群里出现"决定 / 选用"时会自动记录。）' },
-    { type: 'heading2', text: '项目里程碑' },
-    { type: 'paragraph', text: '（PRD / 演示 PPT / 分工表生成后会自动追加。）' },
-    { type: 'heading2', text: '阻塞与风险' },
-    { type: 'paragraph', text: '（任务被标 blocked 或群里讨论风险时会自动记录。）' },
-    { type: 'heading2', text: '完整时间线' },
-    { type: 'paragraph', text: '（所有事件按发生时间正序排列。）' },
+    {
+      type: 'paragraph',
+      text: `${chatName} · 由 Lark Loom 自动维护 · 创建于 ${createdAtIso}`,
+    },
+
+    { type: 'heading2', text: '🎯 项目 OKR' },
+    {
+      type: 'paragraph',
+      text: '（待补充。发送项目需求后，O / KR 会从需求文档中自动提取。）',
+    },
+
+    { type: 'heading2', text: '一句话定义' },
+    {
+      type: 'paragraph',
+      text: '（待补充。需求文档生成后会自动填入项目核心价值描述。）',
+    },
+
+    { type: 'heading2', text: '项目状态' },
+    {
+      type: 'paragraph',
+      text: `健康度：✅ 进行中 · 最后更新：${createdAtIso} · 这周重点：尚未明确`,
+    },
+
+    { type: 'heading2', text: '项目背景与目标' },
+    {
+      type: 'paragraph',
+      text: '（待补充。需求文档生成后会综合成 100-150 字的项目叙述。）',
+    },
+
+    { type: 'heading2', text: '关键决策' },
+    {
+      type: 'paragraph',
+      text: '（待补充。每次会议纪要识别到决策时，会综合成 ADR-style 段落，含「演变路径」。）',
+    },
+
+    { type: 'heading2', text: '已交付产出' },
+    {
+      type: 'paragraph',
+      text: '（PRD / 演示 PPT / 汇报分工文稿 / 任务表生成后会自动列出。）',
+    },
+
+    { type: 'heading2', text: '👥 干系人 / 团队' },
+    {
+      type: 'paragraph',
+      text: '（群成员列表 + 角色分配。可在群里 @bot 主动声明角色。）',
+    },
+
+    { type: 'heading2', text: '⚠️ 阻塞与风险' },
+    {
+      type: 'paragraph',
+      text: '（任务被标 blocked 或会议纪要中识别到风险时自动汇总。）',
+    },
+
+    { type: 'heading2', text: '📋 GRAI 复盘' },
+    {
+      type: 'paragraph',
+      text: '（项目结束触发归档时，按 Goal / Result / Analysis / Improvement 四段填入。）',
+    },
+
+    { type: 'heading2', text: '最近动态' },
+    {
+      type: 'paragraph',
+      text: '（最近 10 条事件按时间正序排列。）',
+    },
   ];
 }
 
@@ -130,6 +207,22 @@ async function bootstrapProjectDoc(
     const grant = await docx.grantMembersEdit(created.value.docToken, 'docx', ids);
     if (!grant.ok) {
       logger.warn('onboarding: grant core doc edit failed', { error: grant.error.message });
+    }
+
+    // 同时把群成员列表写入"干系人 / 团队"段（issue #120 v2）
+    const stakeholderBlocks: DocBlock[] = members.value.members.map((m) => ({
+      type: 'bullet' as const,
+      text: m.name ?? m.userId,
+    }));
+    const stakeholderRes = await docx.replaceSection(
+      created.value.docToken,
+      '👥 干系人 / 团队',
+      stakeholderBlocks,
+    );
+    if (!stakeholderRes.ok) {
+      logger.warn('onboarding: replace stakeholders failed', {
+        error: stakeholderRes.error.message,
+      });
     }
   }
 

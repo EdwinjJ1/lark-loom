@@ -8,7 +8,8 @@
 import type { ChatMember, Message, Skill } from '@seedhac/contracts';
 import type { SlideDraft } from '@seedhac/contracts';
 import { ErrorCode, err, makeError, ok } from '@seedhac/contracts';
-import { appendMilestone } from './core-doc.js';
+import { appendRecentActivity, rewriteDeliverables } from './core-doc.js';
+import { extractLinksFromMemory } from './archive.js';
 import { OutlineSchema, SLIDES_PROMPT } from './prompts/slides.js';
 
 /** chatId 正在生成中的锁，防止同一群短时间内重复触发 */
@@ -296,21 +297,24 @@ async function runSlides(ctx: Parameters<Skill['run']>[0], msg: Message): Return
       });
     });
 
-  // 追加到项目核心文档 "项目里程碑" + "完整时间线"（issue #120）
-  // 两条产出：演示 PPT + 汇报分工文稿。fire-and-forget。
-  void Promise.all([
-    appendMilestone(ctx, chatId, {
-      type: 'completion',
-      title: `演示 PPT 已生成（${outline.title}）`,
-      url: slidesResult.value.url,
-    }),
-    appendMilestone(ctx, chatId, {
-      type: 'completion',
-      title: `汇报分工文稿已生成`,
-      url: assignmentDocResult.value.url,
-    }),
-  ]).catch((e: unknown) => {
-    ctx.logger.warn('slides: core-doc append milestone threw', {
+  // 同步到项目核心文档（issue #120 v2）
+  //   - 已交付产出 ← 重新拉所有 [前缀] memory 渲染列表（含本次新加 2 条）
+  //   - 最近动态 ← append 2 条
+  // fire-and-forget，失败仅 warn
+  void (async () => {
+    const memRes = await ctx.bitable.find({
+      table: 'memory',
+      filter: `AND(CurrentValue.[chat_id]="${chatId}")`,
+      pageSize: 100,
+    });
+    const links = memRes.ok ? extractLinksFromMemory(memRes.value.records) : [];
+    await Promise.all([
+      rewriteDeliverables(ctx, chatId, links),
+      appendRecentActivity(ctx, chatId, '完成', `演示 PPT 已生成（${outline.title}）`),
+      appendRecentActivity(ctx, chatId, '完成', '汇报分工文稿已生成'),
+    ]);
+  })().catch((e: unknown) => {
+    ctx.logger.warn('slides: core-doc updates threw', {
       error: e instanceof Error ? e.message : String(e),
     });
   });

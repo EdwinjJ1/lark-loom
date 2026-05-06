@@ -136,6 +136,7 @@ const ctx: SkillContext = {
     readContent: async () => ok(''),
     grantMembersEdit: async () => ok(undefined),
     appendToSection: async () => ok(undefined),
+    replaceSection: async () => ok(undefined),
   },
   cardBuilder: larkCardBuilder,
   retrievers: {},

@@ -36,7 +36,12 @@ import {
   RelevanceJudgmentSchema,
   type RelevanceCandidate,
 } from './prompts/requirement-doc.js';
-import { appendBlocker, appendDecision } from './core-doc.js';
+import {
+  appendDecision,
+  appendRecentActivity,
+  rewriteBlockers,
+  rewriteStatus,
+} from './core-doc.js';
 
 const TRIGGER_RE = /会议纪要|妙记|会议总结|本次会议/i;
 
@@ -380,18 +385,31 @@ export const summarySkill: Skill = {
     });
     if (!memRes.ok) ctx.logger.warn('summary: insert memory failed', { error: memRes.error });
 
-    // 追加到项目核心文档（issue #120）：每个 decision 一条 ADR-style entry，
-    // 每个 issue（待澄清/风险）一条 blocker。fire-and-forget，失败仅 warn。
+    // 同步到项目核心文档（issue #120 v2）：
+    //   - 决策日志 ← append 每条新决策（ADR Immutability，新决策 [Supersedes Dxx]）
+    //   - 阻塞与风险 ← rewrite（每次会议都重新汇总当前所有 issue + pending todos）
+    //   - 项目状态 ← rewrite（健康度根据阻塞数 + 任务完成率推断）
+    //   - 最近动态 ← append 每条事件
+    // fire-and-forget，失败仅 warn
     const sourceId = msg.messageId;
+    const pendingTodoTitles: string[] = summary.actionItems
+      .map((a) => `${a.owner ? `${a.owner}: ` : ''}${a.content}${a.ddl ? `（${a.ddl}）` : ''}`);
+    const allBlockerItems = [
+      ...summary.issues.map((i) => ({ title: i, source: sourceId })),
+      // pending todos 也算阻塞（待办即潜在风险）
+      ...pendingTodoTitles.map((t) => ({ title: `📌 待办：${t}`, source: sourceId })),
+    ];
     void Promise.all([
-      ...summary.decisions.map((d) =>
-        appendDecision(ctx, chatId, { title: d, source: sourceId }),
-      ),
-      ...summary.issues.map((i) =>
-        appendBlocker(ctx, chatId, { title: i, source: sourceId }),
-      ),
+      ...summary.decisions.map((d) => appendDecision(ctx, chatId, { title: d, source: sourceId })),
+      rewriteBlockers(ctx, chatId, allBlockerItems),
+      rewriteStatus(ctx, chatId, {
+        blockerCount: summary.issues.length,
+        doneCount: 0, // summary 不知道 done 数；用 0 表示仅基于阻塞判断健康度
+        totalTaskCount: summary.actionItems.length,
+      }),
+      ...summary.issues.map((i) => appendRecentActivity(ctx, chatId, '阻塞', i)),
     ]).catch((e: unknown) => {
-      ctx.logger.warn('summary: core-doc append threw', {
+      ctx.logger.warn('summary: core-doc updates threw', {
         error: e instanceof Error ? e.message : String(e),
       });
     });

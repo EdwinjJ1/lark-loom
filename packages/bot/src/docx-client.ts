@@ -379,6 +379,126 @@ export class LarkDocxClient implements DocxClient {
       return err(makeError(ErrorCode.FEISHU_API_ERROR, `appendToSection error: ${msg}`, e));
     }
   }
+
+  /**
+   * 用新 blocks 替换某个 H2 section 下的所有内容（issue #120）。
+   *
+   * 步骤：
+   *   1. 列出 doc 顶层 children
+   *   2. 找 sectionTitle 对应的 H2 index
+   *   3. 找下一个 H2 index（或 children 长度，如果是最后一段）
+   *   4. 收集 [sectionIdx + 1, nextH2Idx) 之间的 block_ids
+   *   5. batchDelete 这些 block
+   *   6. documentBlockChildren.create with index = sectionIdx + 1 插入新 blocks
+   */
+  async replaceSection(
+    docToken: string,
+    sectionTitle: string,
+    blocks: readonly DocBlock[],
+  ): Promise<Result<void>> {
+    // 1 + 2 + 3：列 children，找 section 边界
+    let children: Array<{
+      block_id?: string;
+      block_type?: number;
+      heading2?: { elements?: Array<{ text_run?: { content?: string } }> };
+    }> = [];
+    try {
+      const res = await (this.client.docx.v1.documentBlockChildren as any).list({
+        path: { document_id: docToken, block_id: docToken },
+        params: { page_size: 200 },
+      });
+      if (res.code !== 0) {
+        return err(makeError(ErrorCode.FEISHU_API_ERROR, `replaceSection list failed: ${res.msg}`));
+      }
+      children = res.data?.items ?? [];
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(makeError(ErrorCode.FEISHU_API_ERROR, `replaceSection list error: ${msg}`, e));
+    }
+
+    let sectionIdx = -1;
+    let nextH2Idx = children.length;
+    for (let i = 0; i < children.length; i++) {
+      const c = children[i]!;
+      if (c.block_type === 4) {
+        const txt = c.heading2?.elements?.[0]?.text_run?.content ?? '';
+        if (sectionIdx < 0 && txt === sectionTitle) {
+          sectionIdx = i;
+        } else if (sectionIdx >= 0) {
+          nextH2Idx = i;
+          break;
+        }
+      }
+    }
+    if (sectionIdx < 0) {
+      return err(
+        makeError(ErrorCode.INVALID_INPUT, `replaceSection: section "${sectionTitle}" not found`),
+      );
+    }
+
+    // 4: 收集要删除的 block_ids（section H2 之后，next H2 之前）
+    const toDelete: string[] = [];
+    for (let i = sectionIdx + 1; i < nextH2Idx; i++) {
+      const id = children[i]?.block_id;
+      if (id) toDelete.push(id);
+    }
+
+    // 5: batchDelete（如果有要删的）
+    if (toDelete.length > 0) {
+      try {
+        const delRes = await (this.client.docx.v1.documentBlockChildren as any).batchDelete({
+          path: { document_id: docToken, block_id: docToken },
+          data: { start_index: sectionIdx + 1, end_index: nextH2Idx },
+        });
+        if (delRes.code !== 0) {
+          return err(
+            makeError(
+              ErrorCode.FEISHU_API_ERROR,
+              `replaceSection batchDelete failed: ${delRes.msg}`,
+            ),
+          );
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return err(
+          makeError(ErrorCode.FEISHU_API_ERROR, `replaceSection batchDelete error: ${msg}`, e),
+        );
+      }
+    }
+
+    // 6: 插入新 blocks（如果有）
+    const safeBlocks = blocks.filter((b) => b.text && b.text.trim().length > 0);
+    if (safeBlocks.length === 0) return ok(undefined);
+
+    const childrenPayload = safeBlocks.map((block) => {
+      switch (block.type) {
+        case 'heading1':
+          return { block_type: 3, heading1: { elements: [{ text_run: { content: block.text } }] } };
+        case 'heading2':
+          return { block_type: 4, heading2: { elements: [{ text_run: { content: block.text } }] } };
+        case 'paragraph':
+          return { block_type: 2, text: { elements: [{ text_run: { content: block.text } }] } };
+        case 'bullet':
+          return { block_type: 12, bullet: { elements: [{ text_run: { content: block.text } }] } };
+      }
+    });
+
+    try {
+      const res = await (this.client.docx.v1.documentBlockChildren as any).create({
+        path: { document_id: docToken, block_id: docToken },
+        data: { children: childrenPayload, index: sectionIdx + 1 },
+      });
+      if (res.code !== 0) {
+        return err(
+          makeError(ErrorCode.FEISHU_API_ERROR, `replaceSection insert failed: ${res.msg}`),
+        );
+      }
+      return ok(undefined);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(makeError(ErrorCode.FEISHU_API_ERROR, `replaceSection insert error: ${msg}`, e));
+    }
+  }
 }
 
 export function createDocxClient(): LarkDocxClient {
