@@ -18,6 +18,7 @@ import { handleBotJoinedChat, handleOnboardingAction } from './onboarding.js';
 
 export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   qa: 'qa',
+  recall: 'recall',
   meetingNotes: 'summary',
   slides: 'slides',
   requirementDoc: 'requirementDoc',

@@ -6,10 +6,11 @@
  *
  * 双轨制：
  *   - qa           唯一需要 @bot（避免对组员间普通问句乱插话）
+ *   - recall       无需 @bot，但必须出现明确历史指代/信息缺口
  *   - 其余意图     纯被动监听，无需 @bot
  *
  * 优先级（高→低）：
- *   qa > archive > taskAssignment > progressUpdate > meetingNotes > slides > requirementDoc > silent
+ *   qa > archive > taskAssignment > progressUpdate > recall > meetingNotes > slides > requirementDoc > silent
  */
 
 import type { Message } from '@seedhac/contracts';
@@ -17,6 +18,7 @@ import type { Message } from '@seedhac/contracts';
 /** Router 输出的意图类型（bot 包内部，不放 contracts） */
 export type RouteIntent =
   | 'qa' // 信息缺口回答 — @bot + 疑问句
+  | 'recall' // 主动召回 — 非 @ 消息里出现历史指代/信息缺口
   | 'taskAssignment' // 分工识别与表格生成 — 听到分工讨论
   | 'progressUpdate' // 阶段进展更新 — 听到进展汇报
   | 'meetingNotes' // 会议纪要读取 — 纪要进群
@@ -108,6 +110,20 @@ const RULES: readonly RouteRule[] = [
       /进度更新/,
       /汇报一下进展/,
       /更新进度/,
+    ],
+  },
+
+  // ── recall：历史信息缺口主动召回（被动）──────────────────────────
+  {
+    intent: 'recall',
+    requireMention: false,
+    patterns: [
+      /上次.{0,24}(?:什么|啥|哪|谁|多少|来着|记得|定|说|放|负责)/,
+      /之前.{0,24}(?:什么|啥|哪|谁|多少|来着|记得|定|说|放|负责)/,
+      /我记得.{0,24}(?:之前|上次|上回|那个)/,
+      /上回.{0,24}(?:什么|啥|哪|谁|多少|来着|记得|定|说|放|负责)/,
+      /那个.{0,24}(?:是什么|是啥|在哪|哪了|谁负责|怎么说|后来怎么|来着)/,
+      /(?:是多少|是什么|是谁|在哪|哪了|谁负责|怎么说)来着/,
     ],
   },
 

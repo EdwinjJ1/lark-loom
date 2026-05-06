@@ -221,6 +221,29 @@ describe('handleEvent wiring', () => {
     expect(progressSkill.run).toHaveBeenCalledOnce();
   });
 
+  it('recall intent → recall skill.run called without @mention', async () => {
+    const recallSkill: Skill = {
+      ...qaSkill,
+      name: 'recall' as SkillName,
+      match: vi.fn().mockReturnValue(true),
+      run: vi.fn().mockResolvedValue(ok({ text: '徐坤负责后端接口联调。' })),
+    };
+    const runtime = makeRuntime();
+    const msg = makeMessage({ text: '上次说徐坤负责什么来着？', mentions: [] });
+    const ctx = makeCtx(makeEvent(msg), runtime);
+
+    await handleEvent(ctx, router, {
+      recall: recallSkill,
+    } as Partial<Record<SkillName, Skill>>);
+
+    expect(recallSkill.match).toHaveBeenCalledOnce();
+    expect(recallSkill.run).toHaveBeenCalledOnce();
+    expect(runtime.sendText).toHaveBeenCalledWith({
+      chatId: 'oc_chat1',
+      text: '徐坤负责后端接口联调。',
+    });
+  });
+
   // 5. skill.run() 返回 err → 不 crash，logger.error 被调用
   it('skill.run() returns err → no crash, logger.error called', async () => {
     const failSkill: Skill = {

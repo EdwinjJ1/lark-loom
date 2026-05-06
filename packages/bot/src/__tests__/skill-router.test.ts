@@ -137,6 +137,31 @@ describe('progressUpdate', () => {
 });
 
 // ================================================================
+// recall（历史信息缺口主动召回，被动）
+// ================================================================
+describe('recall', () => {
+  it('pos: "上次 ... 来着" → recall', () => {
+    expect(router.route(plain('上次说徐坤负责什么来着？'))).toBe('recall');
+  });
+
+  it('pos: "之前 ... 谁负责" → recall', () => {
+    expect(router.route(plain('之前那个接口是谁负责来着'))).toBe('recall');
+  });
+
+  it('pos: "我记得之前 ..." → recall', () => {
+    expect(router.route(plain('我记得之前定过 demo 范围，是啥来着'))).toBe('recall');
+  });
+
+  it('pos: "那个 ... 后来怎么说" → recall', () => {
+    expect(router.route(plain('那个 demo 范围后来怎么说'))).toBe('recall');
+  });
+
+  it('neg: 普通非 @ 问句仍不触发 recall', () => {
+    expect(router.route(plain('徐坤负责什么'))).toBe('silent');
+  });
+});
+
+// ================================================================
 // meetingNotes（会议纪要读取，被动）
 // ================================================================
 describe('meetingNotes', () => {
@@ -204,7 +229,11 @@ describe('slides', () => {
   it('neg: merely discussing ppt does not trigger slides', () => {
     expect(router.route(plain('这个ppt怎么样'))).toBe('silent');
     expect(router.route(plain('这个 ppt 风格太丑了'))).toBe('silent');
-    expect(router.route(plain('上次 PPT 放哪了'))).toBe('silent');
+    expect(router.route(plain('我们先别做 ppt'))).toBe('silent');
+  });
+
+  it('recall 优先处理历史指代类 PPT 问句', () => {
+    expect(router.route(plain('上次 PPT 放哪了'))).toBe('recall');
     expect(router.route(plain('我们先别做 ppt'))).toBe('silent');
   });
 });
