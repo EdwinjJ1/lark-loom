@@ -44,28 +44,68 @@ const FEISHU_URL_RE = /https?:\/\/[^\s)>]+(?:feishu\.cn|larksuite\.com|larkoffic
 
 /**
  * 从 memory 找到当前 chatId 的核心文档 docToken。找不到返回 null。
+ *
+ * 健壮性：先用 server-side filter 试一次，若 0 条命中则 fallback 到 client-side
+ * filter（防止 feishu bitable 列名 / 大小写差异导致 server filter 不工作）。
  */
 export async function findCoreDocToken(
   ctx: CoreDocCtx,
   chatId: string,
 ): Promise<string | null> {
+  // 第一次：server-side filter，pageSize 100
   const filter = `AND(CurrentValue.[chat_id]="${chatId}")`;
-  const res = await ctx.bitable.find({ table: 'memory', filter, pageSize: 50 });
+  const res = await ctx.bitable.find({ table: 'memory', filter, pageSize: 100 });
   if (!res.ok) {
     ctx.logger.warn('core-doc: memory.find failed', { error: res.error.message });
     return null;
   }
-  // 找最新的 [核心文档] 前缀条目（按 created_at 倒序）
-  const candidates = res.value.records
-    .filter((r) => /^\[核心文档\]/.test(String(r['content'] ?? '')))
-    .sort(
-      (a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0),
-    );
+
+  let records = res.value.records;
+  let candidates = records.filter((r) =>
+    /^\[核心文档\]/.test(String(r['content'] ?? '')),
+  );
+
+  // Fallback：server filter 完全 0 条记录 → 怀疑 filter 失效（列名不对 / 大小写
+  // 等），再拉一次不带 filter 的全量 + 客户端过滤。
+  // server filter 有记录但 0 个 [核心文档] → 真的没核心文档，不 fallback。
+  if (records.length === 0) {
+    const allRes = await ctx.bitable.find({ table: 'memory', pageSize: 200 });
+    if (allRes.ok) {
+      records = allRes.value.records.filter((r) => String(r['chat_id'] ?? '') === chatId);
+      candidates = records.filter((r) => /^\[核心文档\]/.test(String(r['content'] ?? '')));
+      ctx.logger.info('core-doc: findCoreDocToken client fallback', {
+        chatId,
+        totalAllRecords: allRes.value.records.length,
+        matchedChatId: records.length,
+        coreDocCandidates: candidates.length,
+        sampleContents: records.slice(0, 3).map((r) => String(r['content'] ?? '').slice(0, 60)),
+      });
+    } else {
+      ctx.logger.warn('core-doc: fallback memory.find failed', {
+        error: allRes.error.message,
+      });
+    }
+  } else {
+    ctx.logger.info('core-doc: findCoreDocToken server filter', {
+      chatId,
+      totalRecords: records.length,
+      coreDocCandidates: candidates.length,
+      sampleContents:
+        candidates.length === 0
+          ? records.slice(0, 3).map((r) => String(r['content'] ?? '').slice(0, 60))
+          : undefined,
+    });
+  }
+
   if (candidates.length === 0) return null;
-  const content = String(candidates[0]!['content'] ?? '');
+
+  // 取最新的 [核心文档]（按 created_at 倒序）
+  const sorted = [...candidates].sort(
+    (a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0),
+  );
+  const content = String(sorted[0]!['content'] ?? '');
   const url = content.match(FEISHU_URL_RE)?.[0];
   if (!url) return null;
-  // url: https://feishu.cn/docx/{token}
   const tokenMatch = url.match(/\/docx\/([a-zA-Z0-9]+)/);
   return tokenMatch ? tokenMatch[1]! : null;
 }
