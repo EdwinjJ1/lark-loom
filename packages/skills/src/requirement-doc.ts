@@ -17,7 +17,13 @@
 
 import type { Message, Skill, SkillContext } from '@seedhac/contracts';
 import { err, ok } from '@seedhac/contracts';
-import { appendMilestone } from './core-doc.js';
+import {
+  appendRecentActivity,
+  findCoreDocToken,
+  rewriteBackground,
+  rewriteDefinition,
+  rewriteOKR,
+} from './core-doc.js';
 import {
   REQ_PROMPT,
   RELEVANCE_PROMPT,
@@ -390,15 +396,43 @@ export const requirementDocSkill: Skill = {
       });
     }
 
-    // e2. 追加到项目核心文档 "项目里程碑" + "完整时间线"（issue #120）
-    //     失败仅 warn，不阻塞卡片输出
-    void appendMilestone(ctx, chatId, {
-      type: 'requirement',
-      title: `${doc.title} 已落地`,
-      url: fileResult.value.url,
-      source: msg.messageId,
-    }).catch((e: unknown) => {
-      ctx.logger.warn('requirementDoc: core-doc append milestone threw', {
+    // e2. 同步到项目核心文档（issue #120 v2）
+    //     - 一句话定义 ← PRD.summary
+    //     - OKR ← O = goals[0]，KR = goals[1..]
+    //     - 项目背景与目标 ← background + goals
+    //     - 最近动态 ← append "需求"
+    //     - 文档标题 rename 成 "{项目名} - 核心文档"（issue #120 P6）
+    //     全 fire-and-forget，失败仅 warn，不阻塞卡片
+    void (async () => {
+      const coreDocToken = await findCoreDocToken(ctx, chatId);
+      const renamePromise = coreDocToken
+        ? ctx.docx.renameTitle(coreDocToken, `${doc.title} - 核心文档`).then((r) => {
+            if (!r.ok) {
+              ctx.logger.warn('requirementDoc: rename core doc failed', { error: r.error.message });
+            } else {
+              ctx.logger.info('requirementDoc: renamed core doc', {
+                docToken: coreDocToken,
+                newTitle: `${doc.title} - 核心文档`,
+              });
+            }
+          })
+        : Promise.resolve();
+      await Promise.all([
+        renamePromise,
+        doc.summary ? rewriteDefinition(ctx, chatId, doc.summary) : Promise.resolve(),
+        doc.goals.length > 0
+          ? rewriteOKR(ctx, chatId, {
+              objective: doc.goals[0]!,
+              keyResults: doc.goals.slice(1),
+            })
+          : Promise.resolve(),
+        doc.background || doc.goals.length > 0
+          ? rewriteBackground(ctx, chatId, doc.background, doc.goals)
+          : Promise.resolve(),
+        appendRecentActivity(ctx, chatId, '需求', `${doc.title} 已落地`),
+      ]);
+    })().catch((e: unknown) => {
+      ctx.logger.warn('requirementDoc: core-doc updates threw', {
         error: e instanceof Error ? e.message : String(e),
       });
     });

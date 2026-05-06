@@ -1,108 +1,68 @@
 /**
- * 项目核心文档 helper（issue #120）
+ * 项目核心文档 helper（issue #120 v2 重构）
  *
- * 设计原则：
- *   1. **Append-only** —— 永远不修改已有 entry，决策推翻就 append [Supersedes Dxx]
- *   2. **Per-entry 模板拼接** —— 不过 LLM，所有 entry 字段从 skill 已有数据直接来
- *      （decision 表 content / 完成产出 URL / pending todo 内容），杜绝额外幻觉源
- *   3. **失败仅 warn** —— 找不到核心文档 / appendToSection 失败都不阻塞 skill 主流程
+ * 设计变更：从行车记录仪式时间戳堆叠 → 中外大厂共识的项目叙述文档。
  *
- * Section 映射：
- *   - 决策 → "决策日志"
- *   - 里程碑 → "项目里程碑"
- *   - 阻塞 → "阻塞与风险"
- *   - 同步：每条 entry 同时往"完整时间线"末尾 append 一行
+ * Section 类别：
+ *   - **Rewrite-from-data**：每次相关数据变了重新渲染整段（OKR / 状态 /
+ *     一句话定义 / 项目背景 / 已交付产出 / 干系人 / 阻塞与风险）
+ *   - **Append-only**：决策日志（按 ADR Immutability，新决策 [Supersedes Dxx]）
+ *     + 最近动态（时间线辅助视图）
+ *   - **Conditional**：GRAI 复盘（项目结束 archive 触发时一次性填）
+ *
+ * 防幻觉：
+ *   - 模板渲染段（OKR / 状态 / 产出 / 干系人 / 阻塞）—— 全用 skill 已有数据
+ *     拼接，不过 LLM
+ *   - LLM 综合段（背景与目标 / GRAI 复盘）—— askStructured + schema enforce
+ *   - 失败仅 warn —— 任何 section 写入失败都不阻塞 skill 主流程
  */
 
-import type { BitableClient, DocBlock, DocxClient } from '@seedhac/contracts';
+import type {
+  ArchiveLink,
+  BitableClient,
+  BitableRow,
+  DocBlock,
+  DocxClient,
+} from '@seedhac/contracts';
 
 export interface CoreDocCtx {
   readonly bitable: BitableClient;
   readonly docx: DocxClient;
-  readonly logger: { warn(msg: string, meta?: Record<string, unknown>): void; info(msg: string, meta?: Record<string, unknown>): void };
+  readonly logger: {
+    warn(msg: string, meta?: Record<string, unknown>): void;
+    info(msg: string, meta?: Record<string, unknown>): void;
+  };
 }
 
-export interface DecisionEntry {
-  readonly title: string;
-  readonly source?: string;
-  readonly supersedes?: string;
-}
+// ─── 找核心文档 docToken（从 memory）────────────────────────────────────────
 
-export interface MilestoneEntry {
-  readonly type: 'requirement' | 'completion';
-  readonly title: string;
-  readonly url?: string;
-  readonly source?: string;
-}
-
-export interface BlockerEntry {
-  readonly title: string;
-  readonly source?: string;
-}
-
-// 注意：`[^\s)>]*`（不是 `+`）—— 必须允许域名前 0 字符，否则
-// `https://feishu.cn/...`（无 tenant 子域）不会被匹配。
 const FEISHU_URL_RE =
   /https?:\/\/[^\s)>]*(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/;
 
-/**
- * 从 memory 找到当前 chatId 的核心文档 docToken。找不到返回 null。
- *
- * 健壮性：先用 server-side filter 试一次，若 0 条命中则 fallback 到 client-side
- * filter（防止 feishu bitable 列名 / 大小写差异导致 server filter 不工作）。
- */
 export async function findCoreDocToken(
   ctx: CoreDocCtx,
   chatId: string,
 ): Promise<string | null> {
-  // 第一次：server-side filter，pageSize 100
   const filter = `AND(CurrentValue.[chat_id]="${chatId}")`;
   const res = await ctx.bitable.find({ table: 'memory', filter, pageSize: 100 });
   if (!res.ok) {
     ctx.logger.warn('core-doc: memory.find failed', { error: res.error.message });
     return null;
   }
-
   let records = res.value.records;
   let candidates = records.filter((r) =>
     /^\[核心文档\]/.test(String(r['content'] ?? '')),
   );
 
-  // Fallback：server filter 完全 0 条记录 → 怀疑 filter 失效（列名不对 / 大小写
-  // 等），再拉一次不带 filter 的全量 + 客户端过滤。
-  // server filter 有记录但 0 个 [核心文档] → 真的没核心文档，不 fallback。
   if (records.length === 0) {
     const allRes = await ctx.bitable.find({ table: 'memory', pageSize: 200 });
     if (allRes.ok) {
       records = allRes.value.records.filter((r) => String(r['chat_id'] ?? '') === chatId);
       candidates = records.filter((r) => /^\[核心文档\]/.test(String(r['content'] ?? '')));
-      ctx.logger.info('core-doc: findCoreDocToken client fallback', {
-        chatId,
-        totalAllRecords: allRes.value.records.length,
-        matchedChatId: records.length,
-        coreDocCandidates: candidates.length,
-        sampleContents: records.slice(0, 3).map((r) => String(r['content'] ?? '').slice(0, 60)),
-      });
-    } else {
-      ctx.logger.warn('core-doc: fallback memory.find failed', {
-        error: allRes.error.message,
-      });
     }
-  } else {
-    ctx.logger.info('core-doc: findCoreDocToken server filter', {
-      chatId,
-      totalRecords: records.length,
-      coreDocCandidates: candidates.length,
-      sampleContents:
-        candidates.length === 0
-          ? records.slice(0, 3).map((r) => String(r['content'] ?? '').slice(0, 60))
-          : undefined,
-    });
   }
 
   if (candidates.length === 0) return null;
-
-  // 取最新的 [核心文档]（按 created_at 倒序）
   const sorted = [...candidates].sort(
     (a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0),
   );
@@ -123,101 +83,287 @@ function formatTime(now: number): string {
   }).format(new Date(now));
 }
 
-/**
- * 同时往 "完整时间线" 段 append 一行 timeline entry。
- * 失败仅 warn —— 时间线是辅助视图，主 section 已经记了。
- */
-async function appendTimeline(
+function formatDate(now: number): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(now));
+}
+
+// ─── Section 名称（与 onboarding.ts CORE_DOC_SECTIONS 必须一致）─────────────
+
+export const SECTION = {
+  OKR: '🎯 项目 OKR',
+  DEFINITION: '一句话定义',
+  STATUS: '项目状态',
+  BACKGROUND: '项目背景与目标',
+  DECISIONS: '关键决策',
+  DELIVERABLES: '已交付产出',
+  STAKEHOLDERS: '👥 干系人 / 团队',
+  BLOCKERS: '⚠️ 阻塞与风险',
+  GRAI: '📋 GRAI 复盘',
+  RECENT: '最近动态',
+} as const;
+
+// ─── 通用：拿 docToken + 调对应方法（失败仅 warn）─────────────────────
+
+async function replaceIn(
   ctx: CoreDocCtx,
-  docToken: string,
-  type: '决策' | '完成' | '需求' | '阻塞',
-  title: string,
-  now: number,
+  chatId: string,
+  section: string,
+  blocks: DocBlock[],
 ): Promise<void> {
-  const block: DocBlock = {
-    type: 'bullet',
-    text: `${formatTime(now)} [${type}] ${title}`,
-  };
-  const res = await ctx.docx.appendToSection(docToken, '完整时间线', [block]);
+  const docToken = await findCoreDocToken(ctx, chatId);
+  if (!docToken) {
+    ctx.logger.info(`core-doc: no core doc found, skip replace ${section}`, { chatId });
+    return;
+  }
+  const res = await ctx.docx.replaceSection(docToken, section, blocks);
   if (!res.ok) {
-    ctx.logger.warn('core-doc: appendTimeline failed', { error: res.error.message });
+    ctx.logger.warn(`core-doc: replace ${section} failed`, { error: res.error.message });
   }
 }
 
-/** 决策 → "决策日志" + 时间线。失败仅 warn。 */
+async function appendIn(
+  ctx: CoreDocCtx,
+  chatId: string,
+  section: string,
+  blocks: DocBlock[],
+): Promise<void> {
+  const docToken = await findCoreDocToken(ctx, chatId);
+  if (!docToken) {
+    ctx.logger.info(`core-doc: no core doc found, skip append ${section}`, { chatId });
+    return;
+  }
+  const res = await ctx.docx.appendToSection(docToken, section, blocks);
+  if (!res.ok) {
+    ctx.logger.warn(`core-doc: append ${section} failed`, { error: res.error.message });
+  }
+}
+
+// ─── Rewrite-from-data helpers（不过 LLM，纯模板拼接）───────────────────
+
+export async function rewriteDefinition(
+  ctx: CoreDocCtx,
+  chatId: string,
+  oneLineSummary: string,
+): Promise<void> {
+  if (!oneLineSummary.trim()) return;
+  await replaceIn(ctx, chatId, SECTION.DEFINITION, [
+    { type: 'paragraph', text: oneLineSummary },
+  ]);
+}
+
+export interface OKR {
+  readonly objective: string;
+  readonly keyResults: readonly string[];
+}
+
+export async function rewriteOKR(
+  ctx: CoreDocCtx,
+  chatId: string,
+  okr: OKR,
+): Promise<void> {
+  if (!okr.objective.trim()) return;
+  const blocks: DocBlock[] = [{ type: 'paragraph', text: `**O**：${okr.objective}` }];
+  okr.keyResults.forEach((kr, i) => {
+    if (kr.trim()) blocks.push({ type: 'bullet', text: `KR${i + 1}：${kr}` });
+  });
+  await replaceIn(ctx, chatId, SECTION.OKR, blocks);
+}
+
+export async function rewriteBackground(
+  ctx: CoreDocCtx,
+  chatId: string,
+  background: string,
+  goals: readonly string[],
+): Promise<void> {
+  if (!background.trim() && goals.length === 0) return;
+  const blocks: DocBlock[] = [];
+  if (background.trim()) {
+    blocks.push({ type: 'paragraph', text: `**背景**：${background}` });
+  }
+  if (goals.length > 0) {
+    blocks.push({ type: 'paragraph', text: '**目标**：' });
+    goals.forEach((g, i) => blocks.push({ type: 'bullet', text: `${i + 1}. ${g}` }));
+  }
+  await replaceIn(ctx, chatId, SECTION.BACKGROUND, blocks);
+}
+
+const KIND_ICON: Record<NonNullable<ArchiveLink['kind']>, string> = {
+  requirementDoc: '📋',
+  slides: '🎯',
+  taskAssignment: '✅',
+  bitable: '📊',
+  other: '📎',
+};
+
+/**
+ * 已交付产出：每次有新产出时调用，重新拉所有 [前缀] memory 重新渲染列表。
+ * 调用方传 links（已通过 extractLinksFromMemory 处理过的去重 + 推断结果）。
+ */
+export async function rewriteDeliverables(
+  ctx: CoreDocCtx,
+  chatId: string,
+  links: readonly ArchiveLink[],
+): Promise<void> {
+  const blocks: DocBlock[] =
+    links.length === 0
+      ? [{ type: 'paragraph', text: '（暂无产出。PRD / PPT / 分工表生成后会自动列出。）' }]
+      : links.map((l) => ({
+          type: 'bullet' as const,
+          text: `${KIND_ICON[l.kind ?? 'other'] ?? '📎'} ${l.label}：${l.url}`,
+        }));
+  await replaceIn(ctx, chatId, SECTION.DELIVERABLES, blocks);
+}
+
+export interface Stakeholder {
+  readonly name: string;
+  readonly role?: string;
+}
+
+export async function rewriteStakeholders(
+  ctx: CoreDocCtx,
+  chatId: string,
+  members: readonly Stakeholder[],
+): Promise<void> {
+  const blocks: DocBlock[] =
+    members.length === 0
+      ? [{ type: 'paragraph', text: '（群成员列表为空。）' }]
+      : members.map((m) => ({
+          type: 'bullet' as const,
+          text: m.role ? `${m.name} — ${m.role}` : m.name,
+        }));
+  await replaceIn(ctx, chatId, SECTION.STAKEHOLDERS, blocks);
+}
+
+export interface ProjectStatusInput {
+  readonly blockerCount: number;
+  readonly doneCount: number;
+  readonly totalTaskCount: number;
+  readonly thisWeekFocus?: string;
+}
+
+export async function rewriteStatus(
+  ctx: CoreDocCtx,
+  chatId: string,
+  input: ProjectStatusInput,
+): Promise<void> {
+  const health =
+    input.blockerCount >= 3
+      ? '🚫 Off track（阻塞较多）'
+      : input.blockerCount >= 1
+        ? '⚠️ At risk（有阻塞）'
+        : '✅ On track';
+  const completion =
+    input.totalTaskCount > 0 ? ` · 任务 ${input.doneCount}/${input.totalTaskCount}` : '';
+  const focus = input.thisWeekFocus ? ` · 这周重点：${input.thisWeekFocus}` : '';
+  await replaceIn(ctx, chatId, SECTION.STATUS, [
+    {
+      type: 'paragraph',
+      text: `健康度：${health}${completion} · 最后更新：${formatDate(Date.now())}${focus}`,
+    },
+  ]);
+}
+
+export interface BlockerItem {
+  readonly title: string;
+  readonly source?: string;
+}
+
+export async function rewriteBlockers(
+  ctx: CoreDocCtx,
+  chatId: string,
+  items: readonly BlockerItem[],
+): Promise<void> {
+  const blocks: DocBlock[] =
+    items.length === 0
+      ? [{ type: 'paragraph', text: '✅ 暂无阻塞与风险。' }]
+      : items.map((b) => ({
+          type: 'bullet' as const,
+          text: b.source ? `${b.title} · 来源：${b.source}` : b.title,
+        }));
+  await replaceIn(ctx, chatId, SECTION.BLOCKERS, blocks);
+}
+
+// ─── Append-only helpers ───────────────────────────────────────────────
+
+export interface DecisionEntry {
+  readonly title: string;
+  readonly source?: string;
+  readonly supersedes?: string;
+}
+
+/** 关键决策（append-only ADR-style）。决策推翻只 append 新条目标 [Supersedes]。 */
 export async function appendDecision(
   ctx: CoreDocCtx,
   chatId: string,
   entry: DecisionEntry,
 ): Promise<void> {
-  const docToken = await findCoreDocToken(ctx, chatId);
-  if (!docToken) {
-    ctx.logger.info('core-doc: no core doc found, skip appendDecision', { chatId });
-    return;
-  }
-  const now = Date.now();
   const supersedesPart = entry.supersedes ? ` [Supersedes ${entry.supersedes}]` : '';
   const sourcePart = entry.source ? ` · 来源：${entry.source}` : '';
   const line: DocBlock = {
     type: 'bullet',
-    text: `${formatTime(now)} — ${entry.title}${supersedesPart}${sourcePart}`,
+    text: `${formatTime(Date.now())} — ${entry.title}${supersedesPart}${sourcePart}`,
   };
-  const res = await ctx.docx.appendToSection(docToken, '决策日志', [line]);
-  if (!res.ok) {
-    ctx.logger.warn('core-doc: appendDecision failed', { error: res.error.message });
-    return;
-  }
-  await appendTimeline(ctx, docToken, '决策', entry.title, now);
+  await appendIn(ctx, chatId, SECTION.DECISIONS, [line]);
+  await appendRecentActivity(ctx, chatId, '决策', entry.title);
 }
 
-/** 里程碑 → "项目里程碑" + 时间线。type 区分 [需求]/[完成]。 */
+/** 最近动态时间线（append-only）。 */
+export async function appendRecentActivity(
+  ctx: CoreDocCtx,
+  chatId: string,
+  type: '决策' | '需求' | '完成' | '阻塞' | '其它',
+  title: string,
+): Promise<void> {
+  const block: DocBlock = {
+    type: 'bullet',
+    text: `${formatTime(Date.now())} [${type}] ${title}`,
+  };
+  await appendIn(ctx, chatId, SECTION.RECENT, [block]);
+}
+
+// ─── 兼容旧 API（保留以免现有 caller 破坏）──────────────────────────────
+
+export interface MilestoneEntry {
+  readonly type: 'requirement' | 'completion';
+  readonly title: string;
+  readonly url?: string;
+  readonly source?: string;
+}
+
+export interface BlockerEntry {
+  readonly title: string;
+  readonly source?: string;
+}
+
+/**
+ * @deprecated 改用 rewriteDeliverables + appendRecentActivity
+ * 旧 caller 仍然能调，只往最近动态记一行
+ */
 export async function appendMilestone(
   ctx: CoreDocCtx,
   chatId: string,
   entry: MilestoneEntry,
 ): Promise<void> {
-  const docToken = await findCoreDocToken(ctx, chatId);
-  if (!docToken) {
-    ctx.logger.info('core-doc: no core doc found, skip appendMilestone', { chatId });
-    return;
-  }
-  const now = Date.now();
-  const urlPart = entry.url ? `: ${entry.url}` : '';
-  const sourcePart = entry.source ? ` · 来源：${entry.source}` : '';
-  const line: DocBlock = {
-    type: 'bullet',
-    text: `${formatTime(now)} — ${entry.title}${urlPart}${sourcePart}`,
-  };
-  const res = await ctx.docx.appendToSection(docToken, '项目里程碑', [line]);
-  if (!res.ok) {
-    ctx.logger.warn('core-doc: appendMilestone failed', { error: res.error.message });
-    return;
-  }
-  const tlType = entry.type === 'requirement' ? '需求' : '完成';
-  await appendTimeline(ctx, docToken, tlType, entry.title, now);
+  await appendRecentActivity(
+    ctx,
+    chatId,
+    entry.type === 'requirement' ? '需求' : '完成',
+    entry.title,
+  );
 }
 
-/** 阻塞 → "阻塞与风险" + 时间线。 */
+/** @deprecated 改用 rewriteBlockers + appendRecentActivity */
 export async function appendBlocker(
   ctx: CoreDocCtx,
   chatId: string,
   entry: BlockerEntry,
 ): Promise<void> {
-  const docToken = await findCoreDocToken(ctx, chatId);
-  if (!docToken) {
-    ctx.logger.info('core-doc: no core doc found, skip appendBlocker', { chatId });
-    return;
-  }
-  const now = Date.now();
-  const sourcePart = entry.source ? ` · 来源：${entry.source}` : '';
-  const line: DocBlock = {
-    type: 'bullet',
-    text: `${formatTime(now)} — ${entry.title} [Open]${sourcePart}`,
-  };
-  const res = await ctx.docx.appendToSection(docToken, '阻塞与风险', [line]);
-  if (!res.ok) {
-    ctx.logger.warn('core-doc: appendBlocker failed', { error: res.error.message });
-    return;
-  }
-  await appendTimeline(ctx, docToken, '阻塞', entry.title, now);
+  await appendRecentActivity(ctx, chatId, '阻塞', entry.title);
 }
+
+// re-export BitableRow 让 prompts/skills 用得方便
+export type { ArchiveLink, BitableRow };

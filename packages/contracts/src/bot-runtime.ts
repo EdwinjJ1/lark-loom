@@ -89,6 +89,12 @@ export interface BotRuntime {
    */
   fetchMessage(messageId: string): Promise<Result<{ readonly messages: readonly Message[] }>>;
 
+  /**
+   * 把指定 messageId 置顶到群顶部（issue #120 P6 核心文档置顶）。
+   * 用 chat_top_notice API。机器人必须在群里。
+   */
+  pinMessage(chatId: string, messageId: string): Promise<Result<void>>;
+
   /** 注册事件回调；返回 unregister 函数 */
   on(handler: EventHandler): () => void;
 
