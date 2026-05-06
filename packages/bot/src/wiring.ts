@@ -21,6 +21,7 @@ export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   meetingNotes: 'summary',
   slides: 'slides',
   requirementDoc: 'requirementDoc',
+  archive: 'archive',
 };
 
 /**
