@@ -251,6 +251,50 @@ async function runSlides(ctx: Parameters<Skill['run']>[0], msg: Message): Return
     summary: `共 ${assignment.assignments.length} 位成员，${outline.slides.length} 页幻灯片`,
   });
 
+  // 写两条 memory，让 archive skill 在最终交付卡能列出这次产出（issue #104）
+  // [slides] 前缀 → 演示 PPT；[汇报分工] 前缀 → 汇报分工文稿
+  // fire-and-forget：失败仅 warn，不阻断卡片回复
+  const now = Date.now();
+  void Promise.all([
+    ctx.bitable.insert({
+      table: 'memory',
+      row: {
+        key: `slides-${chatId}-${now}`,
+        kind: 'project',
+        chat_id: chatId,
+        content: `[slides] ${outline.title}\n${slidesResult.value.url}`,
+        importance: 6,
+        last_access: now,
+        created_at: now,
+        source_skill: 'slides',
+      },
+    }),
+    ctx.bitable.insert({
+      table: 'memory',
+      row: {
+        key: `slides-assignment-${chatId}-${now}`,
+        kind: 'project',
+        chat_id: chatId,
+        content: `[汇报分工] ${assignmentTitle}\n${assignmentDocResult.value.url}`,
+        importance: 5,
+        last_access: now,
+        created_at: now,
+        source_skill: 'slides',
+      },
+    }),
+  ])
+    .then(([s1, s2]) => {
+      if (!s1.ok)
+        ctx.logger.warn('slides: insert slides memory failed', { error: s1.error.message });
+      if (!s2.ok)
+        ctx.logger.warn('slides: insert assignment memory failed', { error: s2.error.message });
+    })
+    .catch((e: unknown) => {
+      ctx.logger.warn('slides: memory insert threw', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    });
+
   return ok({
     card: assignmentCard,
     reasoning: `检测到 PPT 需求，基于 ${history.length} 条群聊记录生成 ${outline.slides.length} 页大纲与汇报分工`,

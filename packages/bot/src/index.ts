@@ -16,6 +16,14 @@ import { handleEvent } from './wiring.js';
 
 const DEFAULT_DOCS_ROOT = resolve(fileURLToPath(import.meta.url), '../../../../docs/bot-memory');
 
+// 后台运行时 stdout 默认 block-buffered (4KB)，每条日志几十字节就会滞留好几分钟才刷盘。
+// 强制 stdout/stderr 同步写，保证 nohup/script 重定向到文件时实时可读。
+// 代价：每次 console.* 都同步落盘，但 bot 日志 QPS 很低，可以接受。
+// 参考：https://nodejs.org/api/process.html#a-note-on-process-io
+type WritableWithBlocking = NodeJS.WriteStream & { _handle?: { setBlocking?: (b: boolean) => void } };
+(process.stdout as WritableWithBlocking)._handle?.setBlocking?.(true);
+(process.stderr as WritableWithBlocking)._handle?.setBlocking?.(true);
+
 const logger: Logger = {
   debug: (msg, meta) => console.debug(`[bot] ${msg}`, meta ?? ''),
   info: (msg, meta) => console.info(`[bot] ${msg}`, meta ?? ''),
