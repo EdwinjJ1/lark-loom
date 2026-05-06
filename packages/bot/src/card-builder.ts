@@ -16,6 +16,7 @@
 import type {
   ActivationCardInput,
   ArchiveCardInput,
+  ArchiveLink,
   Card,
   CardBuilder,
   CardButton,
@@ -385,14 +386,49 @@ function buildSlides(input: SlidesCardInput): Card {
  * 目的：宣告项目结束，提供完整产出物入口，方便复盘
  * UI：成果摘要 + 标签 + 查看按钮，有仪式感
  */
+/** 产出物 kind → 显示图标，让评委一眼区分文档 / PPT / 表格 */
+const ARCHIVE_LINK_ICONS: Record<NonNullable<ArchiveLink['kind']>, string> = {
+  requirementDoc: '📋',
+  slides: '🎯',
+  taskAssignment: '✅',
+  bitable: '📊',
+  other: '📎',
+};
+
 function buildArchive(input: ArchiveCardInput): Card {
-  const tagLine = input.tags.length ? input.tags.map((t) => `\`${t}\``).join(' ') : '—';
   const elements: BodyElement[] = [
     md(`**${input.title}**${input.summary ? `\n\n${input.summary}` : ''}`),
-    hr(),
-    md(`🏷 标签：${tagLine}\n📌 归档编号：\`${input.recordId}\``),
-    btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'primary'),
   ];
+
+  // 产出物链接列表（issue #104 核心）：每条 markdown 渲染图标 + label + 可点击链接
+  if (input.links && input.links.length > 0) {
+    elements.push(hr());
+    const linkLines = input.links.map((l) => {
+      const icon = ARCHIVE_LINK_ICONS[l.kind ?? 'other'] ?? '📎';
+      return `${icon} [${l.label}](${l.url})`;
+    });
+    elements.push(md(`**📦 项目产出**\n${linkLines.join('\n')}`));
+  }
+
+  // 关键指标（决策数 / 任务完成情况）
+  if (input.decisionCount !== undefined || input.taskStats) {
+    const stats: string[] = [];
+    if (input.decisionCount !== undefined) stats.push(`关键决策 **${input.decisionCount}** 条`);
+    if (input.taskStats) stats.push(`任务 ${input.taskStats}`);
+    elements.push(md(stats.join(' · ')));
+  }
+
+  // 标签 + 归档编号
+  const tagLine = input.tags.length ? input.tags.map((t) => `\`${t}\``).join(' ') : '—';
+  elements.push(hr(), md(`🏷 标签：${tagLine}\n📌 归档编号：\`${input.recordId}\``));
+
+  // bitableUrl 缺省：不渲染坏按钮，给纯文本 fallback（issue #104 验收标准）
+  if (input.bitableUrl) {
+    elements.push(btn('查看归档表格', { action: 'open_url', url: input.bitableUrl }, 'primary'));
+  } else {
+    elements.push(md('_归档详情已写入 memory，可通过 @bot 查询_'));
+  }
+
   return card('archive', {
     schema: '2.0',
     header: { title: pt('项目已归档 🎉'), template: 'indigo' },

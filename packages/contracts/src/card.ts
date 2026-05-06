@@ -111,13 +111,29 @@ export interface SlidesCardInput {
   readonly errorMessage?: string;
 }
 
+/** 一条产出物链接：需求文档 / PPT / 分工表 / 多维表格等 */
+export interface ArchiveLink {
+  /** 显示文案，如 "需求文档" / "演示 PPT" / "任务分工表" */
+  readonly label: string;
+  readonly url: string;
+  /** 可选：来源 skill 名（用于卡片图标 / 排序） */
+  readonly kind?: 'requirementDoc' | 'slides' | 'taskAssignment' | 'bitable' | 'other';
+}
+
 export interface ArchiveCardInput {
   readonly recordId: string;
   readonly title: string;
+  /** 多维表格归档入口；为空时按钮降级为不可点击文本 */
   readonly bitableUrl: string;
   readonly tags: readonly string[];
   /** 可选：项目一句话成果摘要 */
   readonly summary?: string;
+  /** 本次归档收集到的产出物链接 */
+  readonly links?: readonly ArchiveLink[];
+  /** 可选：任务完成情况 "8/10 已完成" */
+  readonly taskStats?: string;
+  /** 可选：决策数 */
+  readonly decisionCount?: number;
 }
 
 // ── 附属链路 Input ────────────────────────────────────────────────────────────
