@@ -315,7 +315,38 @@ function buildQa(input: QaCardInput): Card {
  * UI：议题 / 决策 / 待办 / 待跟进四段，强制可见
  */
 function buildSummary(input: SummaryCardInput): Card {
-  const elements: BodyElement[] = [md(`**${input.title}**`), hr()];
+  // 三态共用同一个模板色，仅 header 标题区分；与 slides 的「两态同色」保持一致
+  const HEADER_TEMPLATE = 'blue' as const;
+
+  if (input.isLoading) {
+    return card('summary', {
+      schema: '2.0',
+      header: { title: pt('会议纪要整理中'), template: HEADER_TEMPLATE },
+      body: {
+        elements: [
+          md(
+            `**${input.title}**\n\n正在分析群历史并提取决策 / 行动项 / 遗留问题，通常需要 30-90 秒。`,
+          ),
+          md('_我会从群聊上下文里提取关键信息，整理完会自动替换这条卡片。_'),
+        ],
+      },
+    });
+  }
+
+  if (input.errorMessage) {
+    return card('summary', {
+      schema: '2.0',
+      header: { title: pt('会议纪要整理失败'), template: 'red' },
+      body: {
+        elements: [md(`**${input.title}**\n\n${input.errorMessage}`)],
+      },
+    });
+  }
+
+  const elements: BodyElement[] = [md(`**${input.title}**`)];
+  if (input.summary) elements.push(md(input.summary));
+  elements.push(hr());
+
   if (input.topics.length)
     elements.push(md(`**📋 议题**\n${input.topics.map((t) => `- ${t}`).join('\n')}`));
   if (input.decisions.length)
@@ -331,9 +362,31 @@ function buildSummary(input: SummaryCardInput): Card {
   }
   if (input.followUps.length)
     elements.push(hr(), md(`**🔍 待跟进**\n${input.followUps.map((f) => `- ${f}`).join('\n')}`));
+
+  // 全部结构化字段都空 + 也没 prose summary：给用户一个明确的"无可总结"提示，
+  // 避免渲染出一张只有标题的空卡片
+  if (
+    !input.summary &&
+    !input.topics.length &&
+    !input.decisions.length &&
+    !input.todos.length &&
+    !input.followUps.length
+  ) {
+    elements.push(md('未在群历史中识别到明确的决策、行动项或会议结论，可补充后再触发。'));
+  }
+
+  // 混合方案：卡片显示决策/行动项摘要，按钮跳转完整会议纪要文档
+  if (input.docUrl) {
+    elements.push(
+      hr(),
+      btn('打开完整纪要', { action: 'open_url', url: input.docUrl }, 'primary'),
+      md('_仅群内成员可查看与编辑_'),
+    );
+  }
+
   return card('summary', {
     schema: '2.0',
-    header: { title: pt('会议 / 阶段总结'), template: 'green' },
+    header: { title: pt('会议纪要已就绪'), template: HEADER_TEMPLATE },
     body: { elements },
   });
 }
