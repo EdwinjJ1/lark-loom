@@ -105,6 +105,14 @@ async function bootstrapProjectDoc(
   const created = await docx.create(docTitle);
   if (!created.ok) {
     logger.warn('onboarding: create core doc failed', { error: created.error.message });
+    // 创建失败也发一张提示卡，避免用户蒙在鼓里
+    const failCard = ctx.cardBuilder.build('docPush', {
+      docTitle: '项目核心文档',
+      docUrl: '',
+      docType: 'other',
+      errorMessage: '核心文档创建失败，但其它功能仍可正常使用。可稍后 @bot 重新尝试。',
+    });
+    void runtime.sendCard({ chatId, card: failCard });
     return;
   }
 
@@ -148,6 +156,22 @@ async function bootstrapProjectDoc(
     docToken: created.value.docToken,
     url: created.value.url,
   });
+
+  // 发一张通知卡 —— 让用户立刻看到核心文档已创建（issue #120 review fix）
+  // 复用 docPush 卡片：标题 + 摘要 + "打开文档"按钮
+  const notifyCard = ctx.cardBuilder.build('docPush', {
+    docTitle: docTitle,
+    docUrl: created.value.url,
+    docType: 'other',
+    summary:
+      '项目执行轨迹会自动记录在这份文档里。所有关键决策、里程碑、阻塞都会同步追加，方便随时复盘和归档。',
+  });
+  const notifyRes = await runtime.sendCard({ chatId, card: notifyCard });
+  if (!notifyRes.ok) {
+    logger.warn('onboarding: send core doc notify card failed', {
+      error: notifyRes.error.message,
+    });
+  }
 }
 
 /**
