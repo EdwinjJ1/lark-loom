@@ -36,6 +36,7 @@ import {
   RelevanceJudgmentSchema,
   type RelevanceCandidate,
 } from './prompts/requirement-doc.js';
+import { appendBlocker, appendDecision } from './core-doc.js';
 
 const TRIGGER_RE = /会议纪要|妙记|会议总结|本次会议/i;
 
@@ -365,6 +366,22 @@ export const summarySkill: Skill = {
       },
     });
     if (!memRes.ok) ctx.logger.warn('summary: insert memory failed', { error: memRes.error });
+
+    // 追加到项目核心文档（issue #120）：每个 decision 一条 ADR-style entry，
+    // 每个 issue（待澄清/风险）一条 blocker。fire-and-forget，失败仅 warn。
+    const sourceId = msg.messageId;
+    void Promise.all([
+      ...summary.decisions.map((d) =>
+        appendDecision(ctx, chatId, { title: d, source: sourceId }),
+      ),
+      ...summary.issues.map((i) =>
+        appendBlocker(ctx, chatId, { title: i, source: sourceId }),
+      ),
+    ]).catch((e: unknown) => {
+      ctx.logger.warn('summary: core-doc append threw', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    });
 
     // 不再返回 card：已通过 patchCard 替换 loading 卡，wiring 不需要再发一条
     return ok({

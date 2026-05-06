@@ -204,10 +204,31 @@ function summarizeBitableRow(r: BitableRow, maxLen = 80): string {
   return `${trimmed}${status}`.trim();
 }
 
+const TIER_RULE = `
+# 输入分层（重要）
+
+输入分两层，优先级 Tier-1 > Tier-2：
+
+- **Tier-1：项目核心文档**（如果提供）—— 项目执行轨迹的 single source of truth，
+  从启用 bot 起每个里程碑/决策/阻塞都自动 append。**goal / outcomes / whatToImprove
+  应优先从这里提取**。如果 Tier-1 已经写了某条，**Tier-2 里同样事情不要重复列**。
+- **Tier-2：补充事实**（memory/decision/todo 表）—— 用来填 Tier-1 没覆盖到的角落。
+
+如果两层都为空 / 数据不足，按 SYSTEM_RULES 数据严重不足条款处理。
+`.trim();
+
+const PRD_DOC_MAX_CHARS = 8000;
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}\n…（已截断 ${s.length - max} 字）`;
+}
+
 export function ARCHIVE_SUMMARY_PROMPT(
   memories: readonly BitableRow[],
   decisions: readonly BitableRow[],
   todos: readonly BitableRow[],
+  coreDocContent?: string,
 ): string {
   const memoryLines = memories.length
     ? memories.map((m) => `- ${summarizeBitableRow(m)}`).join('\n')
@@ -219,8 +240,19 @@ export function ARCHIVE_SUMMARY_PROMPT(
     ? todos.map((t) => `- ${summarizeBitableRow(t)}`).join('\n')
     : '（空）';
 
+  const tier1Section = coreDocContent
+    ? [
+        '## Tier-1：项目核心文档（最高优先级，请优先提取）',
+        '',
+        truncate(coreDocContent, PRD_DOC_MAX_CHARS),
+        '',
+      ]
+    : [];
+
   return [
     SYSTEM_RULES,
+    '',
+    TIER_RULE,
     '',
     '# 三个 Few-Shot 示例',
     '',
@@ -228,7 +260,8 @@ export function ARCHIVE_SUMMARY_PROMPT(
     '',
     '# 现在轮到你处理',
     '',
-    '## 输入数据',
+    ...tier1Section,
+    `## Tier-2：补充事实（memory/decision/todo 三表）`,
     '',
     `### memory（${memories.length} 条）`,
     memoryLines,

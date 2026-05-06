@@ -17,6 +17,7 @@
 
 import type { Message, Skill, SkillContext } from '@seedhac/contracts';
 import { err, ok } from '@seedhac/contracts';
+import { appendMilestone } from './core-doc.js';
 import {
   REQ_PROMPT,
   RELEVANCE_PROMPT,
@@ -372,6 +373,19 @@ export const requirementDocSkill: Skill = {
         message: memRes.error.message,
       });
     }
+
+    // e2. 追加到项目核心文档 "项目里程碑" + "完整时间线"（issue #120）
+    //     失败仅 warn，不阻塞卡片输出
+    void appendMilestone(ctx, chatId, {
+      type: 'requirement',
+      title: `${doc.title} 已落地`,
+      url: fileResult.value.url,
+      source: msg.messageId,
+    }).catch((e: unknown) => {
+      ctx.logger.warn('requirementDoc: core-doc append milestone threw', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    });
 
     // f. patch loading 卡片为最终 docPush 卡片
     const finalCard = ctx.cardBuilder.build('docPush', {

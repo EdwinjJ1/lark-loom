@@ -1,0 +1,180 @@
+/**
+ * 项目核心文档 helper（issue #120）
+ *
+ * 设计原则：
+ *   1. **Append-only** —— 永远不修改已有 entry，决策推翻就 append [Supersedes Dxx]
+ *   2. **Per-entry 模板拼接** —— 不过 LLM，所有 entry 字段从 skill 已有数据直接来
+ *      （decision 表 content / 完成产出 URL / pending todo 内容），杜绝额外幻觉源
+ *   3. **失败仅 warn** —— 找不到核心文档 / appendToSection 失败都不阻塞 skill 主流程
+ *
+ * Section 映射：
+ *   - 决策 → "决策日志"
+ *   - 里程碑 → "项目里程碑"
+ *   - 阻塞 → "阻塞与风险"
+ *   - 同步：每条 entry 同时往"完整时间线"末尾 append 一行
+ */
+
+import type { BitableClient, DocBlock, DocxClient } from '@seedhac/contracts';
+
+export interface CoreDocCtx {
+  readonly bitable: BitableClient;
+  readonly docx: DocxClient;
+  readonly logger: { warn(msg: string, meta?: Record<string, unknown>): void; info(msg: string, meta?: Record<string, unknown>): void };
+}
+
+export interface DecisionEntry {
+  readonly title: string;
+  readonly source?: string;
+  readonly supersedes?: string;
+}
+
+export interface MilestoneEntry {
+  readonly type: 'requirement' | 'completion';
+  readonly title: string;
+  readonly url?: string;
+  readonly source?: string;
+}
+
+export interface BlockerEntry {
+  readonly title: string;
+  readonly source?: string;
+}
+
+const FEISHU_URL_RE = /https?:\/\/[^\s)>]+(?:feishu\.cn|larksuite\.com|larkoffice\.com)[^\s)>]*/;
+
+/**
+ * 从 memory 找到当前 chatId 的核心文档 docToken。找不到返回 null。
+ */
+export async function findCoreDocToken(
+  ctx: CoreDocCtx,
+  chatId: string,
+): Promise<string | null> {
+  const filter = `AND(CurrentValue.[chat_id]="${chatId}")`;
+  const res = await ctx.bitable.find({ table: 'memory', filter, pageSize: 50 });
+  if (!res.ok) {
+    ctx.logger.warn('core-doc: memory.find failed', { error: res.error.message });
+    return null;
+  }
+  // 找最新的 [核心文档] 前缀条目（按 created_at 倒序）
+  const candidates = res.value.records
+    .filter((r) => /^\[核心文档\]/.test(String(r['content'] ?? '')))
+    .sort(
+      (a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0),
+    );
+  if (candidates.length === 0) return null;
+  const content = String(candidates[0]!['content'] ?? '');
+  const url = content.match(FEISHU_URL_RE)?.[0];
+  if (!url) return null;
+  // url: https://feishu.cn/docx/{token}
+  const tokenMatch = url.match(/\/docx\/([a-zA-Z0-9]+)/);
+  return tokenMatch ? tokenMatch[1]! : null;
+}
+
+function formatTime(now: number): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(now));
+}
+
+/**
+ * 同时往 "完整时间线" 段 append 一行 timeline entry。
+ * 失败仅 warn —— 时间线是辅助视图，主 section 已经记了。
+ */
+async function appendTimeline(
+  ctx: CoreDocCtx,
+  docToken: string,
+  type: '决策' | '完成' | '需求' | '阻塞',
+  title: string,
+  now: number,
+): Promise<void> {
+  const block: DocBlock = {
+    type: 'bullet',
+    text: `${formatTime(now)} [${type}] ${title}`,
+  };
+  const res = await ctx.docx.appendToSection(docToken, '完整时间线', [block]);
+  if (!res.ok) {
+    ctx.logger.warn('core-doc: appendTimeline failed', { error: res.error.message });
+  }
+}
+
+/** 决策 → "决策日志" + 时间线。失败仅 warn。 */
+export async function appendDecision(
+  ctx: CoreDocCtx,
+  chatId: string,
+  entry: DecisionEntry,
+): Promise<void> {
+  const docToken = await findCoreDocToken(ctx, chatId);
+  if (!docToken) {
+    ctx.logger.info('core-doc: no core doc found, skip appendDecision', { chatId });
+    return;
+  }
+  const now = Date.now();
+  const supersedesPart = entry.supersedes ? ` [Supersedes ${entry.supersedes}]` : '';
+  const sourcePart = entry.source ? ` · 来源：${entry.source}` : '';
+  const line: DocBlock = {
+    type: 'bullet',
+    text: `${formatTime(now)} — ${entry.title}${supersedesPart}${sourcePart}`,
+  };
+  const res = await ctx.docx.appendToSection(docToken, '决策日志', [line]);
+  if (!res.ok) {
+    ctx.logger.warn('core-doc: appendDecision failed', { error: res.error.message });
+    return;
+  }
+  await appendTimeline(ctx, docToken, '决策', entry.title, now);
+}
+
+/** 里程碑 → "项目里程碑" + 时间线。type 区分 [需求]/[完成]。 */
+export async function appendMilestone(
+  ctx: CoreDocCtx,
+  chatId: string,
+  entry: MilestoneEntry,
+): Promise<void> {
+  const docToken = await findCoreDocToken(ctx, chatId);
+  if (!docToken) {
+    ctx.logger.info('core-doc: no core doc found, skip appendMilestone', { chatId });
+    return;
+  }
+  const now = Date.now();
+  const urlPart = entry.url ? `: ${entry.url}` : '';
+  const sourcePart = entry.source ? ` · 来源：${entry.source}` : '';
+  const line: DocBlock = {
+    type: 'bullet',
+    text: `${formatTime(now)} — ${entry.title}${urlPart}${sourcePart}`,
+  };
+  const res = await ctx.docx.appendToSection(docToken, '项目里程碑', [line]);
+  if (!res.ok) {
+    ctx.logger.warn('core-doc: appendMilestone failed', { error: res.error.message });
+    return;
+  }
+  const tlType = entry.type === 'requirement' ? '需求' : '完成';
+  await appendTimeline(ctx, docToken, tlType, entry.title, now);
+}
+
+/** 阻塞 → "阻塞与风险" + 时间线。 */
+export async function appendBlocker(
+  ctx: CoreDocCtx,
+  chatId: string,
+  entry: BlockerEntry,
+): Promise<void> {
+  const docToken = await findCoreDocToken(ctx, chatId);
+  if (!docToken) {
+    ctx.logger.info('core-doc: no core doc found, skip appendBlocker', { chatId });
+    return;
+  }
+  const now = Date.now();
+  const sourcePart = entry.source ? ` · 来源：${entry.source}` : '';
+  const line: DocBlock = {
+    type: 'bullet',
+    text: `${formatTime(now)} — ${entry.title} [Open]${sourcePart}`,
+  };
+  const res = await ctx.docx.appendToSection(docToken, '阻塞与风险', [line]);
+  if (!res.ok) {
+    ctx.logger.warn('core-doc: appendBlocker failed', { error: res.error.message });
+    return;
+  }
+  await appendTimeline(ctx, docToken, '阻塞', entry.title, now);
+}

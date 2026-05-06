@@ -8,6 +8,7 @@
 import type { ChatMember, Message, Skill } from '@seedhac/contracts';
 import type { SlideDraft } from '@seedhac/contracts';
 import { ErrorCode, err, makeError, ok } from '@seedhac/contracts';
+import { appendMilestone } from './core-doc.js';
 import { OutlineSchema, SLIDES_PROMPT } from './prompts/slides.js';
 
 /** chatId 正在生成中的锁，防止同一群短时间内重复触发 */
@@ -294,6 +295,25 @@ async function runSlides(ctx: Parameters<Skill['run']>[0], msg: Message): Return
         error: e instanceof Error ? e.message : String(e),
       });
     });
+
+  // 追加到项目核心文档 "项目里程碑" + "完整时间线"（issue #120）
+  // 两条产出：演示 PPT + 汇报分工文稿。fire-and-forget。
+  void Promise.all([
+    appendMilestone(ctx, chatId, {
+      type: 'completion',
+      title: `演示 PPT 已生成（${outline.title}）`,
+      url: slidesResult.value.url,
+    }),
+    appendMilestone(ctx, chatId, {
+      type: 'completion',
+      title: `汇报分工文稿已生成`,
+      url: assignmentDocResult.value.url,
+    }),
+  ]).catch((e: unknown) => {
+    ctx.logger.warn('slides: core-doc append milestone threw', {
+      error: e instanceof Error ? e.message : String(e),
+    });
+  });
 
   return ok({
     card: assignmentCard,
