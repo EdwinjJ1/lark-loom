@@ -358,6 +358,7 @@ export class VolcanoLLMClient implements LLMClient {
 
     const body = JSON.stringify({ model: embeddingModelId, input: text });
     let lastErr: unknown;
+    let sawTimeout = false;
 
     for (let attempt = 0; attempt < 3; attempt++) {
       const controller = new AbortController();
@@ -386,12 +387,17 @@ export class VolcanoLLMClient implements LLMClient {
       } catch (e) {
         clearTimeout(timer);
         lastErr = e;
+        if (e instanceof Error && e.name === 'AbortError') sawTimeout = true;
         if (attempt < 2) await sleep(RETRY_DELAYS_MS[attempt] ?? 1000);
       }
     }
 
     return err(
-      makeError(ErrorCode.LLM_INVALID_RESPONSE, 'embed: failed after 3 attempts', lastErr),
+      makeError(
+        sawTimeout ? ErrorCode.LLM_TIMEOUT : ErrorCode.LLM_INVALID_RESPONSE,
+        sawTimeout ? 'embed: timed out after 3 attempts' : 'embed: failed after 3 attempts',
+        lastErr,
+      ),
     );
   }
 

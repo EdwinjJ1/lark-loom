@@ -268,9 +268,9 @@ export class MemoryStore implements IMemoryStore {
 
     const SIMILARITY_THRESHOLD = 0.3;
 
-    // 只对有 embedding 的行做余弦排序；没有 embedding 的行忽略
+    // 只对有 embedding 的行做余弦排序；没有 embedding 的旧记录直接丢弃
+    // （这些是 embedding feature 上线前写入的历史记录，语义不明，混入会引入噪声）
     const scored: Array<{ memory: MemoryRecord; score: number }> = [];
-    const noEmbedding: MemoryRecord[] = [];
 
     for (const row of findResult.value.records) {
       const memory = this.rowToMemory(row);
@@ -280,21 +280,13 @@ export class MemoryStore implements IMemoryStore {
           const score = cosineSimilarity(queryVec, vec);
           if (score >= SIMILARITY_THRESHOLD) scored.push({ memory, score });
         } catch {
-          noEmbedding.push(memory);
+          // embedding 字段损坏，跳过
         }
-      } else {
-        noEmbedding.push(memory);
       }
     }
 
     scored.sort((a, b) => b.score - a.score);
     const results = scored.slice(0, limit).map((s) => s.memory);
-
-    // 如果语义结果不足 limit，用无 embedding 记录补位（按 last_access 降序）
-    if (results.length < limit && noEmbedding.length > 0) {
-      noEmbedding.sort((a, b) => b.last_access - a.last_access);
-      results.push(...noEmbedding.slice(0, limit - results.length));
-    }
 
     void Promise.all(
       results

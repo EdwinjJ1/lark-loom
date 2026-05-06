@@ -74,8 +74,8 @@ function buildDeps() {
     },
   });
   if (!embeddingModel) {
-    logger.warn(
-      'ARK_MODEL_EMBEDDING not set — memory search will fall back to keyword matching',
+    logger.info(
+      'ARK_MODEL_EMBEDDING not set — memory search will use keyword matching',
     );
   }
 
