@@ -1,17 +1,19 @@
 /**
  * M3 — LLM 工具处理器
  *
- * 4 个供 chatWithTools 调用的工具：
- *   memory.read   按 (kind, key) 精确读取单条记忆
- *   memory.search 按 chat_id + 关键词模糊检索记忆
- *   skill.list    列出所有 Skill 名称与一句话描述
- *   skill.read    返回指定 Skill 的 docs/bot-memory/skills/<name>.md 全文
+ * 6 个供 chatWithTools 调用的工具：
+ *   memory.read    按 (kind, key) 精确读取单条记忆
+ *   memory.search  按 chat_id + 关键词模糊检索记忆
+ *   memory.write   写入一条记忆（事实/背景/分工/截止日期等）
+ *   decision.write 记录正式决策到 decision 表，并同步写入 memory（可被 memory.search 召回）
+ *   skill.list     列出所有 Skill 名称与一句话描述
+ *   skill.read     返回指定 Skill 的 docs/bot-memory/skills/<name>.md 全文
  */
 
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-import type { LLMTool, Skill, ToolCall, ToolResult } from '@seedhac/contracts';
+import type { BitableClient, LLMTool, Skill, ToolCall, ToolResult } from '@seedhac/contracts';
 import type { MemoryKind } from '@seedhac/contracts';
 import { skills as defaultSkills } from '@seedhac/skills';
 
@@ -77,6 +79,32 @@ const TOOLS: readonly LLMTool[] = [
     },
   },
   {
+    name: 'decision.write',
+    description:
+      '把群内正式决策写入 decision 表并同步进记忆，使其可被后续 memory.search 召回。' +
+      '判断标准：消息中出现明确结论（"我们决定…""最终确认…""不做…""验收标准是…"），而非讨论或提议。',
+    parameters: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'string',
+          description: '幂等键（snake_case），相同决策复用同一 key 实现覆盖，例：decision_launch_date',
+        },
+        content: {
+          type: 'string',
+          description: '决策正文，简洁描述结论，不超过 500 字',
+        },
+        importance: {
+          type: 'number',
+          minimum: 1,
+          maximum: 10,
+          description: '可选，1-10 重要度；不传默认 8（决策通常重要）',
+        },
+      },
+      required: ['key', 'content'],
+    },
+  },
+  {
     name: 'skill.list',
     description: '列出所有已注册 Skill 的名称和一句话描述',
     parameters: { type: 'object', properties: {} },
@@ -110,6 +138,8 @@ export interface ToolLogger {
 
 export interface ExecutorDeps {
   readonly store: IMemoryStore;
+  /** decision.write 需要往 Bitable decision 表写行；不传时跳过 Bitable 写入仅写 memory */
+  readonly bitable?: BitableClient;
   /** 当前 runtime 实际启用的 Skill 集合；不传时使用默认全量注册表。 */
   readonly skills?: readonly Skill[];
   /** 当前群组 ID，memory.read 的隐式上下文 */
@@ -167,6 +197,8 @@ async function dispatch(
       return handleMemorySearch(args, deps);
     case 'memory.write':
       return handleMemoryWrite(args, deps);
+    case 'decision.write':
+      return handleDecisionWrite(args, deps);
     case 'skill.list':
       return handleSkillList(deps.skills ?? defaultSkills);
     case 'skill.read':
@@ -242,6 +274,65 @@ async function handleMemoryWrite(
     recordId: r.value.id,
     kind: r.value.kind,
     key: r.value.key,
+  });
+}
+
+async function handleDecisionWrite(
+  args: Record<string, unknown>,
+  deps: ExecutorDeps,
+): Promise<string> {
+  const key = String(args['key'] ?? '');
+  const content = String(args['content'] ?? '');
+  if (!key || !content) return JSON.stringify({ error: 'key and content are required' });
+
+  const importance =
+    typeof args['importance'] === 'number'
+      ? Math.min(Math.max(args['importance'], 1), 10)
+      : 8; // 决策默认重要度 8
+
+  const sourceSkill = deps.sourceSkill ?? 'harness';
+  const now = Date.now();
+
+  // 1. 写 Bitable decision 表（主存储），无 bitable 时静默跳过
+  let bitableRecordId: string | undefined;
+  if (deps.bitable) {
+    const insertResult = await deps.bitable.insert({
+      table: 'decision',
+      row: {
+        chat_id: deps.chatId,
+        key,
+        content,
+        importance,
+        source_skill: sourceSkill,
+        created_at: now,
+      },
+    });
+    if (!insertResult.ok) {
+      deps.logger.warn('decision.write: bitable insert failed', {
+        code: insertResult.error.code,
+        message: insertResult.error.message,
+      });
+    } else {
+      bitableRecordId = insertResult.value.recordId;
+    }
+  }
+
+  // 2. 同步写 memory store（使 memory.search 可召回决策）
+  const memKey = key.startsWith('decision_') ? key : `decision_${key}`;
+  const memResult = await deps.store.write({
+    kind: 'project',
+    chat_id: deps.chatId,
+    key: memKey,
+    content,
+    source_skill: sourceSkill,
+    importance,
+  });
+  if (!memResult.ok) return JSON.stringify({ error: memResult.error.message });
+
+  return JSON.stringify({
+    ok: true,
+    memoryKey: memKey,
+    ...(bitableRecordId !== undefined && { bitableRecordId }),
   });
 }
 

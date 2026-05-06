@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ok, err, makeError, ErrorCode } from '@seedhac/contracts';
-import type { Skill, ToolCall } from '@seedhac/contracts';
+import type { BitableClient, RecordRef, Skill, ToolCall } from '@seedhac/contracts';
 import { qaSkill } from '@seedhac/skills';
 import { getLLMTools, makeExecutor } from '../../memory/tool-handlers.js';
 import type { MemoryStore } from '../../memory/memory-store.js';
@@ -41,14 +41,14 @@ function makeCall(name: string, args: Record<string, unknown>): ToolCall {
 // ─── getLLMTools ──────────────────────────────────────────────────────────────
 
 describe('getLLMTools', () => {
-  it('returns 5 tools with required fields', () => {
-    // M6（PR #87 / #85）加了 memory.write，从 4 个增到 5 个
+  it('returns 6 tools with required fields', () => {
     const tools = getLLMTools();
-    expect(tools).toHaveLength(5);
+    expect(tools).toHaveLength(6);
     const names = tools.map((t) => t.name);
     expect(names).toContain('memory.read');
     expect(names).toContain('memory.search');
     expect(names).toContain('memory.write');
+    expect(names).toContain('decision.write');
     expect(names).toContain('skill.list');
     expect(names).toContain('skill.read');
     for (const t of tools) {
@@ -245,5 +245,109 @@ describe('executor logging', () => {
       'tool called',
       expect.objectContaining({ tool: 'skill.list', ms: expect.any(Number) }),
     );
+  });
+});
+
+// ─── decision.write ───────────────────────────────────────────────────────────
+
+function makeBitable(overrides: Partial<BitableClient> = {}): BitableClient {
+  const stubRef: RecordRef = { tableId: 'tbl_decision', recordId: 'rec_001' };
+  return {
+    find: vi.fn().mockResolvedValue(ok({ records: [], hasMore: false })),
+    insert: vi.fn().mockResolvedValue(ok(stubRef)),
+    batchInsert: vi.fn().mockResolvedValue(ok([])),
+    update: vi.fn().mockResolvedValue(ok(undefined)),
+    delete: vi.fn().mockResolvedValue(ok(undefined)),
+    link: vi.fn().mockResolvedValue(ok(undefined)),
+    readTable: vi.fn().mockResolvedValue(ok('')),
+    ...overrides,
+  } as unknown as BitableClient;
+}
+
+describe('decision.write', () => {
+  it('happy path: writes to bitable decision table and memory store', async () => {
+    const store = makeStore();
+    const bitable = makeBitable();
+    const exec = makeExecutor({
+      store,
+      bitable,
+      chatId: CHAT_ID,
+      logger: mockLogger,
+      docsRoot: DOCS_ROOT,
+      sourceSkill: 'passive_observe',
+    });
+
+    const toolResult = await exec(
+      makeCall('decision.write', { key: 'launch_date', content: '确认 6月1日上线' }),
+    );
+
+    const data = JSON.parse(toolResult.content) as { ok: boolean; memoryKey: string; bitableRecordId: string };
+    expect(data.ok).toBe(true);
+    expect(data.memoryKey).toBe('decision_launch_date');
+    expect(data.bitableRecordId).toBe('rec_001');
+
+    expect(bitable.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        table: 'decision',
+        row: expect.objectContaining({ chat_id: CHAT_ID, key: 'launch_date', content: '确认 6月1日上线' }),
+      }),
+    );
+    expect(store.write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'project', key: 'decision_launch_date', chat_id: CHAT_ID }),
+    );
+  });
+
+  it('key already prefixed with decision_: does not double-prefix', async () => {
+    const store = makeStore();
+    const bitable = makeBitable();
+    const exec = makeExecutor({ store, bitable, chatId: CHAT_ID, logger: mockLogger, docsRoot: DOCS_ROOT });
+
+    await exec(makeCall('decision.write', { key: 'decision_mvp_scope', content: '不做 PC 端' }));
+
+    expect(store.write).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'decision_mvp_scope' }),
+    );
+  });
+
+  it('bitable insert fails: logs warn but still writes memory, returns ok', async () => {
+    const store = makeStore();
+    const bitable = makeBitable({
+      insert: vi.fn().mockResolvedValue(err(makeError(ErrorCode.FEISHU_API_ERROR, 'bitable down'))),
+    });
+    const logger = { info: vi.fn(), warn: vi.fn() };
+    const exec = makeExecutor({ store, bitable, chatId: CHAT_ID, logger, docsRoot: DOCS_ROOT });
+
+    const toolResult = await exec(
+      makeCall('decision.write', { key: 'some_decision', content: '决定暂停迭代' }),
+    );
+
+    const data = JSON.parse(toolResult.content) as { ok: boolean };
+    expect(data.ok).toBe(true);
+    expect(logger.warn).toHaveBeenCalledWith('decision.write: bitable insert failed', expect.anything());
+    expect(store.write).toHaveBeenCalled();
+  });
+
+  it('missing key or content: returns error JSON', async () => {
+    const store = makeStore();
+    const exec = makeExecutor({ store, chatId: CHAT_ID, logger: mockLogger, docsRoot: DOCS_ROOT });
+
+    const toolResult = await exec(makeCall('decision.write', { content: '缺 key' }));
+
+    const data = JSON.parse(toolResult.content) as { error: string };
+    expect(data.error).toContain('required');
+  });
+
+  it('no bitable provided: skips bitable insert, still writes memory', async () => {
+    const store = makeStore();
+    const exec = makeExecutor({ store, chatId: CHAT_ID, logger: mockLogger, docsRoot: DOCS_ROOT });
+
+    const toolResult = await exec(
+      makeCall('decision.write', { key: 'fallback_decision', content: '没有 bitable 也能写记忆' }),
+    );
+
+    const data = JSON.parse(toolResult.content) as { ok: boolean; bitableRecordId?: string };
+    expect(data.ok).toBe(true);
+    expect(data.bitableRecordId).toBeUndefined();
+    expect(store.write).toHaveBeenCalled();
   });
 });
