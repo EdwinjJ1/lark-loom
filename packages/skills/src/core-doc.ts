@@ -103,11 +103,23 @@ export async function findCoreDocToken(
   const sorted = [...candidates].sort(
     (a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0),
   );
-  const content = String(sorted[0]!['content'] ?? '');
+  const rawContent = sorted[0]!['content'];
+  const content = String(rawContent ?? '');
+
   const url = content.match(FEISHU_URL_RE)?.[0];
-  if (!url) return null;
-  const tokenMatch = url.match(/\/docx\/([a-zA-Z0-9]+)/);
-  return tokenMatch ? tokenMatch[1]! : null;
+  const tokenMatch = url?.match(/\/docx\/([a-zA-Z0-9]+)/);
+
+  ctx.logger.info('core-doc: findCoreDocToken extracted', {
+    chatId,
+    rawContentType: typeof rawContent,
+    contentPreview: content.slice(0, 200),
+    contentLength: content.length,
+    urlFound: url ?? null,
+    tokenFound: tokenMatch?.[1] ?? null,
+  });
+
+  if (!url || !tokenMatch) return null;
+  return tokenMatch[1]!;
 }
 
 function formatTime(now: number): string {
