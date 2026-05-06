@@ -296,6 +296,7 @@ describe('progressUpdateSkill.run() — defensive length handling', () => {
     const row = insert.mock.calls[0]![0].row;
     expect(row.key).not.toContain('|');
     expect(row.key).not.toContain('\n');
+    // eslint-disable-next-line no-control-regex -- intentionally testing control char stripping
     expect(row.key).not.toMatch(/[\x00-\x1f]/);
   });
 });
