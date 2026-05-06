@@ -21,6 +21,8 @@ import {
   type Logger,
   type MemoryRecord,
   type MemoryKind,
+  type MemoryListOptions,
+  type MemoryStoreClient,
   type MemoryWriteInput,
   type RecordRef,
   type Result,
@@ -107,16 +109,7 @@ export function evictScore(
 // ---------- IMemoryStore interface ----------
 
 /** Public contract for MemoryStore — implemented by both MemoryStore and NullMemoryStore. */
-export interface IMemoryStore {
-  read(kind: MemoryKind, chatId: string, key: string): Promise<Result<MemoryRecord | null>>;
-  search(
-    chatId: string,
-    query: string,
-    opts?: { limit?: number; kind?: MemoryKind },
-  ): Promise<Result<readonly MemoryRecord[]>>;
-  write(input: MemoryWriteInput): Promise<Result<MemoryRecord>>;
-  score(content: string): Promise<Result<number>>;
-}
+export type IMemoryStore = MemoryStoreClient;
 
 // ---------- MemoryStore ----------
 
@@ -166,11 +159,7 @@ export class MemoryStore implements IMemoryStore {
    * 按 (kind, chat_id, key) 精确读取单条记忆。
    * 命中时异步刷新 last_access（不阻塞返回）。
    */
-  async read(
-    kind: MemoryKind,
-    chatId: string,
-    key: string,
-  ): Promise<Result<MemoryRecord | null>> {
+  async read(kind: MemoryKind, chatId: string, key: string): Promise<Result<MemoryRecord | null>> {
     const v1 = this.validateSafeKey('chat_id', chatId);
     if (!v1.ok) return v1;
     const v2 = this.validateSafeKey('key', key);
@@ -241,6 +230,43 @@ export class MemoryStore implements IMemoryStore {
       ),
     );
     return ok(memories);
+  }
+
+  async list(opts: MemoryListOptions = {}): Promise<Result<readonly MemoryRecord[]>> {
+    if (opts.chatId !== undefined) {
+      const v = this.validateSafeKey('chat_id', opts.chatId);
+      if (!v.ok) return v;
+    }
+    if (opts.sourceSkill !== undefined) {
+      const v = this.validateSafeKey('source_skill', opts.sourceSkill);
+      if (!v.ok) return v;
+    }
+
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+    const records: MemoryRecord[] = [];
+    let pageToken: string | undefined;
+    const filter = this.buildListFilter(opts);
+
+    for (;;) {
+      const findResult = await this.bitable.find({
+        table: MEMORY_TABLE,
+        pageSize: Math.min(limit, 500),
+        ...(filter !== undefined && { filter }),
+        ...(pageToken !== undefined && { pageToken }),
+      });
+      if (!findResult.ok) return findResult;
+
+      for (const row of findResult.value.records) {
+        const memory = this.rowToMemory(row);
+        records.push(memory);
+        if (records.length >= limit) return ok(records);
+      }
+
+      if (!findResult.value.hasMore) break;
+      pageToken = findResult.value.nextPageToken;
+    }
+
+    return ok(records);
   }
 
   // ─────────────────────────── write ───────────────────────────
@@ -377,6 +403,14 @@ export class MemoryStore implements IMemoryStore {
     return ok(result.value.importance);
   }
 
+  async delete(record: MemoryRecord | string): Promise<Result<void>> {
+    const recordId = typeof record === 'string' ? record : record.id;
+    if (!recordId) {
+      return err(makeError(ErrorCode.INVALID_INPUT, 'memory.delete: missing record id'));
+    }
+    return this.bitable.delete({ table: MEMORY_TABLE, recordId });
+  }
+
   /** 立即把评分队列里的任务执行完（测试用，绕过定时器） */
   async flushScoreQueue(): Promise<void> {
     if (this.scoreTimer) {
@@ -439,14 +473,20 @@ export class MemoryStore implements IMemoryStore {
       pageSize: MEMORY_MAX_PER_CHAT_KIND + 1,
     });
     if (perChatResult.ok && perChatResult.value.records.length > MEMORY_MAX_PER_CHAT_KIND) {
-      await this.evictLowest(perChatResult.value.records.map((r) => this.rowToMemory(r)), 1);
+      await this.evictLowest(
+        perChatResult.value.records.map((r) => this.rowToMemory(r)),
+        1,
+      );
     }
 
     // 全表计数：MEMORY_MAX_TOTAL=2000 > 飞书单页上限 500，必须分页累计
     const allResult = await this.fetchAllRecords();
     if (allResult.ok && allResult.value.length > MEMORY_MAX_TOTAL) {
       const excess = allResult.value.length - MEMORY_MAX_TOTAL;
-      await this.evictLowest(allResult.value.map((r) => this.rowToMemory(r)), excess);
+      await this.evictLowest(
+        allResult.value.map((r) => this.rowToMemory(r)),
+        excess,
+      );
     }
   }
 
@@ -505,6 +545,25 @@ export class MemoryStore implements IMemoryStore {
     return `AND(${parts.join(', ')})`;
   }
 
+  private buildListFilter(opts: MemoryListOptions): string | undefined {
+    const parts: string[] = [];
+    if (opts.chatId !== undefined) {
+      parts.push(`CurrentValue.[chat_id] = "${this.escapeFilterValue(opts.chatId)}"`);
+    }
+    if (opts.kind !== undefined) {
+      parts.push(`CurrentValue.[kind] = "${opts.kind}"`);
+    }
+    if (opts.sourceSkill !== undefined) {
+      parts.push(`CurrentValue.[source_skill] = "${this.escapeFilterValue(opts.sourceSkill)}"`);
+    }
+    if (opts.minImportance !== undefined) {
+      parts.push(`CurrentValue.[importance] >= ${opts.minImportance}`);
+    }
+    if (parts.length === 0) return undefined;
+    if (parts.length === 1) return parts[0];
+    return `AND(${parts.join(', ')})`;
+  }
+
   /** 转义飞书 filter 字符串字面量中的双引号和反斜杠 */
   private escapeFilterValue(s: string): string {
     return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -541,8 +600,16 @@ export class NullMemoryStore implements IMemoryStore {
     return ok([]);
   }
 
+  async list(): Promise<Result<readonly MemoryRecord[]>> {
+    return ok([]);
+  }
+
   async write(): Promise<Result<MemoryRecord>> {
     return err(makeError(ErrorCode.CONFIG_MISSING, 'NullMemoryStore: write not supported'));
+  }
+
+  async delete(): Promise<Result<void>> {
+    return err(makeError(ErrorCode.CONFIG_MISSING, 'NullMemoryStore: delete not supported'));
   }
 
   async score(): Promise<Result<number>> {

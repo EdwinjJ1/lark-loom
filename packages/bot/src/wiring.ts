@@ -54,6 +54,10 @@ export async function handleEvent(
     await handleCardAction(ctx, skills);
     return;
   }
+  if (event.type === 'schedule') {
+    await handleSchedule(ctx, skills);
+    return;
+  }
   // bot 入群 → 立刻发 onboarding 卡（issue #98 数据使用告知 + 启用按钮）
   if (event.type === 'botJoinedChat') {
     await handleBotJoinedChat(ctx, {
@@ -141,8 +145,7 @@ async function handleWithSkillRouter(
 }
 
 async function runSkill(ctx: SkillContext, skill: Skill): Promise<void> {
-  const { event, logger, runtime } = ctx;
-  if (event.type !== 'message') return;
+  const { logger, runtime } = ctx;
   const result = await skill.run(ctx);
   if (!result.ok) {
     logger.error('skill failed', {
@@ -152,9 +155,12 @@ async function runSkill(ctx: SkillContext, skill: Skill): Promise<void> {
     });
     return;
   }
+  writeSkillMemory(ctx, skill, result.value);
+  const chatId = deliveryChatId(ctx);
+  if (!chatId) return;
   const { card, text } = result.value;
   if (card) {
-    const sendResult = await runtime.sendCard({ chatId: event.payload.chatId, card });
+    const sendResult = await runtime.sendCard({ chatId, card });
     if (!sendResult.ok) {
       logger.error('send card failed', {
         code: sendResult.error.code,
@@ -164,7 +170,7 @@ async function runSkill(ctx: SkillContext, skill: Skill): Promise<void> {
     }
   }
   if (text) {
-    const sendResult = await runtime.sendText({ chatId: event.payload.chatId, text });
+    const sendResult = await runtime.sendText({ chatId, text });
     if (!sendResult.ok) {
       logger.error('send text failed', {
         code: sendResult.error.code,
@@ -173,7 +179,153 @@ async function runSkill(ctx: SkillContext, skill: Skill): Promise<void> {
       return;
     }
   }
-  logger.info(`skill=${skill.name} replied to chat=${event.payload.chatId}`);
+  logger.info(`skill=${skill.name} replied to chat=${chatId}`);
+}
+
+function writeSkillMemory(
+  ctx: SkillContext,
+  skill: Skill,
+  result: { readonly card?: unknown; readonly text?: string; readonly reasoning?: string },
+): void {
+  const memoryStore = ctx.memoryStore;
+  if (!memoryStore) return;
+  if (skill.name === 'weekly') return;
+
+  void writeSkillMemoryNow(ctx, skill, result);
+}
+
+// 自动写入的 skill_log / chat 记忆 input 上限：JSON.stringify 后还要嵌进 2KB content，
+// 给 reason/output/skill/at 留余量后单字段最多 500 字符。
+const AUTO_MEMORY_INPUT_MAX = 500;
+
+async function writeSkillMemoryNow(
+  ctx: SkillContext,
+  skill: Skill,
+  result: { readonly card?: unknown; readonly text?: string; readonly reasoning?: string },
+): Promise<void> {
+  const memoryStore = ctx.memoryStore;
+  if (!memoryStore) return;
+  const { chatId, userId, eventKey } = memoryEventIdentity(ctx);
+  const now = Date.now();
+  const summary = summarizeSkillResult(skill, result);
+  const baseUserField = userId ? { user_id: safeMemoryKey(userId) } : {};
+
+  // 不显式传 importance —— MemoryStore.write 会异步调 LLM 评分。
+  const skillLogPromise = memoryStore.write({
+    kind: 'skill_log',
+    chat_id: chatId,
+    key: safeMemoryKey(`skill:${skill.name}:${eventKey}:${now}`),
+    ...baseUserField,
+    source_skill: skill.name,
+    content: JSON.stringify({
+      skill: skill.name,
+      reason: result.reasoning ?? '',
+      output: summary,
+      at: now,
+    }),
+  });
+
+  const writeChatMemory = skill.name === 'qa' || skill.name === 'summary';
+  const chatPromise = writeChatMemory
+    ? memoryStore.write({
+        kind: 'chat',
+        chat_id: chatId,
+        key: safeMemoryKey(`chat:${skill.name}:${eventKey}:${now}`),
+        ...baseUserField,
+        source_skill: skill.name,
+        content: JSON.stringify({
+          skill: skill.name,
+          input:
+            ctx.event.type === 'message'
+              ? ctx.event.payload.text.slice(0, AUTO_MEMORY_INPUT_MAX)
+              : '',
+          output: summary,
+          reason: result.reasoning ?? '',
+          at: now,
+        }),
+      })
+    : null;
+
+  const [skillLog, chatWrite] = await Promise.all([skillLogPromise, chatPromise]);
+  if (!skillLog.ok) {
+    ctx.logger.warn('memory auto-write skill_log failed', {
+      skill: skill.name,
+      code: skillLog.error.code,
+      message: skillLog.error.message,
+    });
+  }
+  if (chatWrite && !chatWrite.ok) {
+    ctx.logger.warn('memory auto-write chat failed', {
+      skill: skill.name,
+      code: chatWrite.error.code,
+      message: chatWrite.error.message,
+    });
+  }
+}
+
+function memoryEventIdentity(ctx: SkillContext): {
+  chatId: string;
+  userId?: string;
+  eventKey: string;
+} {
+  const { event } = ctx;
+  if (event.type === 'message') {
+    return {
+      chatId: event.payload.chatId,
+      userId: event.payload.sender.userId,
+      eventKey: event.payload.messageId,
+    };
+  }
+  if (event.type === 'cardAction') {
+    return {
+      chatId: event.payload.chatId,
+      userId: event.payload.user.userId,
+      eventKey: event.payload.messageId,
+    };
+  }
+  if (event.type === 'botJoinedChat') {
+    return {
+      chatId: event.payload.chatId,
+      userId: event.payload.inviter.userId,
+      eventKey: `botJoined:${event.payload.timestamp}`,
+    };
+  }
+  if (event.type === 'schedule') {
+    return {
+      chatId: event.payload.chatId,
+      eventKey: `schedule:${event.payload.skillName}:${event.payload.timestamp}`,
+    };
+  }
+  return {
+    chatId: event.payload.chatId,
+    userId: event.payload.user.userId,
+    eventKey: `p2p:${event.payload.timestamp}`,
+  };
+}
+
+function summarizeSkillResult(
+  skill: Skill,
+  result: { readonly card?: unknown; readonly text?: string; readonly reasoning?: string },
+): string {
+  const text = result.text?.trim();
+  if (text) return text.slice(0, 500);
+  if (result.reasoning) return result.reasoning.slice(0, 500);
+  if (result.card) return `${skill.name} produced a card`;
+  return `${skill.name} completed`;
+}
+
+function safeMemoryKey(raw: string): string {
+  const key = raw.replace(/[^A-Za-z0-9_:.-]+/g, '_').slice(0, 120);
+  return key.length > 0 ? key : 'unknown';
+}
+
+function deliveryChatId(ctx: SkillContext): string | null {
+  const { event } = ctx;
+  if (event.type === 'message' || event.type === 'cardAction' || event.type === 'schedule') {
+    return event.payload.chatId;
+  }
+  if (event.type === 'botJoinedChat') return event.payload.chatId;
+  return null;
 }
 
 async function handleWithHarness(
@@ -194,13 +346,14 @@ async function handleWithHarness(
     docsRoot: harness.docsRoot,
   });
 
-  const skillChoices = [...registeredSkillNames(skills), 'silent'].join('|');
+  const skillChoices = [...registeredSkillNames(skills), 'silent'].join(' | ');
   const decisionInstruction =
     '可调用工具：skill.list / skill.read / memory.search 用于检索，' +
     'memory.write 用于把消息中的可记忆事实（项目目标/用户群体/截止日期/分工/关键决策/文档链接）写入记忆。' +
     '工具调用完成后只输出 JSON：' +
-    `{"skill":"${skillChoices}","reason":"一句话原因","args":{}}。` +
-    '如果不应处理，skill 必须是 "silent"。不要输出 JSON 以外的文字。';
+    `{"skill":"<以下之一: ${skillChoices}>","reason":"一句话原因","args":{}}。` +
+    `skill 字段必须是 ${skillChoices} 中的一个，不要输出其他值。` +
+    '不要输出 JSON 以外的文字。';
 
   const messages: ChatMessage[] = [
     { role: 'system', content: systemPrompt },
@@ -249,6 +402,9 @@ async function handleWithHarness(
     reason: decision.reason,
     args: decision.args ?? {},
   });
+  // Intentionally skip skill.match(): the harness uses LLM + memory context to
+  // select the skill, which is more flexible than keyword routing. The skills'
+  // run() methods do not assume match() was called first.
   await runSkill(ctx, skill);
   return true;
 }
@@ -261,18 +417,16 @@ function parseHarnessDecision(
   try {
     const parsed = JSON.parse(trimmed) as { skill?: unknown; reason?: unknown; args?: unknown };
     if (parsed.skill === 'silent') {
-      return {
-        skill: 'silent',
-        ...(typeof parsed.reason === 'string' && { reason: parsed.reason }),
-        ...(isRecord(parsed.args) && { args: parsed.args }),
-      };
+      let d: HarnessDecision = { skill: 'silent' };
+      if (typeof parsed.reason === 'string') d = { ...d, reason: parsed.reason };
+      if (isRecord(parsed.args)) d = { ...d, args: parsed.args };
+      return d;
     }
     if (typeof parsed.skill !== 'string' || !isSkillName(parsed.skill, skills)) return null;
-    return {
-      skill: parsed.skill,
-      ...(typeof parsed.reason === 'string' && { reason: parsed.reason }),
-      ...(isRecord(parsed.args) && { args: parsed.args }),
-    };
+    let d: HarnessDecision = { skill: parsed.skill };
+    if (typeof parsed.reason === 'string') d = { ...d, reason: parsed.reason };
+    if (isRecord(parsed.args)) d = { ...d, args: parsed.args };
+    return d;
   } catch {
     return null;
   }
@@ -371,19 +525,24 @@ async function handleCardAction(
     ...ctx,
     event: { type: 'message', payload: question as Message },
   };
-  const result = await qa.run(replayCtx);
-  if (!result.ok) {
-    logger.error('qa.reanswer skill failed', {
-      code: result.error.code,
-      message: result.error.message,
-    });
+  await runSkill(replayCtx, qa);
+  logger.info(`skill=qa reanswer requested chat=${chatId}`);
+}
+
+async function handleSchedule(
+  ctx: SkillContext,
+  skills: Readonly<Partial<Record<SkillName, Skill>>>,
+): Promise<void> {
+  const { event } = ctx;
+  if (event.type !== 'schedule') return;
+  const skillName = event.payload.skillName as SkillName;
+  const skill = skills[skillName];
+  if (!skill) {
+    ctx.logger.warn('schedule selected missing skill', { skill: event.payload.skillName });
     return;
   }
-
-  const { card, text } = result.value;
-  if (card) await runtime.sendCard({ chatId, card });
-  if (text) await runtime.sendText({ chatId, text });
-  logger.info(`skill=qa reanswered chat=${chatId}`);
+  if (!(await skill.match(ctx))) return;
+  await runSkill(ctx, skill);
 }
 
 // ─── 被动 memory 观察 ─────────────────────────────────────────────────────────

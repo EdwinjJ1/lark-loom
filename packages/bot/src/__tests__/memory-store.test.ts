@@ -34,9 +34,12 @@ class FakeBitable implements BitableClient {
     for (const [, field, expected] of eqMatches) {
       if (String(row.fields[field!]) !== expected) return false;
     }
-    const containsMatches = [
-      ...filter.matchAll(/CurrentValue\.\[(\w+)\]\.contains\("([^"]*)"\)/g),
-    ];
+    const gteMatches = [...filter.matchAll(/CurrentValue\.\[(\w+)\]\s*>=\s*(\d+(?:\.\d+)?)/g)];
+    for (const [, field, expected] of gteMatches) {
+      const actual = Number(row.fields[field!]);
+      if (!Number.isFinite(actual) || actual < Number(expected)) return false;
+    }
+    const containsMatches = [...filter.matchAll(/CurrentValue\.\[(\w+)\]\.contains\("([^"]*)"\)/g)];
     for (const [, field, needle] of containsMatches) {
       if (!String(row.fields[field!] ?? '').includes(needle!)) return false;
     }
@@ -48,7 +51,13 @@ class FakeBitable implements BitableClient {
     filter?: string;
     pageSize?: number;
     pageToken?: string;
-  }): Promise<Result<{ records: readonly (Record<string, unknown> & { tableId: string; recordId: string })[]; hasMore: boolean; nextPageToken?: string }>> {
+  }): Promise<
+    Result<{
+      records: readonly (Record<string, unknown> & { tableId: string; recordId: string })[];
+      hasMore: boolean;
+      nextPageToken?: string;
+    }>
+  > {
     this.findCalls++;
     const matched = this.rows.filter((r) => this.matchesFilter(r, params.filter ?? ''));
     const limit = params.pageSize ?? 20;
@@ -135,12 +144,18 @@ class FakeLLM implements LLMClient {
   async chatWithTools(): Promise<Result<{ content: string; toolCalls: never[]; rounds: number }>> {
     return ok({ content: '', toolCalls: [], rounds: 0 });
   }
-  async askStructured<T>(_prompt: string, schema: { parse: (v: unknown) => T }): Promise<Result<T>> {
+  async askStructured<T>(
+    _prompt: string,
+    schema: { parse: (v: unknown) => T },
+  ): Promise<Result<T>> {
     this.scoreCallCount++;
     try {
       return ok(schema.parse({ importance: this.nextScore }));
     } catch (e) {
-      return { ok: false, error: { code: 'LLM_INVALID_RESPONSE' as const, message: String(e) } as AppError };
+      return {
+        ok: false,
+        error: { code: 'LLM_INVALID_RESPONSE' as const, message: String(e) } as AppError,
+      };
     }
   }
 }
@@ -158,10 +173,7 @@ describe('MemoryStore.evictScore', () => {
   });
 
   it('importance 低 + 30 天前访问 → 低分', () => {
-    const low = evictScore(
-      { importance: 1, last_access: NOW - 30 * 24 * 3600 * 1000 },
-      NOW,
-    );
+    const low = evictScore({ importance: 1, last_access: NOW - 30 * 24 * 3600 * 1000 }, NOW);
     expect(low).toBeLessThan(1);
   });
 
@@ -306,6 +318,65 @@ describe('MemoryStore.read', () => {
     const result = await store.read('chat', 'oc_1', 'nonexistent');
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toBeNull();
+  });
+});
+
+describe('MemoryStore.list/delete', () => {
+  it('lists records by kind/chat/minImportance and deletes compressed records', async () => {
+    const bitable = new FakeBitable();
+    const store = new MemoryStore({ bitable, now: () => 1000 });
+    bitable.seed([
+      {
+        recordId: 'rec_1',
+        fields: {
+          kind: 'skill_log',
+          chat_id: 'chat_a',
+          key: 'log_1',
+          content: 'important',
+          importance: 8,
+          last_access: 900,
+          created_at: 900,
+          source_skill: 'qa',
+        },
+      },
+      {
+        recordId: 'rec_2',
+        fields: {
+          kind: 'skill_log',
+          chat_id: 'chat_a',
+          key: 'log_2',
+          content: 'low',
+          importance: 4,
+          last_access: 900,
+          created_at: 900,
+          source_skill: 'summary',
+        },
+      },
+      {
+        recordId: 'rec_3',
+        fields: {
+          kind: 'project',
+          chat_id: 'chat_a',
+          key: 'snapshot',
+          content: 'snapshot',
+          importance: 9,
+          last_access: 900,
+          created_at: 900,
+          source_skill: 'weekly',
+        },
+      },
+    ]);
+
+    const listed = await store.list({ chatId: 'chat_a', kind: 'skill_log', minImportance: 7 });
+
+    expect(listed.ok).toBe(true);
+    if (listed.ok) {
+      expect(listed.value.map((m) => m.key)).toEqual(['log_1']);
+      const deleted = await store.delete(listed.value[0]!);
+      expect(deleted.ok).toBe(true);
+    }
+    expect(bitable.deleteCalls).toBe(1);
+    expect(bitable.size()).toBe(2);
   });
 });
 

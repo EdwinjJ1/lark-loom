@@ -9,7 +9,7 @@
  *      → run() 返回 SkillResult，runtime 负责把 card / sideEffects 落地
  */
 
-import type { BitableClient } from './bitable.js';
+import type { BitableClient, MemoryStoreClient } from './bitable.js';
 import type { BotRuntime } from './bot-runtime.js';
 import type { Card, CardBuilder } from './card.js';
 import type { LLMClient } from './llm.js';
@@ -70,6 +70,7 @@ export interface SkillContext {
   readonly docx: DocxClient;
   readonly slides?: SlidesClient;
   readonly cardBuilder: CardBuilder;
+  readonly memoryStore?: MemoryStoreClient;
 }
 
 /** Skill 副作用：写 Bitable / 调外部 webhook / 触发其他 skill 等 */

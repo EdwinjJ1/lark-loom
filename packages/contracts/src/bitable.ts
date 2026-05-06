@@ -56,6 +56,27 @@ export type MemoryWriteInput = Pick<
   readonly importance?: number;
 };
 
+export interface MemoryListOptions {
+  readonly chatId?: string;
+  readonly kind?: MemoryKind;
+  readonly minImportance?: number;
+  readonly limit?: number;
+  readonly sourceSkill?: string;
+}
+
+export interface MemoryStoreClient {
+  read(kind: MemoryKind, chatId: string, key: string): Promise<Result<MemoryRecord | null>>;
+  search(
+    chatId: string,
+    query: string,
+    opts?: { limit?: number; kind?: MemoryKind },
+  ): Promise<Result<readonly MemoryRecord[]>>;
+  list(opts?: MemoryListOptions): Promise<Result<readonly MemoryRecord[]>>;
+  write(input: MemoryWriteInput): Promise<Result<MemoryRecord>>;
+  delete(record: MemoryRecord | string): Promise<Result<void>>;
+  score(content: string): Promise<Result<number>>;
+}
+
 /** 一条记录的稳定主键（飞书侧的 record_id） */
 export interface RecordRef {
   readonly tableId: string;
