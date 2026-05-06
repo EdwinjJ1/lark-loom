@@ -32,6 +32,8 @@ interface TableSpec {
   fields: FieldSpec[];
 }
 
+// 字段名严格对齐 skill 实际写入的 row（toLarkFields 不做转换）。
+// 来源：packages/skills/src/{task-assignment,progress-update,archive,summary,slides,requirement-doc}.ts
 const TABLES: readonly TableSpec[] = [
   {
     table_name: 'memory',
@@ -56,6 +58,7 @@ const TABLES: readonly TableSpec[] = [
       { field_name: 'importance', type: 2, property: { formatter: '0' } },
       { field_name: 'last_access', type: 2, property: { formatter: '0' } },
       { field_name: 'created_at', type: 2, property: { formatter: '0' } },
+      { field_name: 'source_skill', type: 1 },
     ],
   },
   {
@@ -63,33 +66,38 @@ const TABLES: readonly TableSpec[] = [
     envKey: 'BITABLE_TABLE_DECISION',
     fields: [
       { field_name: 'topic', type: 1 },
-      { field_name: 'chat_id', type: 1 },
+      { field_name: 'chatId', type: 1 },
       { field_name: 'decision', type: 1 },
       { field_name: 'rationale', type: 1 },
       { field_name: 'decided_by', type: 1 },
       { field_name: 'decided_at', type: 2, property: { formatter: '0' } },
+      { field_name: 'timestamp', type: 2, property: { formatter: '0' } },
     ],
   },
   {
+    // todo 表字段对齐 task-assignment.ts:119-129 / progress-update.ts:131-137
     table_name: 'todo',
     envKey: 'BITABLE_TABLE_TODO',
     fields: [
-      { field_name: 'title', type: 1 },
-      { field_name: 'chat_id', type: 1 },
-      { field_name: 'assignee', type: 1 },
+      { field_name: 'content', type: 1 },
+      { field_name: 'chatId', type: 1 },
+      { field_name: 'owner', type: 1 },
+      { field_name: 'ddl', type: 1 },
       {
         field_name: 'status',
         type: 3,
         property: {
           options: [
-            { name: 'open', color: 0 },
+            { name: 'pending', color: 0 },
             { name: 'in_progress', color: 1 },
             { name: 'done', color: 2 },
           ],
         },
       },
-      { field_name: 'due_at', type: 2, property: { formatter: '0' } },
-      { field_name: 'created_at', type: 2, property: { formatter: '0' } },
+      { field_name: 'deliverable', type: 1 },
+      { field_name: 'acceptance', type: 1 },
+      { field_name: 'source', type: 1 },
+      { field_name: 'timestamp', type: 2, property: { formatter: '0' } },
     ],
   },
   {
@@ -97,7 +105,7 @@ const TABLES: readonly TableSpec[] = [
     envKey: 'BITABLE_TABLE_KNOWLEDGE',
     fields: [
       { field_name: 'title', type: 1 },
-      { field_name: 'chat_id', type: 1 },
+      { field_name: 'chatId', type: 1 },
       { field_name: 'content', type: 1 },
       { field_name: 'source', type: 1 },
       { field_name: 'created_at', type: 2, property: { formatter: '0' } },
