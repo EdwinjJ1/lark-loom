@@ -5,6 +5,7 @@ import type { Logger, SkillContext } from '@seedhac/contracts';
 import { skillsByName } from '@seedhac/skills';
 import { createBotRuntime } from './bot-runtime.js';
 import { LarkBitableClient } from './bitable-client.js';
+import { BitableRetriever } from './bitable-retriever.js';
 import { larkCardBuilder } from './card-builder.js';
 import { createDocxClient } from './docx-client.js';
 import { VolcanoLLMClient } from './llm-client.js';
@@ -110,6 +111,7 @@ async function main(): Promise<void> {
   }
   const memoryStore = new MemoryStore({ bitable, llm, logger });
   logger.info('memory store initialized', { type: 'MemoryStore' });
+  const bitableRetriever = new BitableRetriever(bitable);
   const botOpenId = process.env['LARK_BOT_OPEN_ID'] ?? '';
   if (!botOpenId) {
     logger.warn('LARK_BOT_OPEN_ID 未配置 — @bot 检测会失败，所有 mention skill 不会触发');
@@ -143,7 +145,7 @@ async function main(): Promise<void> {
       slides,
       cardBuilder: larkCardBuilder,
       memoryStore,
-      retrievers: {},
+      retrievers: { bitable: bitableRetriever },
       logger,
     };
     await handleEvent(ctx, router, skillsByName, harness);

@@ -20,8 +20,8 @@ describe('BitableRetriever', () => {
       ok: true,
       value: {
         records: [
-          { recordId: 'rec_1', messageId: 'msg_1', chatId: 'chat_a', userId: 'u1', content: 'hello world', timestamp: 5000 },
-          { recordId: 'rec_2', messageId: 'msg_2', chatId: 'chat_a', userId: 'u2', content: 'goodbye', timestamp: 4000 },
+          { recordId: 'rec_1', key: 'project_goal', chat_id: 'chat_a', user_id: 'u1', content: 'hello world', last_access: 5000, kind: 'project' },
+          { recordId: 'rec_2', key: 'deadline', chat_id: 'chat_a', user_id: 'u2', content: 'goodbye', last_access: 4000, kind: 'project' },
         ],
         hasMore: false,
       },
@@ -32,7 +32,7 @@ describe('BitableRetriever', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value).toHaveLength(2);
-      expect(result.value[0]!.id).toBe('msg_1');
+      expect(result.value[0]!.id).toBe('rec_1');
       expect(result.value[0]!.source).toBe('bitable');
       expect(result.value[0]!.snippet).toBe('hello world');
     }

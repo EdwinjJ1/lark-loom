@@ -26,7 +26,8 @@ export class BitableRetriever implements Retriever {
 
     const result = await this.bitable.find({
       table: 'memory',
-      ...(query.chatId ? { filter: `AND(CurrentValue.[chatId]="${query.chatId}")` } : {}),
+      // chat_id 是 memory 表的实际字段名（MemoryRecord schema）
+      ...(query.chatId ? { filter: `AND(CurrentValue.[chat_id]="${query.chatId}")` } : {}),
       pageSize: topK,
     });
 
@@ -34,14 +35,15 @@ export class BitableRetriever implements Retriever {
 
     const hits: RetrieveHit[] = result.value.records.map((r) => ({
       source: 'bitable' as RetrieverSource,
-      id: String(r['messageId'] ?? r['recordId']),
-      title: String(r['content'] ?? '').slice(0, 30),
+      id: String(r['recordId'] ?? r['key'] ?? ''),
+      title: String(r['key'] ?? '').slice(0, 30),
       snippet: String(r['content'] ?? '').slice(0, 200),
       score: 1,
-      timestamp: Number(r['timestamp'] ?? 0),
+      timestamp: Number(r['last_access'] ?? r['created_at'] ?? 0),
       meta: {
-        chatId: r['chatId'],
-        userId: r['userId'],
+        chatId: r['chat_id'],
+        userId: r['user_id'],
+        kind: r['kind'],
       },
     }));
 
