@@ -81,10 +81,11 @@ export const CORE_DOC_SECTIONS = [
 export type CoreDocSection = (typeof CORE_DOC_SECTIONS)[number];
 
 /**
- * 初始化的核心文档 blocks。每个 section 一个 H2 + 一个引导性 placeholder。
+ * 初始化的核心文档 blocks。
  *
- * Placeholder 文案是有意写的"提示性占位"而非空文字 —— 让用户翻文档时
- * 一眼就知道每段会被什么 skill 填充，而不是看到一堆空段以为坏了。
+ * 每个 section 只有 H2 标题（不含 placeholder paragraph）—— skill 后续
+ * append 内容到对应 H2 下方。这样规避 feishu batchDelete 索引语义模糊
+ * 问题，所有 section 都用纯 append 模式，简单稳定。
  */
 function buildCoreDocInitialBlocks(chatName: string, createdAtIso: string): DocBlock[] {
   return [
@@ -93,66 +94,16 @@ function buildCoreDocInitialBlocks(chatName: string, createdAtIso: string): DocB
       type: 'paragraph',
       text: `${chatName} · 由 Lark Loom 自动维护 · 创建于 ${createdAtIso}`,
     },
-
     { type: 'heading2', text: '🎯 项目 OKR' },
-    {
-      type: 'paragraph',
-      text: '（待补充。发送项目需求后，O / KR 会从需求文档中自动提取。）',
-    },
-
     { type: 'heading2', text: '一句话定义' },
-    {
-      type: 'paragraph',
-      text: '（待补充。需求文档生成后会自动填入项目核心价值描述。）',
-    },
-
     { type: 'heading2', text: '项目状态' },
-    {
-      type: 'paragraph',
-      text: `健康度：✅ 进行中 · 最后更新：${createdAtIso} · 这周重点：尚未明确`,
-    },
-
     { type: 'heading2', text: '项目背景与目标' },
-    {
-      type: 'paragraph',
-      text: '（待补充。需求文档生成后会综合成 100-150 字的项目叙述。）',
-    },
-
     { type: 'heading2', text: '关键决策' },
-    {
-      type: 'paragraph',
-      text: '（待补充。每次会议纪要识别到决策时，会综合成 ADR-style 段落，含「演变路径」。）',
-    },
-
     { type: 'heading2', text: '已交付产出' },
-    {
-      type: 'paragraph',
-      text: '（PRD / 演示 PPT / 汇报分工文稿 / 任务表生成后会自动列出。）',
-    },
-
     { type: 'heading2', text: '👥 干系人 / 团队' },
-    {
-      type: 'paragraph',
-      text: '（群成员列表 + 角色分配。可在群里 @bot 主动声明角色。）',
-    },
-
     { type: 'heading2', text: '⚠️ 阻塞与风险' },
-    {
-      type: 'paragraph',
-      text: '（任务被标 blocked 或会议纪要中识别到风险时自动汇总。）',
-    },
-
     { type: 'heading2', text: '📋 GRAI 复盘' },
-    {
-      type: 'paragraph',
-      text: '（项目结束触发归档时，按 Goal / Result / Analysis / Improvement 四段填入。）',
-    },
-
     { type: 'heading2', text: '最近动态' },
-    {
-      type: 'paragraph',
-      text: '（最近 10 条事件按时间正序排列。）',
-    },
   ];
 }
 
