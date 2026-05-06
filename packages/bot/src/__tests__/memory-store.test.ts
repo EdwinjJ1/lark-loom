@@ -611,3 +611,98 @@ describe('MemoryStore — 评分队列批量化', () => {
     if (result.ok) expect(result.value.importance).toBe(-1); // PENDING
   });
 });
+
+describe('MemoryStore — 写入前 LLM 提炼', () => {
+  it('content 超过 400 字节的纯文本会被 LLM 提炼后存入', async () => {
+    const bitable = new FakeBitable();
+    const longText = 'A'.repeat(401);
+    const summary = '这是摘要';
+    const llm = {
+      ask: vi.fn().mockResolvedValue(ok(summary)),
+      chat: vi.fn(),
+      askStructured: vi.fn().mockResolvedValue(ok({ importance: 5 })),
+      chatWithTools: vi.fn(),
+    } as unknown as LLMClient;
+
+    const store = new MemoryStore({ bitable, llm, scoreFlushMs: 100_000, now: () => 1000 });
+    const result = await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'k1',
+      content: longText,
+      source_skill: 'qa',
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.content).toBe(summary);
+    expect(llm.ask).toHaveBeenCalledOnce();
+  });
+
+  it('content 400 字节以内不触发提炼', async () => {
+    const bitable = new FakeBitable();
+    const shortText = '短文本';
+    const llm = {
+      ask: vi.fn(),
+      chat: vi.fn(),
+      askStructured: vi.fn().mockResolvedValue(ok({ importance: 5 })),
+      chatWithTools: vi.fn(),
+    } as unknown as LLMClient;
+
+    const store = new MemoryStore({ bitable, llm, scoreFlushMs: 100_000, now: () => 1000 });
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'k1',
+      content: shortText,
+      source_skill: 'qa',
+    });
+
+    expect(llm.ask).not.toHaveBeenCalled();
+  });
+
+  it('JSON 格式的 content 跳过提炼，直接存入', async () => {
+    const bitable = new FakeBitable();
+    const jsonContent = JSON.stringify({ skill: 'qa', output: 'A'.repeat(400), at: 123 });
+    const llm = {
+      ask: vi.fn(),
+      chat: vi.fn(),
+      askStructured: vi.fn().mockResolvedValue(ok({ importance: 5 })),
+      chatWithTools: vi.fn(),
+    } as unknown as LLMClient;
+
+    const store = new MemoryStore({ bitable, llm, scoreFlushMs: 100_000, now: () => 1000 });
+    const result = await store.write({
+      kind: 'skill_log',
+      chat_id: 'oc_1',
+      key: 'k1',
+      content: jsonContent,
+      source_skill: 'qa',
+    });
+
+    expect(result.ok).toBe(true);
+    expect(llm.ask).not.toHaveBeenCalled();
+  });
+
+  it('LLM 提炼失败时静默回退到原文', async () => {
+    const bitable = new FakeBitable();
+    const longText = 'B'.repeat(401);
+    const llm = {
+      ask: vi.fn().mockResolvedValue({ ok: false, error: { code: 'LLM_TIMEOUT', message: 'timeout' } }),
+      chat: vi.fn(),
+      askStructured: vi.fn().mockResolvedValue(ok({ importance: 5 })),
+      chatWithTools: vi.fn(),
+    } as unknown as LLMClient;
+
+    const store = new MemoryStore({ bitable, llm, scoreFlushMs: 100_000, now: () => 1000 });
+    const result = await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'k1',
+      content: longText,
+      source_skill: 'qa',
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.content).toBe(longText);
+  });
+});
