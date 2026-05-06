@@ -511,20 +511,19 @@ async function handleSchedule(
 // ─── 被动 memory 观察 ─────────────────────────────────────────────────────────
 //
 // 设计：非 @mention 的消息也可能含有值得长期记忆的事实（项目背景/PRD/分工/截止日期）。
-// 关键字门先粗筛，命中再调一个轻量 LLM（只暴露 memory.write 一个工具），不发任何回复。
+// 所有足够长的消息进 LLM Lite 判断；LLM 自主决定是否调 memory.write，不发任何回复。
 // 失败/超时静默 warn，不阻塞 SkillRouter 的主路径。
+//
+// 历史注：曾有关键字前置过滤（PASSIVE_MEMORY_KEYWORDS_RE）降低 LLM 调用量，
+// 但实测遗漏太多有价值消息（#109），故移除，改为长度门是唯一前置条件。
 
-const PASSIVE_MEMORY_KEYWORDS_RE =
-  /项目|需求|PRD|目标用户|背景|MVP|交付|deadline|截止|分工|负责|决定|确定|结论|文档/i;
-
-const PASSIVE_MIN_TEXT_LENGTH = 12;
+/** 消息至少要有这么多字符才值得进 LLM 判断（过滤"好""嗯""👍"等） */
+export const PASSIVE_MIN_TEXT_LENGTH = 12;
 
 const MEMORY_WRITE_TOOL_NAME = 'memory.write';
 
 export function shouldObservePassively(text: string): boolean {
-  // 太短的消息（"好的""嗯"）一律跳过
-  if (text.trim().length < PASSIVE_MIN_TEXT_LENGTH) return false;
-  return PASSIVE_MEMORY_KEYWORDS_RE.test(text);
+  return text.trim().length >= PASSIVE_MIN_TEXT_LENGTH;
 }
 
 async function handlePassiveObserve(
@@ -554,6 +553,8 @@ async function handlePassiveObserve(
     '你是一个静默的记忆观察者。读到的消息**不要回复用户**。\n' +
     '如果消息包含值得群组长期记住的事实（项目目标/用户群体/截止日期/分工/关键文档/重要决策），' +
     '调用 memory.write 写入；importance 只在很重要时（≥7）才指定。\n' +
+    'key 命名规范：用稳定的语义英文短语（snake_case），相同主题复用同一 key 实现覆盖更新，避免写重复条目。\n' +
+    '示例：截止日期 → "project_deadline"；分工 → "task_owner_<姓名拼音>"；项目目标 → "project_goal"。\n' +
     '若消息是闲聊/重复/没有事实信息，什么都不调，直接输出 SKIP。';
 
   const messages: ChatMessage[] = [
