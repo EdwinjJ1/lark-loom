@@ -25,7 +25,9 @@ import {
 } from './prompts/task-assignment.js';
 import { clamp } from './utils/clamp.js';
 
-const TRIGGER_RE = /负责|DDL|deadline|截止日期|截止时间|验收标准|交付物|分工/i;
+// 放宽：router 已经做过一道闸；这里只要疑似分工就交给 LLM 抽，抽不到 confidence>=0.5 自然 warn 静默
+const TRIGGER_RE =
+  /负责|DDL|deadline|截止|验收|交付物|分工|排期|跟进|盯一下|盯着|对接|安排一下|交给|派给|分给|让.{0,8}(?:来|去|做|搞|弄|写|盯|跟)|由.{0,8}(?:来|做|搞|负责)|.{1,8}来(?:搞|做|弄|写|跟进|对接|处理|盯|完成)|这块|这部分|那块/i;
 
 const MIN_CONFIDENCE = 0.5;
 const HISTORY_PAGE_SIZE = 20;
