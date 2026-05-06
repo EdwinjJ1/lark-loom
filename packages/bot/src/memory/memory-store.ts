@@ -237,10 +237,12 @@ export class MemoryStore implements IMemoryStore {
       if (embedResult.ok) {
         return this.semanticSearch(chatId, embedResult.value, opts.kind, limit);
       }
-      // embed 失败（如未配置模型）→ 静默降级，不打 error
-      this.logger?.warn('memory: embed failed, falling back to keyword search', {
-        code: embedResult.error.code,
-      });
+      // CONFIG_MISSING = 预期状态（未配置模型），不打 warn；其他错误才值得关注
+      if (embedResult.error.code !== 'CONFIG_MISSING') {
+        this.logger?.warn('memory: embed failed, falling back to keyword search', {
+          code: embedResult.error.code,
+        });
+      }
     }
 
     // 降级：关键词匹配
@@ -409,7 +411,7 @@ export class MemoryStore implements IMemoryStore {
       const embedResult = await this.llm.embed(content);
       if (embedResult.ok) {
         embedding = JSON.stringify(embedResult.value);
-      } else {
+      } else if (embedResult.error.code !== 'CONFIG_MISSING') {
         this.logger?.warn('memory: embed failed on write, skipping embedding', {
           code: embedResult.error.code,
         });
