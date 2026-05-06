@@ -315,13 +315,19 @@ function buildQa(input: QaCardInput): Card {
  * UI：议题 / 决策 / 待办 / 待跟进四段，强制可见
  */
 function buildSummary(input: SummaryCardInput): Card {
+  // 三态共用同一个模板色，仅 header 标题区分；与 slides 的「两态同色」保持一致
+  const HEADER_TEMPLATE = 'blue' as const;
+
   if (input.isLoading) {
     return card('summary', {
       schema: '2.0',
-      header: { title: pt('会议纪要整理中'), template: 'orange' },
+      header: { title: pt('会议纪要整理中'), template: HEADER_TEMPLATE },
       body: {
         elements: [
-          md(`**${input.title}**\n正在分析群历史并提取决策 / 行动项 / 遗留问题，预计 30-90 秒。`),
+          md(
+            `**${input.title}**\n\n正在分析群历史并提取决策 / 行动项 / 遗留问题，通常需要 30-90 秒。`,
+          ),
+          md('_我会从群聊上下文里提取关键信息，整理完会自动替换这条卡片。_'),
         ],
       },
     });
@@ -332,7 +338,7 @@ function buildSummary(input: SummaryCardInput): Card {
       schema: '2.0',
       header: { title: pt('会议纪要整理失败'), template: 'red' },
       body: {
-        elements: [md(`**${input.title}**\n${input.errorMessage}`)],
+        elements: [md(`**${input.title}**\n\n${input.errorMessage}`)],
       },
     });
   }
@@ -371,7 +377,7 @@ function buildSummary(input: SummaryCardInput): Card {
 
   return card('summary', {
     schema: '2.0',
-    header: { title: pt('会议 / 阶段总结'), template: 'green' },
+    header: { title: pt('会议纪要已就绪'), template: HEADER_TEMPLATE },
     body: { elements },
   });
 }

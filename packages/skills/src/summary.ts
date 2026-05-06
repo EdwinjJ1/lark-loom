@@ -239,6 +239,14 @@ export const summarySkill: Skill = {
         code: patchRes.error.code,
         message: patchRes.error.message,
       });
+    } else {
+      // Feishu 端 code=0 不一定真的更新视图（Card 2.0 patch 偶尔不生效）。
+      // 显式 log 让排查时能区分「patch 没调」/「patch 调了但 Feishu 未刷新」
+      ctx.logger.info('summary: patch final card returned ok', {
+        loadingMessageId,
+        decisions: summary.decisions.length,
+        actionItems: summary.actionItems.length,
+      });
     }
 
     // e. 副作用写入（失败不阻断卡片输出）
