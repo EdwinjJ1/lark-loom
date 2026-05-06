@@ -19,7 +19,7 @@ import type { Result } from './result.js';
 import type { DocxClient } from './docx.js';
 import type { SlidesClient } from './slides.js';
 
-/** 8 条主线对应的稳定字符串 ID */
+/** 业务主线对应的稳定字符串 ID */
 export type SkillName =
   | 'qa'
   | 'recall'
@@ -28,7 +28,9 @@ export type SkillName =
   | 'archive'
   | 'weekly'
   | 'requirementDoc' // 被动监听需求描述 → 生成结构化飞书文档
-  | 'docIterate'; // 持续监听对话 → 增量更新已有需求文档
+  | 'docIterate' // 持续监听对话 → 增量更新已有需求文档
+  | 'taskAssignment' // 分工讨论 → todo 表录入 + tablePush 卡片
+  | 'progressUpdate'; // 进展汇报 → 更新对应 todo 状态
 
 /** 触发条件描述（声明式，便于在 docs / debug UI 上展示） */
 export interface TriggerSpec {
