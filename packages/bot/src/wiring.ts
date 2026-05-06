@@ -539,6 +539,7 @@ export function shouldObservePassively(text: string): boolean {
 }
 
 const PROACTIVE_MIN_TEXT_LENGTH = 8;
+export const PROACTIVE_TIMEOUT_MS = 30_000;
 const PROACTIVE_SIGNAL_RE =
   /(?:怎么|如何|有没有|哪里|找不到|不确定|不清楚|缺|需要什么|先做什么|下一步|资料|文档|链接|方案|规则|标准|口径|背景|参考|帮忙看看|卡住|blocked)/i;
 
@@ -677,7 +678,7 @@ async function handleProactiveLayer(
     executor,
     maxToolCallRounds: 3,
     model: 'lite',
-    timeoutMs: 600_000,
+    timeoutMs: PROACTIVE_TIMEOUT_MS,
   });
 
   if (!result.ok) {

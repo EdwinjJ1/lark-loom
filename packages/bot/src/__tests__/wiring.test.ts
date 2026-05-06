@@ -12,6 +12,7 @@ import type {
 import { SkillRouter } from '../skill-router.js';
 import {
   handleEvent,
+  PROACTIVE_TIMEOUT_MS,
   shouldConsiderProactive,
   shouldObservePassively,
   PASSIVE_MIN_TEXT_LENGTH,
@@ -874,10 +875,16 @@ describe('handleEvent — proactive layer', () => {
 
     expect(chatWithTools).toHaveBeenCalledOnce();
     const [, opts] = chatWithTools.mock.calls[0]!;
-    const toolNames = (opts as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+    const callOptions = opts as {
+      tools: Array<{ name: string }>;
+      timeoutMs: number;
+    };
+    const toolNames = callOptions.tools.map((t) => t.name);
     expect(toolNames.sort()).toEqual(['memory.search', 'skill.list', 'skill.read']);
     expect(toolNames).not.toContain('memory.write');
     expect(toolNames).not.toContain('decision.write');
+    expect(callOptions.timeoutMs).toBe(PROACTIVE_TIMEOUT_MS);
+    expect(callOptions.timeoutMs).toBeLessThanOrEqual(30_000);
     expect(runtime.sendText).toHaveBeenCalledWith({
       chatId: 'oc_chat1',
       text: '我找到一条相关资料：项目 PRD 在飞书文档里，先看“验收标准”那节。',
