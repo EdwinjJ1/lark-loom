@@ -74,6 +74,23 @@ interface PendingScore {
 // ---------- 工具函数 ----------
 
 /**
+ * 余弦相似度：两个等长浮点向量的点积除以模长之积。
+ * 两向量之一全零时返回 0（避免除零 NaN）。
+ */
+export function cosineSimilarity(a: readonly number[], b: readonly number[]): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    normA += a[i]! * a[i]!;
+    normB += b[i]! * b[i]!;
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom < 1e-10 ? 0 : dot / denom;
+}
+
+/**
  * 按 UTF-8 字节数硬截断；不会撕裂 UTF-8 多字节字符。
  * 实现：用 strict decoder 二分回退到最后一个合法字符边界。
  */
@@ -90,6 +107,10 @@ function truncateBytes(s: string, maxBytes: number): string {
     }
   }
   return ''; // 极端边界（maxBytes < 4）
+}
+
+function matchesKeyword(memory: Pick<MemoryRecord, 'content' | 'raw'>, query: string): boolean {
+  return memory.content.includes(query) || memory.raw?.includes(query) === true;
 }
 
 /**
@@ -190,9 +211,16 @@ export class MemoryStore implements IMemoryStore {
   // ─────────────────────────── search ───────────────────────────
 
   /**
-   * 按 chat_id + 关键词模糊查询。
-   * filter 用飞书 CurrentValue.[content].contains("keyword") 语法。
-   * 命中后批量刷新 last_access（异步，不阻塞返回）。
+   * 语义搜索：优先用 embedding 向量余弦相似度；LLM 无 embedding 能力时降级到关键词匹配。
+   *
+   * 语义路径：
+   *   1. 生成 query embedding
+   *   2. 拉取该 chat 全量记录（≤200 条）
+   *   3. 对有 embedding 的记录做余弦相似度排序，返回 top-N
+   *   4. 相似度 < 0.3 的记录剪掉（低相关性噪声）
+   *
+   * 降级路径（LLM 未配置 / embed 调用失败）：
+   *   - 飞书 filter content.contains("keyword") 字符串匹配
    */
   async search(
     chatId: string,
@@ -203,14 +231,99 @@ export class MemoryStore implements IMemoryStore {
     if (!v.ok) return v;
 
     const safeQuery = this.sanitizeQuery(query);
-    if (!safeQuery) {
-      // 全空 query 没意义；返回空列表而非全表扫描
-      return ok([]);
-    }
+    if (!safeQuery) return ok([]);
 
     const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
-    const filter = this.buildSearchFilter(chatId, safeQuery, opts.kind);
 
+    // 尝试语义路径
+    if (this.llm) {
+      const embedResult = await this.llm.embed(safeQuery);
+      if (embedResult.ok) {
+        return this.semanticSearch(chatId, safeQuery, embedResult.value, opts.kind, limit);
+      }
+      // CONFIG_MISSING = 预期状态（未配置模型），不打 warn；其他错误才值得关注
+      if (embedResult.error.code !== 'CONFIG_MISSING') {
+        this.logger?.warn('memory: embed failed, falling back to keyword search', {
+          code: embedResult.error.code,
+        });
+      }
+    }
+
+    // 降级：关键词匹配
+    return this.keywordSearch(chatId, safeQuery, opts.kind, limit);
+  }
+
+  private async semanticSearch(
+    chatId: string,
+    query: string,
+    queryVec: readonly number[],
+    kind: MemoryKind | undefined,
+    limit: number,
+  ): Promise<Result<readonly MemoryRecord[]>> {
+    // 拉取该 chat 全量记录（最多 MEMORY_MAX_PER_CHAT_KIND=200 条，单页够）
+    const filter = this.buildFilter(
+      kind ? { chat_id: chatId, kind } : { chat_id: chatId },
+    );
+    const findResult = await this.bitable.find({
+      table: MEMORY_TABLE,
+      filter,
+      pageSize: MEMORY_MAX_PER_CHAT_KIND,
+    });
+    if (!findResult.ok) return findResult;
+
+    const SIMILARITY_THRESHOLD = 0.3;
+
+    const scored: Array<{ memory: MemoryRecord; score: number }> = [];
+    const keywordFallback: MemoryRecord[] = [];
+
+    for (const row of findResult.value.records) {
+      const memory = this.rowToMemory(row);
+      if (typeof memory.embedding === 'string' && memory.embedding) {
+        try {
+          const vec = JSON.parse(memory.embedding) as number[];
+          const score = cosineSimilarity(queryVec, vec);
+          if (score >= SIMILARITY_THRESHOLD) scored.push({ memory, score });
+        } catch {
+          // embedding 字段损坏，走关键词兜底，避免旧/坏数据在语义模式下完全不可见
+          if (matchesKeyword(memory, query)) keywordFallback.push(memory);
+        }
+      } else if (matchesKeyword(memory, query)) {
+        // embedding 上线前的旧记录没有向量，仍用关键词兜底参与召回。
+        keywordFallback.push(memory);
+      }
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    const semanticResults = scored.slice(0, limit).map((s) => s.memory);
+    const seenKeys = new Set(semanticResults.map((m) => `${m.kind}:${m.chat_id}:${m.key}`));
+    const fallbackResults = keywordFallback
+      .filter((m) => !seenKeys.has(`${m.kind}:${m.chat_id}:${m.key}`))
+      .slice(0, Math.max(0, limit - semanticResults.length));
+    const results = [...semanticResults, ...fallbackResults];
+
+    void Promise.all(
+      results
+        .filter((m) => m.id)
+        .map((m) =>
+          this.touchAccess(m.id!).catch((e) => {
+            this.logger?.warn('memory: touchAccess failed in search', {
+              recordId: m.id,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }),
+        ),
+    );
+
+    return ok(results);
+  }
+
+  private async keywordSearch(
+    chatId: string,
+    query: string,
+    kind: MemoryKind | undefined,
+    limit: number,
+  ): Promise<Result<readonly MemoryRecord[]>> {
+    const filter = this.buildSearchFilter(chatId, query, kind);
     const findResult = await this.bitable.find({
       table: MEMORY_TABLE,
       filter,
@@ -219,7 +332,6 @@ export class MemoryStore implements IMemoryStore {
     if (!findResult.ok) return findResult;
 
     const memories = findResult.value.records.map((r) => this.rowToMemory(r));
-    // 批量刷新 last_access
     void Promise.all(
       findResult.value.records.map((r) =>
         this.touchAccess(r.recordId).catch((e) => {
@@ -298,6 +410,19 @@ export class MemoryStore implements IMemoryStore {
     // 提炼后内容与原文不同时保留原文，供查阅还原
     const raw = summarized !== input.content ? input.content : undefined;
 
+    // 异步生成 embedding（失败时静默跳过，不阻断写入）
+    let embedding: string | undefined;
+    if (this.llm) {
+      const embedResult = await this.llm.embed(content);
+      if (embedResult.ok) {
+        embedding = JSON.stringify(embedResult.value);
+      } else if (embedResult.error.code !== 'CONFIG_MISSING') {
+        this.logger?.warn('memory: embed failed on write, skipping embedding', {
+          code: embedResult.error.code,
+        });
+      }
+    }
+
     // 查现有
     const existing = await this.read(input.kind, input.chat_id, input.key);
     if (!existing.ok) return existing;
@@ -311,18 +436,27 @@ export class MemoryStore implements IMemoryStore {
           content,
           last_access: now,
           raw: raw ?? '',
+          embedding: embedding ?? '',
           ...(input.importance !== undefined && { importance: input.importance }),
         },
       });
       if (!updateResult.ok) return updateResult;
-      const { raw: _previousRaw, ...existingWithoutRaw } = existing.value;
+      const {
+        raw: _previousRaw,
+        embedding: _previousEmbedding,
+        ...existingWithoutRaw
+      } = existing.value;
       const updated: MemoryRecord = {
         ...existingWithoutRaw,
         content,
         last_access: now,
         ...(input.importance !== undefined && { importance: input.importance }),
       };
-      return ok(raw !== undefined ? { ...updated, raw } : updated);
+      return ok({
+        ...updated,
+        ...(raw !== undefined && { raw }),
+        ...(embedding !== undefined && { embedding }),
+      });
     }
 
     // 新增
@@ -339,6 +473,7 @@ export class MemoryStore implements IMemoryStore {
     };
     if (input.user_id !== undefined) row.user_id = input.user_id;
     if (raw !== undefined) row.raw = raw;
+    if (embedding !== undefined) row.embedding = embedding;
 
     const insertResult = await this.bitable.insert({ table: MEMORY_TABLE, row });
     if (!insertResult.ok) return insertResult;
@@ -355,6 +490,7 @@ export class MemoryStore implements IMemoryStore {
       source_skill: input.source_skill,
       ...(input.user_id !== undefined && { user_id: input.user_id }),
       ...(raw !== undefined && { raw }),
+      ...(embedding !== undefined && { embedding }),
     };
 
     // 评分队列（仅未指定 importance 且 LLM 可用时）
@@ -623,6 +759,7 @@ export class MemoryStore implements IMemoryStore {
       key: String(row.key ?? ''),
       content: String(row.content ?? ''),
       ...(typeof row.raw === 'string' && row.raw ? { raw: row.raw } : {}),
+      ...(typeof row.embedding === 'string' && row.embedding ? { embedding: row.embedding } : {}),
       importance: typeof row.importance === 'number' ? row.importance : MEMORY_PENDING_SCORE,
       last_access: typeof row.last_access === 'number' ? row.last_access : 0,
       created_at: typeof row.created_at === 'number' ? row.created_at : 0,
