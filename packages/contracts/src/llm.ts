@@ -125,4 +125,11 @@ export interface LLMClient {
     messages: readonly ChatMessage[],
     opts: ChatWithToolsOptions,
   ): Promise<Result<ChatWithToolsResult>>;
+
+  /**
+   * 向量化单条文本（Embedding）。
+   * 返回浮点数组，维度由模型决定（Doubao text-embedding-3 为 2048 维）。
+   * 不支持 embedding 的实现应返回 CONFIG_MISSING err，调用方据此降级。
+   */
+  embed(text: string): Promise<Result<readonly number[]>>;
 }

@@ -103,6 +103,7 @@ const llm: LLMClient = {
       rounds: 1,
     });
   },
+  embed: async () => ok([] as readonly number[]),
 };
 
 const logger = {

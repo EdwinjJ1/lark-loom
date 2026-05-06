@@ -67,6 +67,7 @@ describe('clampKeyPart()', () => {
   it('strips control characters', () => {
     const withCtrl = `name${String.fromCharCode(0x07)}_${String.fromCharCode(0x1f)}`;
     const out = clampKeyPart(withCtrl);
+    // eslint-disable-next-line no-control-regex -- intentionally testing control char stripping
     expect(out).not.toMatch(/[\x00-\x1f]/);
   });
 

@@ -10,7 +10,7 @@ import type {
   SkillName,
 } from '@seedhac/contracts';
 import { SkillRouter } from '../skill-router.js';
-import { handleEvent, type HarnessConfig } from '../wiring.js';
+import { handleEvent, shouldObservePassively, PASSIVE_MIN_TEXT_LENGTH, type HarnessConfig } from '../wiring.js';
 import { NullMemoryStore } from '../memory/memory-store.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -48,7 +48,11 @@ function makeRuntime(): BotRuntime {
   } as unknown as BotRuntime;
 }
 
-function makeCtx(event: BotEvent, runtimeOverride?: BotRuntime): SkillContext {
+function makeCtx(
+  event: BotEvent,
+  runtimeOverride?: BotRuntime,
+  llmOverride?: Partial<SkillContext['llm']>,
+): SkillContext {
   return {
     event,
     runtime: runtimeOverride ?? makeRuntime(),
@@ -57,6 +61,8 @@ function makeCtx(event: BotEvent, runtimeOverride?: BotRuntime): SkillContext {
       chat: vi.fn(),
       askStructured: vi.fn(),
       chatWithTools: vi.fn(),
+      embed: vi.fn(),
+      ...llmOverride,
     } as unknown as SkillContext['llm'],
     bitable: {
       insert: vi.fn().mockResolvedValue(ok({ tableId: 't', recordId: 'r' })),
@@ -711,5 +717,113 @@ describe('onboarding flow', () => {
 
     // patchCard 挂了，但 audit memory 仍然写入
     expect(ctx.bitable.insert).toHaveBeenCalledOnce();
+  });
+});
+
+// ─── shouldObservePassively ───────────────────────────────────────────────────
+
+describe('shouldObservePassively', () => {
+  it('长度达标的普通对话消息应被观察', () => {
+    expect(shouldObservePassively('我们明天把这个功能做完吧')).toBe(true);
+  });
+
+  it('不含关键字但有事实信息的消息也应被观察', () => {
+    expect(shouldObservePassively('小明你来写登录页，小红负责接口')).toBe(true);
+  });
+
+  it('恰好等于最小长度的消息应被观察', () => {
+    const text = 'a'.repeat(PASSIVE_MIN_TEXT_LENGTH);
+    expect(shouldObservePassively(text)).toBe(true);
+  });
+
+  it('过短的消息（闲聊/表情）应被跳过', () => {
+    expect(shouldObservePassively('好的')).toBe(false);
+    expect(shouldObservePassively('👍')).toBe(false);
+    expect(shouldObservePassively('ok')).toBe(false);
+  });
+
+  it('纯空白消息应被跳过', () => {
+    expect(shouldObservePassively('   ')).toBe(false);
+  });
+
+  it('trim 后长度不足的消息应被跳过', () => {
+    const padded = '   ' + 'a'.repeat(PASSIVE_MIN_TEXT_LENGTH - 1) + '   ';
+    expect(shouldObservePassively(padded)).toBe(false);
+  });
+});
+
+// ─── handlePassiveObserve（通过 handleEvent 集成） ────────────────────────────
+
+describe('handleEvent — passive observe', () => {
+  const router = new SkillRouter(BOT_ID);
+
+  it('非 @mention 长消息触发 LLM 判断', async () => {
+    const msg = makeMessage({ text: '我们决定下周五提交MVP，前端由小明负责', mentions: [] });
+    const chatWithTools = vi.fn().mockResolvedValue(ok({ content: 'SKIP', toolCalls: [], rounds: 1 }));
+    const ctx = makeCtx(makeEvent(msg), undefined, { chatWithTools });
+
+    await handleEvent(ctx, router, {}, makeHarness());
+    await new Promise((r) => setTimeout(r, 0)); // flush fire-and-forget
+
+    expect(chatWithTools).toHaveBeenCalledOnce();
+  });
+
+  it('非 @mention 短消息不触发 LLM 判断', async () => {
+    const msg = makeMessage({ text: '好的', mentions: [] });
+    const chatWithTools = vi.fn().mockResolvedValue(ok({ content: '', toolCalls: [], rounds: 0 }));
+    const ctx = makeCtx(makeEvent(msg), undefined, { chatWithTools });
+
+    await handleEvent(ctx, router, {}, makeHarness());
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(chatWithTools).not.toHaveBeenCalled();
+  });
+
+  it('LLM 决定调 memory.write 时写入 store', async () => {
+    const msg = makeMessage({ text: '项目截止日期确定是5月15日，请各位注意', mentions: [] });
+
+    const memoryStore = new NullMemoryStore();
+    const writeSpy = vi.spyOn(memoryStore, 'write').mockResolvedValue(
+      ok({ id: 'r1', kind: 'chat', chat_id: 'oc_chat1', key: 'project_deadline',
+           content: '截止5月15日', importance: -1, last_access: 0, created_at: 0, source_skill: 'passive_observe' }),
+    );
+
+    const chatWithTools = vi.fn().mockImplementation(
+      async (_msgs: unknown, opts: { executor: (c: { id: string; name: string; argumentsRaw: string }) => Promise<unknown> }) => {
+        await opts.executor({ id: 'tc1', name: 'memory.write',
+          argumentsRaw: JSON.stringify({ kind: 'chat', key: 'project_deadline', content: '截止5月15日' }) });
+        return ok({ content: '', toolCalls: [{ id: 'tc1', name: 'memory.write', argumentsRaw: '{}' }], rounds: 1 });
+      },
+    );
+
+    const ctx = makeCtx(makeEvent(msg), undefined, { chatWithTools });
+    const harness = { ...makeHarness(), memoryStore };
+
+    await handleEvent(ctx, router, {}, harness);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(writeSpy).toHaveBeenCalledOnce();
+    expect(writeSpy).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'chat',
+      key: 'project_deadline',
+      source_skill: 'passive_observe',
+    }));
+  });
+
+  it('@mention 消息不走 passive observe 路径', async () => {
+    // @mention 走 Harness，不走 passive observe；chatWithTools 被 Harness 调，不是 passive observe
+    const msg = makeMessage({ text: '我们决定下周五提交MVP，前端由小明负责',
+      mentions: [{ user: { userId: BOT_ID }, key: '@_bot' }] });
+    const chatWithTools = vi.fn().mockResolvedValue(
+      ok({ content: JSON.stringify({ skill: 'silent' }), toolCalls: [], rounds: 1 }),
+    );
+    const ctx = makeCtx(makeEvent(msg), undefined, { chatWithTools });
+
+    await handleEvent(ctx, router, {}, makeHarness());
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Harness 可能调 chatWithTools，但 passive observe 不应额外再调一次
+    // 每条 @mention 消息 chatWithTools 调用次数 ≤ 1（只有 Harness，没有 passive observe）
+    expect(chatWithTools.mock.calls.length).toBeLessThanOrEqual(1);
   });
 });
