@@ -88,6 +88,9 @@ function summarize(value: string, max = 200): string {
 /**
  * 用 lite 模型预筛历史 — 群里可能掺多个项目讨论 / bot 诊断噪音。
  * 失败时降级为原 history（不致命）。
+ *
+ * 触发消息（trigger）100% 保留，不进 candidates —— 否则 lite 容易按
+ * "重复触发消息"规则把它丢了（参考 requirement-doc 同款修复）。
  */
 async function filterByRelevance(
   ctx: SkillContext,
@@ -96,7 +99,10 @@ async function filterByRelevance(
 ): Promise<readonly Message[]> {
   if (history.length <= 5) return history;
 
-  const candidates: RelevanceCandidate[] = history.map((m, i) => ({
+  const judgable = history.filter((m) => m.messageId !== trigger.messageId);
+  if (judgable.length === 0) return history;
+
+  const candidates: RelevanceCandidate[] = judgable.map((m, i) => ({
     id: `m${i}`,
     kind: 'message',
     excerpt: `[${m.sender.name ?? m.sender.userId}] ${summarize(m.text, 200)}`,
@@ -119,10 +125,17 @@ async function filterByRelevance(
   if (judgmentResult.value.results.length === 0) return history;
 
   const keepIds = new Set(judgmentResult.value.results.filter((r) => r.keep).map((r) => r.id));
-  const kept = history.filter((_, i) => keepIds.has(`m${i}`));
+  const keptJudgable = judgable.filter((_, i) => keepIds.has(`m${i}`));
+  // 触发消息永远保留 + 按 history 原顺序保时间序
+  const keptSet = new Set<Message>([
+    ...history.filter((m) => m.messageId === trigger.messageId),
+    ...keptJudgable,
+  ]);
+  const kept = history.filter((m) => keptSet.has(m));
 
   ctx.logger.info('summary: relevance pre-filter done', {
     kept: `${kept.length}/${history.length}`,
+    judgableKept: `${keptJudgable.length}/${judgable.length}`,
   });
 
   // 如果筛完几乎全没了，可能是模型误判：保底退回原 history

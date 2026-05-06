@@ -118,7 +118,17 @@ async function filterByRelevance(
     return { history, linkedDocs };
   }
 
-  const candidates: RelevanceCandidate[] = natives.map((m, i) => ({
+  // 触发消息本身是用户当前显式输入，跟 forwarded / linkedDocs 同等地位 —— 100% 保留，
+  // 不进 lite 模型 candidates，否则 lite 容易按"重复触发消息"规则把它丢了（实战 bug：
+  // 触发消息被丢掉时整个 history 变 0/N，pro 模型拿到空 prompt，输出空文档）
+  const judgable = natives.filter((m) => m.messageId !== trigger.messageId);
+
+  // 没有非触发候选可筛 → 直接返回全量
+  if (judgable.length === 0) {
+    return { history, linkedDocs };
+  }
+
+  const candidates: RelevanceCandidate[] = judgable.map((m, i) => ({
     id: `m${i}`,
     kind: 'message',
     excerpt: `[${m.sender.name ?? m.sender.userId}] ${summarize(m.text, 200)}`,
@@ -126,9 +136,10 @@ async function filterByRelevance(
 
   ctx.logger.info('requirementDoc: relevance pre-filter', {
     nativeCount: natives.length,
+    judgableCount: judgable.length,
     forwardedCount: forwarded.length,
     linkedDocCount: linkedDocs.length,
-    note: 'forwarded + linkedDocs are always kept; lite filter only judges native messages',
+    note: 'trigger + forwarded + linkedDocs are always kept; lite only judges other natives',
   });
 
   const judgmentResult = await ctx.llm.askStructured(
@@ -152,15 +163,20 @@ async function filterByRelevance(
   }
 
   const keepIds = new Set(judgmentResult.value.results.filter((r) => r.keep).map((r) => r.id));
-  const keptNatives = natives.filter((_, i) => keepIds.has(`m${i}`));
+  const keptJudgable = judgable.filter((_, i) => keepIds.has(`m${i}`));
 
-  // 把「保留的原生」+「全部 forwarded」按 history 原顺序组合，保证时间序正确
+  // 触发消息 + 保留的判定项 + 全部 forwarded（按 history 原顺序保时间序）
+  const keptNativesSet = new Set<Message>([
+    ...natives.filter((m) => m.messageId === trigger.messageId),
+    ...keptJudgable,
+  ]);
   const keptHistory = history.filter(
-    (m) => forwardedIds.has(m.messageId) || keptNatives.includes(m),
+    (m) => forwardedIds.has(m.messageId) || keptNativesSet.has(m),
   );
 
   ctx.logger.info('requirementDoc: relevance pre-filter done', {
-    nativeKept: `${keptNatives.length}/${natives.length}`,
+    nativeKept: `${keptNativesSet.size}/${natives.length}`,
+    judgableKept: `${keptJudgable.length}/${judgable.length}`,
     forwardedKept: `${forwarded.length}/${forwarded.length} (always kept)`,
     linkedDocKept: `${linkedDocs.length}/${linkedDocs.length} (always kept)`,
   });
