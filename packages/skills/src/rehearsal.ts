@@ -112,10 +112,16 @@ export async function loadRehearsalSession(
     return parseSession(res.value.content);
   }
   // 兜底：直接 bitable.find（测试时 memoryStore 可能未注入）
+  // 拉 50 条按 created_at 取最新一条；防止 saveSession fallback 重复 insert 后旧 session 被读到
   const filter = `AND(CurrentValue.[chat_id]="${chatId}",CurrentValue.[key]="${SESSION_KEY}",CurrentValue.[kind]="skill_log")`;
-  const findRes = await ctx.bitable.find({ table: 'memory', filter, pageSize: 1 });
+  const findRes = await ctx.bitable.find({ table: 'memory', filter, pageSize: 50 });
   if (!findRes.ok || findRes.value.records.length === 0) return null;
-  return parseSession(String(findRes.value.records[0]!['content'] ?? ''));
+  const newest = [...findRes.value.records].sort((a, b) => {
+    const ta = Number(a['created_at'] ?? 0);
+    const tb = Number(b['created_at'] ?? 0);
+    return tb - ta;
+  })[0]!;
+  return parseSession(String(newest['content'] ?? ''));
 }
 
 function parseSession(content: string): RehearsalSession | null {
@@ -169,9 +175,27 @@ async function saveSession(
     }
     return;
   }
-  // 兜底：直接 bitable.insert（无 upsert，靠 find + update 不优雅；先粗暴 insert 容忍重复）
+  // 兜底：bitable upsert — 先 find 现有 record，找到就 update，否则 insert
+  // 之前的"粗暴 insert 容忍重复"会让 5 轮 session 留 5 行，loadRehearsalSession 可能拿到旧 row
   const now = Date.now();
-  const res = await ctx.bitable.insert({
+  const filter = `AND(CurrentValue.[chat_id]="${chatId}",CurrentValue.[key]="${SESSION_KEY}",CurrentValue.[kind]="skill_log")`;
+  const findRes = await ctx.bitable.find({ table: 'memory', filter, pageSize: 1 });
+  if (findRes.ok && findRes.value.records.length > 0) {
+    const recordId = findRes.value.records[0]!.recordId;
+    const updateRes = await ctx.bitable.update({
+      table: 'memory',
+      recordId,
+      patch: { content, last_access: now },
+    });
+    if (!updateRes.ok) {
+      ctx.logger.warn('rehearsal: save session update failed', {
+        chatId,
+        error: updateRes.error.message,
+      });
+    }
+    return;
+  }
+  const insertRes = await ctx.bitable.insert({
     table: 'memory',
     row: {
       kind: 'skill_log',
@@ -184,10 +208,10 @@ async function saveSession(
       source_skill: 'rehearsal',
     },
   });
-  if (!res.ok) {
+  if (!insertRes.ok) {
     ctx.logger.warn('rehearsal: save session insert failed', {
       chatId,
-      error: res.error.message,
+      error: insertRes.error.message,
     });
   }
 }
