@@ -1,4 +1,7 @@
 import { execFile as execFileCallback } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   ErrorCode,
@@ -30,12 +33,20 @@ export interface LarkSlidesClientOptions {
 
 export class LarkSlidesClient implements SlidesClient {
   private readonly bin: string;
+  private readonly binArgs: readonly string[];
   private readonly as: 'user' | 'bot';
   private readonly baseUrl: string;
   private readonly execFile: ExecFile;
 
   constructor(options: LarkSlidesClientOptions = {}) {
-    this.bin = options.bin ?? 'lark-cli';
+    const resolvedBin = options.bin ?? 'lark-cli';
+    if (resolvedBin.endsWith('.js')) {
+      this.bin = process.execPath;
+      this.binArgs = [resolvedBin];
+    } else {
+      this.bin = resolvedBin;
+      this.binArgs = [];
+    }
     // 默认用 bot 身份：bot 创建 = bot owns，可直接给团队成员授权，
     // 无需任何人登录 lark-cli 也无需补 user OAuth scope。lark-cli 在
     // bot 模式下还会自动把当前 cli 登录用户加为 full_access。
@@ -56,6 +67,7 @@ export class LarkSlidesClient implements SlidesClient {
       const { stdout, stderr } = await this.execFile(
         this.bin,
         [
+          ...this.binArgs,
           'slides',
           '+create',
           '--as',
@@ -97,6 +109,7 @@ export class LarkSlidesClient implements SlidesClient {
         const { stdout, stderr } = await this.execFile(
           this.bin,
           [
+            ...this.binArgs,
             'drive',
             'permission.members',
             'create',
@@ -422,12 +435,28 @@ function extractTokenFromUrl(url: string): string | undefined {
   return url.match(/\/slides\/([A-Za-z0-9_-]+)/)?.[1];
 }
 
+export function resolveLarkCliBin(): string {
+  const fromEnv = process.env['LARK_CLI_BIN'];
+  if (fromEnv) return fromEnv;
+
+  try {
+    const require = createRequire(import.meta.url);
+    const pkgPath = require.resolve('@larksuite/cli/package.json');
+    const binRelative = join(dirname(pkgPath), 'scripts', 'run.js');
+    if (existsSync(binRelative)) return binRelative;
+  } catch {
+    // fall through to PATH lookup
+  }
+
+  return 'lark-cli';
+}
+
 export function createSlidesClient(): LarkSlidesClient {
-  const bin = process.env['LARK_CLI_BIN'];
+  const bin = resolveLarkCliBin();
   const as = process.env['LARK_SLIDES_CLI_AS'];
   const baseUrl = process.env['LARK_SLIDES_BASE_URL'];
   return new LarkSlidesClient({
-    ...(bin && { bin }),
+    bin,
     ...(as === 'bot' || as === 'user' ? { as } : {}),
     ...(baseUrl && { baseUrl }),
   });
