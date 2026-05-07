@@ -22,7 +22,7 @@ import {
 } from '@seedhac/contracts';
 import { GapDetector, type GapDetection } from './gap-detector.js';
 
-const KEYWORDS = ['上次', '之前', '我记得', '那个', '上回', '是多少来着'] as const;
+const KEYWORDS = ['上次', '之前', '我记得', '那个', '上回', '是多少来着', '负责什么', '做什么', '什么时候', '是谁', 'DDL'] as const;
 
 async function synthesize(
   llm: LLMClient,
@@ -68,13 +68,8 @@ class RecallSkill implements Skill {
 
     if (!KEYWORDS.some((k) => msg.text.includes(k))) return false;
 
-    const histResult = await ctx.runtime.fetchHistory({ chatId: msg.chatId, pageSize: 10 });
-    const fetched = histResult.ok ? histResult.value.messages : [];
-    const hasCurrent = fetched.some((m) => m.messageId === msg.messageId);
-    const messages = hasCurrent ? fetched : [msg, ...fetched];
-
     const detector = new GapDetector(ctx.llm);
-    const gapResult = await detector.detect(messages);
+    const gapResult = await detector.detect([msg]);
     if (!gapResult.ok || !gapResult.value.shouldRecall) return false;
 
     const detection = gapResult.value;
