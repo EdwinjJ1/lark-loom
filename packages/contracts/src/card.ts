@@ -22,6 +22,8 @@ export type CardTemplateName =
   | 'summary' // 会议 / 阶段总结
   | 'slides' // 演示文稿生成
   | 'archive' // 项目归档
+  | 'rehearsal' // 演练复盘分析（issues / suggestions / uncertainties）
+  | 'rehearsalClarify' // 演练反问澄清（循环到用户满意）
   // ── 附属链路 ────────────────────────────────
   | 'offlineSummary' // 用户重连后的离线期间摘要
   | 'docChange' // 重要文档变更通知
@@ -155,6 +157,61 @@ export interface ArchiveCardInput {
   readonly errorMessage?: string;
 }
 
+// ── 演练复盘 Input ────────────────────────────────────────────────────────────
+
+/** 五维评估（参考字节『坦诚清晰』 + 麦肯锡金字塔 + 飞书赛道权重） */
+export type RehearsalDimensionLabel = '内容' | '结构' | '表达' | '受众' | '时间' | '其他';
+
+/** 一条带维度的反馈条目（issue / suggestion 通用） */
+export interface RehearsalDimensionedItem {
+  readonly text: string;
+  readonly dimension: RehearsalDimensionLabel;
+}
+
+/**
+ * 演练分析卡（template: rehearsal）—— 四态：
+ *   - loading：拉历史 / 跑分析中
+ *   - active：列 issues / suggestions（按维度分组） / uncertainties + 满意/继续修改 按钮
+ *   - completed：用户点"满意，完成"后的终态，附产出物链接
+ *   - error：分析失败
+ */
+export interface RehearsalCardInput {
+  /** 第几轮分析（从 1 开始） */
+  readonly round: number;
+  /** 演示中存在的问题（带维度，用于分组渲染） */
+  readonly issues: readonly RehearsalDimensionedItem[];
+  /** 修改建议（带维度） */
+  readonly suggestions: readonly RehearsalDimensionedItem[];
+  /** 信心不足 / 需要用户确认的不确定点 */
+  readonly uncertainties: readonly string[];
+  /** 一句话总览（80-120 字） */
+  readonly summary?: string;
+  readonly chatId?: string;
+  /** 满意态：附产出物链接（PPT / 文档） */
+  readonly newSlidesUrl?: string;
+  readonly newDocUrl?: string;
+  readonly noRegenReason?: 'noChanges' | 'regenFailed';
+  readonly isLoading?: boolean;
+  readonly isCompleted?: boolean;
+  readonly errorMessage?: string;
+}
+
+/**
+ * 反问澄清卡（template: rehearsalClarify）—— 把 uncertainties 转成 1-3 个问题，
+ * 等用户在群里直接文字回复（不是按钮）。
+ *   - active：列出反问问题
+ *   - acknowledged：用户回复后 patch 成"已收到反馈，重新分析中…"
+ */
+export interface RehearsalClarifyCardInput {
+  readonly round: number;
+  /** 1-3 个具体问题 */
+  readonly questions: readonly string[];
+  readonly chatId?: string;
+  /** 已收到回答态 */
+  readonly acknowledgedAt?: number;
+  readonly errorMessage?: string;
+}
+
 // ── 附属链路 Input ────────────────────────────────────────────────────────────
 
 export interface OfflineSummaryCardInput {
@@ -204,6 +261,8 @@ export interface CardInputMap {
   summary: SummaryCardInput;
   slides: SlidesCardInput;
   archive: ArchiveCardInput;
+  rehearsal: RehearsalCardInput;
+  rehearsalClarify: RehearsalClarifyCardInput;
   offlineSummary: OfflineSummaryCardInput;
   docChange: DocChangeCardInput;
   weekly: WeeklyCardInput;

@@ -5,6 +5,7 @@ import { docIterateSkill } from './doc-iterate.js';
 import { progressUpdateSkill } from './progress-update.js';
 import { qaSkill } from './qa.js';
 import { recallSkill } from './recall.js';
+import { rehearsalSkill } from './rehearsal.js';
 import { requirementDocSkill } from './requirement-doc.js';
 import { slidesSkill } from './slides.js';
 import { summarySkill } from './summary.js';
@@ -16,6 +17,15 @@ export { docIterateSkill } from './doc-iterate.js';
 export { progressUpdateSkill } from './progress-update.js';
 export { qaSkill } from './qa.js';
 export { recallSkill } from './recall.js';
+export {
+  rehearsalSkill,
+  loadRehearsalSession,
+  isSatisfactionSignal,
+  isFreshTrigger,
+  isAwaitingUserResponse,
+  REHEARSAL_SESSION_KEY,
+} from './rehearsal.js';
+export type { RehearsalSession, RehearsalPhase } from './rehearsal.js';
 export { requirementDocSkill } from './requirement-doc.js';
 export { slidesSkill } from './slides.js';
 export { summarySkill } from './summary.js';
@@ -33,6 +43,7 @@ const registeredSkills: readonly Skill[] = [
   docIterateSkill,
   taskAssignmentSkill,
   progressUpdateSkill,
+  rehearsalSkill,
 ];
 
 function assertSkillMetadata(skill: Skill): void {

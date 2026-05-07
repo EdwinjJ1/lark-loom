@@ -28,6 +28,10 @@ import type {
   OfflineSummaryCardInput,
   QaCardInput,
   RecallCardInput,
+  RehearsalCardInput,
+  RehearsalClarifyCardInput,
+  RehearsalDimensionedItem,
+  RehearsalDimensionLabel,
   SlidesCardInput,
   SummaryCardInput,
   TablePushCardInput,
@@ -556,6 +560,223 @@ function buildArchive(input: ArchiveCardInput): Card {
   });
 }
 
+// 五维 → 图标 + 中文短名（卡片头里显示，让评估维度一眼可见）
+const REHEARSAL_DIM_ICON: Record<RehearsalDimensionLabel, string> = {
+  内容: '📝',
+  结构: '🏗',
+  表达: '🎤',
+  受众: '🎯',
+  时间: '⏱',
+  其他: '📌',
+};
+
+const REHEARSAL_DIM_ORDER: readonly RehearsalDimensionLabel[] = [
+  '内容',
+  '结构',
+  '表达',
+  '受众',
+  '时间',
+  '其他',
+];
+
+/**
+ * 把带 dimension 的 items 按维度分组渲染。维度块之间留空行，避免挤成一团：
+ *
+ *   📝 **内容**
+ *   - bullet 1
+ *   - bullet 2
+ *
+ *   🏗 **结构**
+ *   - bullet 1
+ */
+function renderDimensionedItems(items: readonly RehearsalDimensionedItem[]): string {
+  const groups = new Map<RehearsalDimensionLabel, string[]>();
+  for (const it of items) {
+    const list = groups.get(it.dimension) ?? [];
+    list.push(it.text);
+    groups.set(it.dimension, list);
+  }
+  const blocks: string[] = [];
+  for (const dim of REHEARSAL_DIM_ORDER) {
+    const list = groups.get(dim);
+    if (!list || list.length === 0) continue;
+    const block = [`${REHEARSAL_DIM_ICON[dim]} **${dim}**`, ...list.map((t) => `- ${t}`)].join(
+      '\n',
+    );
+    blocks.push(block);
+  }
+  return blocks.join('\n\n');
+}
+
+/**
+ * rehearsal — 演练复盘分析卡
+ *
+ * 四态：
+ *   - loading：拉历史 + 跑分析中
+ *   - active：列 issues / suggestions / uncertainties + 满意/继续修改 按钮
+ *   - completed：用户点"满意，完成"后的终态，附产出物链接（新版 PPT / 新版文档）
+ *   - error：分析失败
+ *
+ * 按钮 value 透传 action / chatId / round，wiring.handleCardAction 按 action 分发。
+ */
+function buildRehearsal(input: RehearsalCardInput): Card {
+  if (input.isLoading) {
+    return card('rehearsal', {
+      schema: '2.0',
+      header: { title: pt('演练复盘分析中…'), template: 'blue' },
+      body: {
+        elements: [
+          md('📊 正在读取群历史与会议纪要，分析演示问题。\n\n通常需要 30-60 秒，分析完会自动替换这条卡片。'),
+        ],
+      },
+    });
+  }
+
+  if (input.errorMessage) {
+    return card('rehearsal', {
+      schema: '2.0',
+      header: { title: pt('演练复盘失败'), template: 'red' },
+      body: {
+        elements: [md(`⚠️ ${input.errorMessage}`)],
+      },
+    });
+  }
+
+  // 完成态：用户已确认满意 → 附产出物链接
+  if (input.isCompleted) {
+    const elements: BodyElement[] = [
+      md(`✅ **演练复盘已完成**（共 ${input.round} 轮迭代）`),
+    ];
+    if (input.summary) elements.push(md(input.summary));
+
+    if (input.newSlidesUrl || input.newDocUrl) {
+      // 把产出物的人话描述跟图标放一段，按钮紧跟其后 —— 比孤立标题视觉更稳
+      const outputDesc: string[] = [];
+      if (input.newSlidesUrl) outputDesc.push('🎯 新版 PPT');
+      if (input.newDocUrl) outputDesc.push('📄 汇报文档修订记录');
+      elements.push(
+        hr(),
+        md(`**已更新的产出物**：${outputDesc.join(' · ')}`),
+      );
+      if (input.newSlidesUrl) {
+        elements.push(btn('打开新版 PPT', { action: 'open_url', url: input.newSlidesUrl }, 'primary'));
+      }
+      if (input.newDocUrl) {
+        elements.push(btn('打开汇报文档', { action: 'open_url', url: input.newDocUrl }, 'default'));
+      }
+    } else {
+      // 无新产出物：区分"没需要改" vs "改了但重生成失败"
+      elements.push(hr());
+      if (input.noRegenReason === 'regenFailed') {
+        elements.push(
+          md(
+            '_本次有改动建议但 PPT / 文档重生成未成功（可能是 LLM 或网络问题）。复盘记录已写入项目记忆，可稍后再 @bot 重新生成。_',
+          ),
+        );
+      } else {
+        elements.push(
+          md(
+            '_本次没有需要重新生成的 PPT 或文档；复盘记录已写入项目记忆，可在归档时回顾。_',
+          ),
+        );
+      }
+    }
+    return card('rehearsal', {
+      schema: '2.0',
+      header: { title: pt('演练复盘已完成 🎉'), template: 'green' },
+      body: { elements },
+    });
+  }
+
+  // active 态：按五维分组的 issues + suggestions + uncertainties + 按钮
+  const elements: BodyElement[] = [
+    md(`**第 ${input.round} 轮演练复盘**`),
+  ];
+  if (input.summary) elements.push(md(input.summary));
+  elements.push(hr());
+
+  if (input.issues.length) {
+    elements.push(md(`**🔴 存在的问题**\n${renderDimensionedItems(input.issues)}`));
+  }
+  if (input.suggestions.length) {
+    elements.push(hr(), md(`**💡 修改建议**\n${renderDimensionedItems(input.suggestions)}`));
+  }
+  if (input.uncertainties.length) {
+    elements.push(
+      hr(),
+      md(`**❓ 待确认（信心不足，需要你的判断）**\n${input.uncertainties.map((u) => `- ${u}`).join('\n')}`),
+    );
+  }
+  // 三段都为空时给一个中性提示 —— 注意不要说"表现良好"（false reassurance：群聊
+  // 没真反馈不等于演示真的没问题）。让用户决定是补反馈还是直接结束。
+  if (!input.issues.length && !input.suggestions.length && !input.uncertainties.length) {
+    elements.push(
+      md('暂未在群聊中识别到具体反馈。可以在群里补充演练中的问题，或直接点"满意，完成"结束本次复盘。'),
+    );
+  }
+
+  // 按钮：value 透传 action / round / chatId，cardAction handler 依此分发
+  const baseValue = {
+    chatId: input.chatId ?? '',
+    round: input.round,
+  };
+  elements.push(
+    hr(),
+    btn('满意，完成', { ...baseValue, action: 'rehearsal.satisfied' }, 'primary'),
+    btn('继续修改', { ...baseValue, action: 'rehearsal.iterate' }, 'default'),
+  );
+
+  return card('rehearsal', {
+    schema: '2.0',
+    header: { title: pt('演练复盘分析结果'), template: 'blue' },
+    body: { elements },
+  });
+}
+
+/**
+ * rehearsalClarify — 演练反问澄清卡
+ *
+ * 三态：
+ *   - active：列 1-3 个具体反问问题，提示用户在群里直接文字回复
+ *   - acknowledged：用户已回复，patch 成"已收到反馈，重新分析中…"
+ *   - error：反问构造失败
+ */
+function buildRehearsalClarify(input: RehearsalClarifyCardInput): Card {
+  if (input.errorMessage) {
+    return card('rehearsalClarify', {
+      schema: '2.0',
+      header: { title: pt('反问构造失败'), template: 'red' },
+      body: { elements: [md(`⚠️ ${input.errorMessage}`)] },
+    });
+  }
+
+  if (input.acknowledgedAt) {
+    const time = formatTime(input.acknowledgedAt);
+    return card('rehearsalClarify', {
+      schema: '2.0',
+      header: { title: pt('已收到反馈'), template: 'turquoise' },
+      body: {
+        elements: [
+          md(`✅ ${time} 已收到反馈，正在重新分析…\n\n下一轮分析卡马上发到群里。`),
+        ],
+      },
+    });
+  }
+
+  const lines = input.questions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+  return card('rehearsalClarify', {
+    schema: '2.0',
+    header: { title: pt(`第 ${input.round} 轮反问 · 请在群里回复`), template: 'wathet' },
+    body: {
+      elements: [
+        md('为了让分析更准，先请你回答下面的问题（直接在群里发消息即可，不需要点按钮）：'),
+        md(lines),
+        md('_回答完后我会重新跑一轮分析；如果你想结束本轮，发"满意 / 完成 / OK"。_'),
+      ],
+    },
+  });
+}
+
 // ─── 附属链路卡片 ─────────────────────────────────────────────────────────────
 
 /**
@@ -668,6 +889,8 @@ const builders: { [K in CardTemplateName]: (input: CardInputMap[K]) => Card } = 
   summary: buildSummary,
   slides: buildSlides,
   archive: buildArchive,
+  rehearsal: buildRehearsal,
+  rehearsalClarify: buildRehearsalClarify,
   offlineSummary: buildOfflineSummary,
   docChange: buildDocChange,
   weekly: buildWeekly,

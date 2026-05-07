@@ -30,7 +30,8 @@ export type SkillName =
   | 'requirementDoc' // 被动监听需求描述 → 生成结构化飞书文档
   | 'docIterate' // 持续监听对话 → 增量更新已有需求文档
   | 'taskAssignment' // 分工讨论 → todo 表录入 + tablePush 卡片
-  | 'progressUpdate'; // 进展汇报 → 更新对应 todo 状态
+  | 'progressUpdate' // 进展汇报 → 更新对应 todo 状态
+  | 'rehearsal'; // 演练复盘 → 分析卡 + 多轮反问 + 满意后重生成 PPT/文档
 
 /** 触发条件描述（声明式，便于在 docs / debug UI 上展示） */
 export interface TriggerSpec {
