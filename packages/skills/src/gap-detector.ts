@@ -58,6 +58,14 @@ export const TRIGGER_RULES: readonly TriggerRule[] = [
     kind: '决策追溯',
     patterns: [/(当时|之前|上次).*(决定|定了|定的|定下)/, /决定用\s*\S+\s*还是/],
   },
+  {
+    kind: '项目信息查询',
+    patterns: [
+      /[^\s]{1,8}.{0,6}(?:负责什么|做什么|的工作是什么)/,
+      /谁.{0,8}(?:负责|来做|来搞)/,
+      /(?:DDL|截止时间|deadline).{0,12}[？?是]/i,
+    ],
+  },
 ];
 
 function ruleMatch(messages: readonly Message[]): {
