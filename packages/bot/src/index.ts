@@ -11,6 +11,7 @@ import { VolcanoLLMClient } from './llm-client.js';
 import { MemoryStore } from './memory/memory-store.js';
 import { SystemPromptCache } from './memory/system-prompt.js';
 import { createSlidesClient } from './slides-client.js';
+import { BitableRetriever } from './bitable-retriever.js';
 import { SkillRouter } from './skill-router.js';
 import { handleEvent } from './wiring.js';
 
@@ -143,7 +144,7 @@ async function main(): Promise<void> {
       slides,
       cardBuilder: larkCardBuilder,
       memoryStore,
-      retrievers: {},
+      retrievers: { bitable: new BitableRetriever(bitable) },
       logger,
     };
     await handleEvent(ctx, router, skillsByName, harness);

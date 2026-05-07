@@ -26,7 +26,7 @@ export class BitableRetriever implements Retriever {
 
     const result = await this.bitable.find({
       table: 'memory',
-      ...(query.chatId ? { filter: `AND(CurrentValue.[chatId]="${query.chatId}")` } : {}),
+      ...(query.chatId ? { filter: `AND(CurrentValue.[chat_id] = "${query.chatId}")` } : {}),
       pageSize: topK,
     });
 
