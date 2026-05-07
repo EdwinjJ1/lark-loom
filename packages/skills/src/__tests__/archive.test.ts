@@ -587,6 +587,21 @@ describe('extractLinksFromMemory', () => {
     expect(links[2]!.kind).toBe('taskAssignment');
   });
 
+  it('recognizes [演练复盘] prefix as slides kind (issue #102)', () => {
+    const memories: BitableRow[] = [
+      {
+        content:
+          '[演练复盘] 已完成 2 轮迭代\n累计采纳改动 3 条\n新版 PPT：https://example.feishu.cn/slides/v2',
+        created_at: 100,
+      } as unknown as BitableRow,
+    ];
+    const links = extractLinksFromMemory(memories);
+    expect(links).toHaveLength(1);
+    expect(links[0]!.kind).toBe('slides');
+    expect(links[0]!.label).toBe('演练后新版 PPT');
+    expect(links[0]!.url).toBe('https://example.feishu.cn/slides/v2');
+  });
+
   it('keeps only latest URL per (kind, label) pair', () => {
     const memories: BitableRow[] = [
       {

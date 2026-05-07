@@ -96,6 +96,8 @@ const PREFIX_TABLE: ReadonlyArray<{
 }> = [
   { re: /^\[需求文档\]/, kind: 'requirementDoc', label: '需求文档' },
   { re: /^\[(slides|PPT|演示)\]/i, kind: 'slides', label: '演示 PPT' },
+  // issue #102 rehearsal final memory：content 内嵌新版 PPT URL，归类到 slides
+  { re: /^\[演练复盘\]/, kind: 'slides', label: '演练后新版 PPT' },
   { re: /^\[(汇报分工|发言分工)\]/, kind: 'taskAssignment', label: '汇报分工文稿' },
   { re: /^\[(任务表|todo|分工)\]/i, kind: 'taskAssignment', label: '任务分工表' },
 ];

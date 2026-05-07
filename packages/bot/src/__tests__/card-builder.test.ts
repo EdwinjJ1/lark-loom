@@ -409,6 +409,78 @@ describe('docChange card', () => {
   });
 });
 
+describe('rehearsal card 维度分组渲染', () => {
+  it('issues / suggestions 按维度分组，块之间用空行分隔', () => {
+    const card = larkCardBuilder.build('rehearsal', {
+      round: 1,
+      issues: [
+        { text: '内容问题 1', dimension: '内容' },
+        { text: '内容问题 2', dimension: '内容' },
+        { text: '结构问题 1', dimension: '结构' },
+        { text: '其他问题 1', dimension: '其他' },
+      ],
+      suggestions: [
+        { text: '建议 1', dimension: '内容' },
+        { text: '建议 2', dimension: '时间' },
+      ],
+      uncertainties: [],
+      summary: '混合维度测试。',
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    // 每个维度都带图标 + 维度名
+    expect(j).toContain('📝 **内容**');
+    expect(j).toContain('🏗 **结构**');
+    expect(j).toContain('⏱ **时间**');
+    expect(j).toContain('📌 **其他**');
+    // 维度按固定顺序：内容 → 结构 → 表达 → 受众 → 时间 → 其他
+    const body = JSON.stringify(schema(card).body);
+    const contentIdx = body.indexOf('内容');
+    const structureIdx = body.indexOf('结构');
+    const otherIdx = body.indexOf('其他');
+    expect(contentIdx).toBeLessThan(structureIdx);
+    expect(structureIdx).toBeLessThan(otherIdx);
+    // 同维度多条 issue 在同一组
+    expect(j).toContain('内容问题 1');
+    expect(j).toContain('内容问题 2');
+  });
+
+  it('完成态卡显示新版 PPT + 修订记录两个产出物', () => {
+    const card = larkCardBuilder.build('rehearsal', {
+      round: 2,
+      issues: [],
+      suggestions: [],
+      uncertainties: [],
+      summary: '共 3 条改动已采纳',
+      isCompleted: true,
+      newSlidesUrl: 'https://feishu.cn/slides/v2',
+      newDocUrl: 'https://feishu.cn/docx/rev',
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    expect(j).toContain('演练复盘已完成');
+    expect(j).toContain('已更新的产出物');
+    expect(j).toContain('新版 PPT');
+    expect(j).toContain('汇报文档');
+    expect(j).toContain('feishu.cn/slides/v2');
+    expect(j).toContain('feishu.cn/docx/rev');
+  });
+
+  it('完成态卡 regen 失败时 → 显示"未成功"兜底，不显示空标题', () => {
+    const card = larkCardBuilder.build('rehearsal', {
+      round: 1,
+      issues: [],
+      suggestions: [],
+      uncertainties: [],
+      isCompleted: true,
+      noRegenReason: 'regenFailed',
+    });
+    const j = json(card);
+    expect(j).toContain('重生成未成功');
+    expect(j).not.toContain('已更新的产出物');
+  });
+});
+
 describe('weekly card', () => {
   it('renders weekRange, highlights, decisions, todos, metrics', () => {
     const card = larkCardBuilder.build('weekly', {

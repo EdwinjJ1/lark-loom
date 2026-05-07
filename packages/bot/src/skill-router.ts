@@ -25,6 +25,7 @@ export type RouteIntent =
   | 'slides' // 演示文稿生成 — 听到 PPT 需求
   | 'requirementDoc' // 需求整理 — 听到项目需求/资料
   | 'archive' // 项目交付归档 — 听到归档/复盘/结束/收尾
+  | 'rehearsal' // 演练复盘 — 听到 演练 / 彩排 / 汇报复盘
   | 'silent'; // 不处理
 
 interface RouteRule {
@@ -65,6 +66,14 @@ const RULES: readonly RouteRule[] = [
       /能不能/,
       /可以吗/,
     ],
+  },
+
+  // ── rehearsal：演练复盘（issue #102）放在 archive 之前，避免 "汇报复盘 / 演练复盘"
+  // 被 archive 的 /复盘/ 抢走 ─────────────────────────────────────────
+  {
+    intent: 'rehearsal',
+    requireMention: false,
+    patterns: [/演练/, /演示练习/, /彩排/, /汇报复盘/, /根据刚才反馈修改/],
   },
 
   // ── archive：项目交付归档（被动）放在 progressUpdate 之前避免 "项目结束" 被

@@ -15,6 +15,12 @@ import type { IMemoryStore } from './memory/memory-store.js';
 import { getLLMTools, makeExecutor } from './memory/tool-handlers.js';
 import type { SystemPromptCache } from './memory/system-prompt.js';
 import { handleBotJoinedChat, handleOnboardingAction } from './onboarding.js';
+import {
+  isFreshTrigger as isRehearsalFreshTrigger,
+  isAwaitingUserResponse as isRehearsalAwaiting,
+  isSatisfactionSignal as isRehearsalSatisfied,
+  loadRehearsalSession,
+} from '@seedhac/skills';
 
 export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   qa: 'qa',
@@ -25,6 +31,7 @@ export const intentToSkill: Partial<Record<RouteIntent, SkillName>> = {
   taskAssignment: 'taskAssignment',
   progressUpdate: 'progressUpdate',
   archive: 'archive',
+  rehearsal: 'rehearsal',
 };
 
 export interface HarnessConfig {
@@ -87,6 +94,13 @@ export async function handleEvent(
       });
     });
   }
+
+  // rehearsal 循环检测（issue #102）—— 路由前优先：当前 chat 有活跃 rehearsal session
+  // 且本条消息既不是新一轮 rehearsal trigger 也不是别的高优 intent，就把消息当作
+  // 反馈/满意信号交给 rehearsal skill。
+  const rehearsalHandled = await maybeContinueRehearsal(ctx, msg, skills);
+  if (rehearsalHandled) return;
+
   const handledBySkill = await handleWithSkillRouter(ctx, router, skills);
   if (!handledBySkill && harness && shouldConsiderProactive(msg.text)) {
     void handleProactiveLayer(ctx, msg, skills, harness).catch((e) => {
@@ -96,6 +110,63 @@ export async function handleEvent(
       });
     });
   }
+}
+
+/**
+ * Rehearsal 循环检测（issue #102 step ④）：
+ *
+ * 当前 chat 有活跃 rehearsal session 时，把后续消息视为反馈或满意信号交给 rehearsal skill。
+ *
+ * 关键语义（用户实测反馈，2026-05-06）：
+ *   - phase=clarifying（已发反问卡）：bot 明确说"请在群里回复"，用户任何文本（含
+ *     极短回答如『第三页啊』）都必须当反馈。**不允许过滤**，否则 UX 撕裂。
+ *   - phase=analyzing（已分析，等用户判断）：保留极弱过滤，防『嗯』『哈哈』等
+ *     纯反应触发昂贵的 pro 重分析。门槛降到 3 字。
+ *
+ * 排除项：
+ *   - 包含 rehearsal 触发词的消息让 router 兜底
+ *   - 非文本 / 富文本不处理
+ */
+const REHEARSAL_ANALYZING_MIN_LENGTH = 3;
+
+async function maybeContinueRehearsal(
+  ctx: SkillContext,
+  msg: Message,
+  skills: Readonly<Partial<Record<SkillName, Skill>>>,
+): Promise<boolean> {
+  const rehearsal = skills.rehearsal;
+  if (!rehearsal) return false;
+  if (isRehearsalFreshTrigger(msg.text)) return false;
+  if (msg.contentType !== 'text' && msg.contentType !== 'post') return false;
+
+  const session = await loadRehearsalSession(ctx, msg.chatId);
+  if (!isRehearsalAwaiting(session)) return false;
+
+  const trimmed = msg.text.trim();
+  const looksSatisfied = isRehearsalSatisfied(trimmed);
+
+  // analyzing 阶段：极短的纯反应（"嗯"/"哈"）跳过；满意信号永远接管
+  // clarifying 阶段：bot 已让用户回复，不做长度过滤
+  if (
+    session?.phase === 'analyzing' &&
+    trimmed.length < REHEARSAL_ANALYZING_MIN_LENGTH &&
+    !looksSatisfied
+  ) {
+    ctx.logger.debug('rehearsal: skip ultra-short msg in analyzing phase', {
+      chatId: msg.chatId,
+      length: trimmed.length,
+    });
+    return false;
+  }
+
+  ctx.logger.info('rehearsal: continuing active session via wiring', {
+    chatId: msg.chatId,
+    phase: session?.phase,
+    round: session?.round,
+    isSatisfied: looksSatisfied,
+  });
+  await runSkill(ctx, rehearsal);
+  return true;
 }
 
 async function handleWithSkillRouter(
@@ -466,6 +537,17 @@ async function handleCardAction(
   // onboarding（issue #98）：activation 卡按钮被点击
   if (action === 'activate' || action === 'dismiss') {
     await handleOnboardingAction(ctx, action);
+    return;
+  }
+
+  // rehearsal（issue #102）：分析卡的"满意，完成" / "继续修改"按钮
+  if (action === 'rehearsal.satisfied' || action === 'rehearsal.iterate') {
+    const rehearsal = skills.rehearsal;
+    if (!rehearsal) {
+      logger.warn('rehearsal cardAction received but skill not registered');
+      return;
+    }
+    await runSkill(ctx, rehearsal);
     return;
   }
 
