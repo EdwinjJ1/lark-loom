@@ -31,6 +31,7 @@
     "eval:gap-detector": "node --env-file=../../.env --import tsx/esm ./node_modules/vitest/vitest.mjs run src/__tests__/gap-detector.eval.test.ts"
   },
   "dependencies": {
+    "@larksuite/cli": "^1.0.24",
     "@larksuiteoapi/node-sdk": "^1.62.1",
     "@seedhac/contracts": "workspace:*",
     "@seedhac/skills": "workspace:*",
