@@ -48,6 +48,12 @@ export interface MemoryRecord {
   readonly last_access: number;
   readonly created_at: number;
   readonly source_skill: string;
+  /** 当前条目是否为 compact 生成的摘要条；普通条目省略此字段 */
+  readonly is_summary?: boolean;
+  /** 该 summary 覆盖的原条目数量；普通条目省略 */
+  readonly covered_count?: number;
+  /** 该 summary 覆盖的原条目 id 列表（JSON 序列化为字符串存入 bitable） */
+  readonly original_ids?: readonly string[];
 }
 
 /** 写入时的输入：id / created_at / last_access / importance 由 store 自动管理 */
