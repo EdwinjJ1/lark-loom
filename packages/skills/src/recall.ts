@@ -68,8 +68,12 @@ class RecallSkill implements Skill {
 
     if (!KEYWORDS.some((k) => msg.text.includes(k))) return false;
 
+    const histResult = await ctx.runtime.fetchHistory({ chatId: msg.chatId, pageSize: 10 });
+    const fetched = histResult.ok ? histResult.value.messages : [];
+    const hasCurrent = fetched.some((m) => m.messageId === msg.messageId);
+    const messages = hasCurrent ? fetched : [msg, ...fetched];
     const detector = new GapDetector(ctx.llm);
-    const gapResult = await detector.detect([msg]);
+    const gapResult = await detector.detect(messages);
     if (!gapResult.ok || !gapResult.value.shouldRecall) return false;
 
     const detection = gapResult.value;
