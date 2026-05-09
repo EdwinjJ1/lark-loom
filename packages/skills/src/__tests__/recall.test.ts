@@ -77,7 +77,15 @@ function makeHit(id: string, snippet: string): RetrieveHit {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 describe('recallSkill', () => {
-  beforeEach(() => vi.clearAllMocks());
+  // mockReset 而非 clearAllMocks — 后者只清 .mock.calls，不会清 mockResolvedValueOnce 的 queue，
+  // 导致测试间 mock 队列泄漏（之前的 mockResolvedValueOnce 在下个测试被消费）
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockLLMAsk.mockReset();
+    mockFetchHistory.mockReset();
+    mockVectorRetrieve.mockReset();
+    mockBitableRetrieve.mockReset();
+  });
 
   it('match returns false for non-message events', async () => {
     const ctx = makeCtx({
