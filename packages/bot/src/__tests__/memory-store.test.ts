@@ -1215,6 +1215,46 @@ describe('MemoryStore — compact', () => {
     );
   });
 
+  it('旧表把 covered_count 以字符串返回时，rowToMemory 解析为数字而不是回退到默认值', async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    bitable.seed([
+      {
+        recordId: 'rec_legacy_summary',
+        fields: {
+          kind: 'chat',
+          chat_id: 'oc_legacy',
+          key: '__summary_legacy',
+          content: '旧表 summary',
+          importance: '7',
+          last_access: '0',
+          created_at: '0',
+          source_skill: 'memory.compact',
+          covered_count: '37',
+        },
+      },
+    ]);
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    const result = await store.list({
+      chatId: 'oc_legacy',
+      kind: 'chat',
+      sourceSkill: 'memory.compact',
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toHaveLength(1);
+      expect(result.value[0]?.is_summary).toBe(true);
+      expect(result.value[0]?.covered_count).toBe(37);
+    }
+  });
+
   it('LLM 摘要失败不删原文，failure 计数 +1，logger 不告警（首次失败）', async () => {
     const bitable = new FakeBitable();
     const llm = new FakeLLM();

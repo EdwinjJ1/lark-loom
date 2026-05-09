@@ -833,11 +833,9 @@ export class MemoryStore implements IMemoryStore {
       created_at: readNumberField(row.created_at, 0),
       source_skill: sourceSkill,
       ...(isSummary ? { is_summary: true } : {}),
-      ...(typeof row.covered_count === 'number'
-        ? { covered_count: row.covered_count }
-        : isSummary
-          ? { covered_count: MEMORY_COMPACT_BATCH }
-          : {}),
+      ...(isSummary
+        ? { covered_count: readNumberField(row.covered_count, MEMORY_COMPACT_BATCH) }
+        : {}),
       ...(originalIds ? { original_ids: originalIds } : {}),
     };
   }
