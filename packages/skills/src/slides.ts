@@ -257,6 +257,16 @@ async function runSlides(ctx: Parameters<Skill['run']>[0], msg: Message): Return
   // [slides] 前缀 → 演示 PPT；[汇报分工] 前缀 → 汇报分工文稿
   // fire-and-forget：失败仅 warn，不阻断卡片回复
   const now = Date.now();
+  // [slides_outline] 是 v2 rehearsal preview 用的 — 持久化 outline JSON 让 AI 听众能读到每页内容
+  // 只挑下游 preview 真正用得到的字段，避免 content 越过 LONG (2KB) 上限
+  const outlineForPreview = JSON.stringify({
+    title: outline.title,
+    slides: outline.slides.slice(0, 30).map((s) => ({
+      title: s.title,
+      bullets: (s.bullets ?? []).slice(0, 6),
+      ...(s.subtitle ? { subtitle: s.subtitle } : {}),
+    })),
+  });
   void Promise.all([
     ctx.bitable.insert({
       table: 'memory',
@@ -284,12 +294,27 @@ async function runSlides(ctx: Parameters<Skill['run']>[0], msg: Message): Return
         source_skill: 'slides',
       },
     }),
+    ctx.bitable.insert({
+      table: 'memory',
+      row: {
+        key: `slides-outline-${chatId}-${now}`,
+        kind: 'project',
+        chat_id: chatId,
+        content: `[slides_outline] ${outlineForPreview}`,
+        importance: 4,
+        last_access: now,
+        created_at: now,
+        source_skill: 'slides',
+      },
+    }),
   ])
-    .then(([s1, s2]) => {
+    .then(([s1, s2, s3]) => {
       if (!s1.ok)
         ctx.logger.warn('slides: insert slides memory failed', { error: s1.error.message });
       if (!s2.ok)
         ctx.logger.warn('slides: insert assignment memory failed', { error: s2.error.message });
+      if (!s3.ok)
+        ctx.logger.warn('slides: insert outline memory failed', { error: s3.error.message });
     })
     .catch((e: unknown) => {
       ctx.logger.warn('slides: memory insert threw', {

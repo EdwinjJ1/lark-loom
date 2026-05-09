@@ -541,8 +541,8 @@ describe('rehearsalSkill.run() — 多轮循环（issue #102 step ④）', () =>
 
 // ── 满意按钮 → step ⑤ ────────────────────────────────────────────────────────
 
-describe('rehearsalSkill.run() — satisfied 按钮（step ⑤）', () => {
-  it('cardAction satisfied → 调 slides 重生成 + 发完成卡 + 写 project memory', async () => {
+describe('rehearsalSkill.run() — satisfied → review checkpoint（issue #145 P2）', () => {
+  it('cardAction satisfied → 不直接 finalize，而是先发 review 卡', async () => {
     const memStore = makeMemoryStore();
     const presetSession: RehearsalSession = {
       phase: 'analyzing',
@@ -570,44 +570,43 @@ describe('rehearsalSkill.run() — satisfied 按钮（step ⑤）', () => {
     const r = await rehearsalSkill.run(ctx);
     expect(r.ok).toBe(true);
 
-    // slides.createFromOutline 被调
-    expect(ctx.slides!.createFromOutline).toHaveBeenCalled();
-    // doc.createFromMarkdown 被调（doc 类改动）
-    expect(ctx.docx.createFromMarkdown).toHaveBeenCalled();
+    // v2: 不再直接调 slides；先发 review 卡
+    expect(ctx.slides!.createFromOutline).not.toHaveBeenCalled();
+    expect(ctx.docx.createFromMarkdown).not.toHaveBeenCalled();
 
-    // 完成态卡 build（含 isCompleted + newSlidesUrl）
     const build = ctx.cardBuilder.build as unknown as ReturnType<typeof vi.fn>;
-    const completedBuild = build.mock.calls.find((c) => c[0] === 'rehearsal' && c[1].isCompleted);
-    expect(completedBuild).toBeDefined();
-    expect(completedBuild![1].newSlidesUrl).toBe('https://feishu.cn/slides/new');
+    const reviewBuild = build.mock.calls.find((c) => c[0] === 'rehearsalReview');
+    expect(reviewBuild).toBeDefined();
+    const reviewInput = reviewBuild![1] as {
+      changes: { id: string; defaultChecked: boolean; source: string }[];
+      round: number;
+    };
+    expect(reviewInput.changes.length).toBe(3);
+    // 全是 user 类（来自历史合并），都默认勾选
+    expect(reviewInput.changes.every((c) => c.defaultChecked)).toBe(true);
 
-    // patch 到原分析卡
-    expect(ctx.runtime.patchCard).toHaveBeenCalledWith(
-      expect.objectContaining({ messageId: 'analysis_msg_r2' }),
-    );
-
-    // project memory 写入（kind=project，content 含 [演练复盘]）
-    const projectInsert = (ctx.bitable.insert as ReturnType<typeof vi.fn>).mock.calls.find(
-      (c) => c[0].row.kind === 'project' && String(c[0].row.content).includes('[演练复盘]'),
-    );
-    expect(projectInsert).toBeDefined();
-
-    // session 标 done
+    // session 进 reviewing
     const session = await loadRehearsalSession(ctx, CHAT_ID);
-    expect(session!.phase).toBe('done');
+    expect(session!.phase).toBe('reviewing');
+    expect(session!.reviewSelection?.length).toBe(3);
   });
 
-  it('文本"满意"信号 → 等价于 satisfied 按钮', async () => {
+  it('rehearsal.review.confirm → 按勾选子集真正 finalize', async () => {
     const memStore = makeMemoryStore();
     const presetSession: RehearsalSession = {
-      phase: 'clarifying',
-      round: 1,
-      analysisMessageId: 'analysis_msg_r1',
-      clarifyMessageId: 'clarify_msg_r1',
-      recommendedChanges: [{ target: 'slides', text: '第 3 页补单位' }],
-      lastUncertainties: ['配色'],
-      startedAt: Date.now() - 30_000,
-      updatedAt: Date.now() - 5_000,
+      phase: 'reviewing',
+      round: 2,
+      analysisMessageId: 'analysis_msg_r2',
+      reviewMessageId: 'review_msg',
+      recommendedChanges: [
+        { id: 'c_0', target: 'slides', text: 'A', source: 'user' },
+        { id: 'c_1', target: 'slides', text: 'B', source: 'user' },
+        { id: 'c_2', target: 'doc', text: 'C', source: 'user' },
+      ],
+      lastUncertainties: [],
+      reviewSelection: ['c_0', 'c_2'], // 用户取消了 c_1
+      startedAt: Date.now() - 60_000,
+      updatedAt: Date.now() - 1_000,
     };
     await memStore.client.write({
       kind: 'skill_log',
@@ -618,18 +617,90 @@ describe('rehearsalSkill.run() — satisfied 按钮（step ⑤）', () => {
       importance: 6,
     });
 
-    const ctx = makeCtx(
-      { type: 'message', payload: makeMessage('OK 就这样吧') },
-      { memoryStore: memStore },
-    );
+    const ctx = makeCtx(makeCardActionEvent('rehearsal.review.confirm'), { memoryStore: memStore });
     const r = await rehearsalSkill.run(ctx);
     expect(r.ok).toBe(true);
 
-    // 直接 finalize：调 slides，不再发新一轮 loading 卡
     expect(ctx.slides!.createFromOutline).toHaveBeenCalled();
-    const build = ctx.cardBuilder.build as unknown as ReturnType<typeof vi.fn>;
-    const completedBuild = build.mock.calls.find((c) => c[0] === 'rehearsal' && c[1].isCompleted);
-    expect(completedBuild).toBeDefined();
+    expect(ctx.docx.createFromMarkdown).toHaveBeenCalled();
+
+    const session = await loadRehearsalSession(ctx, CHAT_ID);
+    expect(session!.phase).toBe('done');
+    // 只保留勾选的两条，c_1 被剔除
+    expect(session!.recommendedChanges.length).toBe(2);
+    expect(session!.recommendedChanges.map((c) => c.text)).toEqual(['A', 'C']);
+  });
+
+  it('rehearsal.review.cancel → 回 clarifying，不调 slides', async () => {
+    const memStore = makeMemoryStore();
+    const presetSession: RehearsalSession = {
+      phase: 'reviewing',
+      round: 1,
+      reviewMessageId: 'review_msg',
+      recommendedChanges: [{ id: 'c_0', target: 'slides', text: 'A', source: 'user' }],
+      lastUncertainties: ['是否补封面'],
+      reviewSelection: ['c_0'],
+      startedAt: Date.now() - 1_000,
+      updatedAt: Date.now() - 100,
+    };
+    await memStore.client.write({
+      kind: 'skill_log',
+      chat_id: CHAT_ID,
+      key: REHEARSAL_SESSION_KEY,
+      content: JSON.stringify(presetSession),
+      source_skill: 'rehearsal',
+      importance: 6,
+    });
+
+    const ctx = makeCtx(makeCardActionEvent('rehearsal.review.cancel'), { memoryStore: memStore });
+    const r = await rehearsalSkill.run(ctx);
+    expect(r.ok).toBe(true);
+    expect(ctx.slides!.createFromOutline).not.toHaveBeenCalled();
+
+    const session = await loadRehearsalSession(ctx, CHAT_ID);
+    expect(session!.phase).toBe('clarifying');
+  });
+
+  it('rehearsal.review.toggle → 仅更新 reviewSelection，不发卡', async () => {
+    const memStore = makeMemoryStore();
+    const presetSession: RehearsalSession = {
+      phase: 'reviewing',
+      round: 1,
+      reviewMessageId: 'review_msg',
+      recommendedChanges: [
+        { id: 'c_0', target: 'slides', text: 'A', source: 'user' },
+        { id: 'c_1', target: 'slides', text: 'B', source: 'listener' },
+      ],
+      lastUncertainties: [],
+      reviewSelection: ['c_0'],
+      startedAt: Date.now() - 1_000,
+      updatedAt: Date.now() - 100,
+    };
+    await memStore.client.write({
+      kind: 'skill_log',
+      chat_id: CHAT_ID,
+      key: REHEARSAL_SESSION_KEY,
+      content: JSON.stringify(presetSession),
+      source_skill: 'rehearsal',
+      importance: 6,
+    });
+
+    const togglePayload = {
+      type: 'cardAction' as const,
+      payload: {
+        chatId: CHAT_ID,
+        messageId: 'card_msg_001',
+        user: { userId: 'ou_user_001', name: '张三' },
+        value: { action: 'rehearsal.review.toggle', changeId: 'c_1', checked: true },
+        timestamp: 1_700_000_999_000,
+      },
+    };
+    const ctx = makeCtx(togglePayload as unknown as BotEvent, { memoryStore: memStore });
+    const r = await rehearsalSkill.run(ctx);
+    expect(r.ok).toBe(true);
+
+    const session = await loadRehearsalSession(ctx, CHAT_ID);
+    expect(session!.reviewSelection).toEqual(expect.arrayContaining(['c_0', 'c_1']));
   });
 });
 

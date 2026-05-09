@@ -24,6 +24,8 @@ export type CardTemplateName =
   | 'archive' // 项目归档
   | 'rehearsal' // 演练复盘分析（issues / suggestions / uncertainties）
   | 'rehearsalClarify' // 演练反问澄清（循环到用户满意）
+  | 'rehearsalPreview' // AI 听众预演分页讲稿卡（issue #145）
+  | 'rehearsalReview' // 累积改动决策透明化卡（issue #145）
   // ── 附属链路 ────────────────────────────────
   | 'offlineSummary' // 用户重连后的离线期间摘要
   | 'docChange' // 重要文档变更通知
@@ -196,6 +198,79 @@ export interface RehearsalCardInput {
   readonly errorMessage?: string;
 }
 
+// ── rehearsal v2 (issue #145) ─────────────────────────────────────────────────
+
+/** AI 听众预演卡的一页 PPT 子项 */
+export interface RehearsalPreviewPage {
+  readonly page: number;
+  readonly pageTitle: string;
+  /** 演讲者人设 LLM 生成的三段式讲稿 */
+  readonly hook: string;
+  readonly core: string;
+  readonly transition: string;
+  /** 听众人设 LLM 给出的当页 critique（已过 attribution check） */
+  readonly critiques: readonly RehearsalListenerCritique[];
+}
+
+export type RehearsalCritiqueCategory = 'audience' | 'content' | 'consistency';
+
+export interface RehearsalListenerCritique {
+  /** 跨多页时唯一 id（review 卡勾选过滤用） */
+  readonly id: string;
+  readonly category: RehearsalCritiqueCategory;
+  readonly page: number;
+  readonly text: string;
+  readonly evidence: string;
+  readonly cite?: string;
+  readonly confidence: number;
+  /** attribution 校验结果：'confirmed' / 'unsure'。'no' 整条丢，不会进卡片 */
+  readonly attribution: 'confirmed' | 'unsure';
+}
+
+/**
+ * AI 听众预演卡（template: rehearsalPreview）—— PPT 一存在即可跑，无需先开演练会。
+ *   - active：每页 PPT 一段渲染（标题 / 三段式讲稿 / 听众点评 / 反馈按钮）
+ *   - error：preview 跑挂的失败提示
+ */
+export interface RehearsalPreviewCardInput {
+  readonly chatId: string;
+  readonly totalPages: number;
+  readonly pages: readonly RehearsalPreviewPage[];
+  /** 风格槽位：严肃 / 路演（影响讲稿语气，仅在卡片头展示选择） */
+  readonly style?: 'judges' | 'roadshow';
+  readonly errorMessage?: string;
+}
+
+export type RehearsalChangeSource = 'user' | 'listener' | 'unsure';
+export type RehearsalChangeTarget = 'slides' | 'doc';
+
+/** Review 卡显示的一条累积改动 */
+export interface RehearsalReviewChange {
+  /** 唯一 id，按勾选过滤时使用 */
+  readonly id: string;
+  readonly target: RehearsalChangeTarget;
+  readonly text: string;
+  readonly source: RehearsalChangeSource;
+  /** 默认是否勾选；user 默认 true，listener / unsure 默认 false */
+  readonly defaultChecked: boolean;
+}
+
+/**
+ * Review 卡（template: rehearsalReview）—— finalize 之前的决策透明化 checkpoint。
+ * 三组 changes（user / listener / unsure）按 source 分组渲染，每条带勾选框。
+ */
+export interface RehearsalReviewCardInput {
+  readonly chatId: string;
+  readonly round: number;
+  readonly changes: readonly RehearsalReviewChange[];
+  /** 累积条数超过软上限时显示"请精简"提示（替代静默截断） */
+  readonly overLimitHint?: boolean;
+  readonly errorMessage?: string;
+  /** 完成态：用户已点全部确认 / 取消 / 编辑 */
+  readonly resolution?: 'confirmed' | 'cancelled' | 'editing';
+  readonly resolvedAt?: number;
+}
+
 /**
  * 反问澄清卡（template: rehearsalClarify）—— 把 uncertainties 转成 1-3 个问题，
  * 等用户在群里直接文字回复（不是按钮）。
@@ -263,6 +338,8 @@ export interface CardInputMap {
   archive: ArchiveCardInput;
   rehearsal: RehearsalCardInput;
   rehearsalClarify: RehearsalClarifyCardInput;
+  rehearsalPreview: RehearsalPreviewCardInput;
+  rehearsalReview: RehearsalReviewCardInput;
   offlineSummary: OfflineSummaryCardInput;
   docChange: DocChangeCardInput;
   weekly: WeeklyCardInput;
