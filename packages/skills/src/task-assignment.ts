@@ -153,14 +153,15 @@ export const taskAssignmentSkill: Skill = {
     const insertResult = await ctx.bitable.batchInsert({
       table: 'todo',
       rows: tasks.map((t) => ({
-        chatId: chatId,
+        chatId,
         content: clamp(t.task),
         owner: clamp(t.owner),
-        status: 'pending',
         ddl: t.ddl ?? '',
+        status: 'pending',
         deliverable: clamp(t.deliverable ?? ''),
         acceptance: clamp(t.acceptance ?? ''),
         source: 'taskAssignment',
+        timestamp: now,
       })),
     });
 

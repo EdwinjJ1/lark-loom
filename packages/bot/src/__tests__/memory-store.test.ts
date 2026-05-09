@@ -5,10 +5,13 @@ import {
   MEMORY_MAX_PER_CHAT_KIND,
   MEMORY_MAX_TOTAL,
   MEMORY_SUMMARIZE_THRESHOLD_BYTES,
+  MEMORY_COMPACT_THRESHOLD,
+  MEMORY_COMPACT_BATCH,
+  MEMORY_COMPACT_MAX_FAILURES,
   cosineSimilarity,
   evictScore,
 } from '../memory/memory-store.js';
-import type { BitableClient, LLMClient, Result, AppError } from '@seedhac/contracts';
+import type { BitableClient, LLMClient, Logger, Result, AppError } from '@seedhac/contracts';
 import { ok, err, ErrorCode, makeError } from '@seedhac/contracts';
 
 // ────────────────────────────────────────────────────────────────────
@@ -139,8 +142,13 @@ class FakeLLM implements LLMClient {
   /** 测试可设：null = 不支持 embedding（返回 CONFIG_MISSING err） */
   public nextEmbedding: readonly number[] | null = null;
   public embedCallCount = 0;
+  public askCallCount = 0;
+  /** 测试可设：每次 ask 调用的返回值（function 形式可看到 prompt） */
+  public askImpl: ((prompt: string) => Result<string>) | null = null;
 
-  async ask(): Promise<Result<string>> {
+  async ask(prompt: string): Promise<Result<string>> {
+    this.askCallCount++;
+    if (this.askImpl) return this.askImpl(prompt);
     return ok('');
   }
   async chat(): Promise<Result<string>> {
@@ -947,5 +955,383 @@ describe('MemoryStore — embedding 写入与语义搜索', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value.length).toBe(1);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// compact: 每 (chat_id, kind) 超 100 条压缩最早 50 条为 1 条 summary
+// ────────────────────────────────────────────────────────────────────
+
+interface FakeLogger {
+  warn: ReturnType<typeof vi.fn>;
+  info: ReturnType<typeof vi.fn>;
+  error: ReturnType<typeof vi.fn>;
+  debug: ReturnType<typeof vi.fn>;
+}
+
+function makeFakeLogger(): FakeLogger {
+  return {
+    warn: vi.fn(),
+    info: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  };
+}
+
+/** seed N 条普通记忆，created_at 严格递增（最早的 recordId 在前） */
+function seedConversation(
+  bitable: FakeBitable,
+  count: number,
+  opts: { kind?: string; chatId?: string; baseTime?: number } = {},
+): void {
+  const kind = opts.kind ?? 'chat';
+  const chatId = opts.chatId ?? 'oc_1';
+  const base = opts.baseTime ?? 1_000_000;
+  const rows: FakeRow[] = [];
+  for (let i = 0; i < count; i++) {
+    rows.push({
+      recordId: `rec_${kind}_${chatId}_${i + 1}`,
+      fields: {
+        kind,
+        chat_id: chatId,
+        key: `msg_${i}`,
+        content: `消息 ${i} 内容`,
+        importance: 5,
+        last_access: base + i,
+        created_at: base + i,
+        source_skill: 'seed',
+      },
+    });
+  }
+  bitable.seed(rows);
+}
+
+describe('MemoryStore — compact', () => {
+  it(`(chat_id, kind) 不到阈值（${MEMORY_COMPACT_THRESHOLD - 2} 条 + 1 条 write = ${MEMORY_COMPACT_THRESHOLD - 1}）不触发`, async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    // 写入后总数 = THRESHOLD - 1，未达阈值
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 2);
+    llm.askImpl = () => ok('summary text'); // 即便 LLM 可用也不该被叫到
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      scoreFlushMs: 100_000,
+      now: () => 9_999_999,
+    });
+
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'msg_new',
+      content: '新消息',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // compact 不触发：summary 应不存在、askImpl 没用于 compact 摘要
+    expect(bitable.all.some((r) => r.fields.is_summary === true)).toBe(false);
+    // 写新条+enforceCapacity 都不会调 ask（评分用 askStructured）；askCallCount 不应因 compact 增长
+    expect(llm.askCallCount).toBe(0);
+  });
+
+  it(`达到阈值（${MEMORY_COMPACT_THRESHOLD} 条）触发：最早 ${MEMORY_COMPACT_BATCH} 条被压成 1 条 summary 并删除原文`, async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    // 99 条 + write 1 条 = 100
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1);
+    llm.askImpl = () => ok('压缩后的摘要内容');
+    llm.nextEmbedding = [0.1, 0.2, 0.3];
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'msg_trigger',
+      content: '触发条',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    const summaryRows = bitable.all.filter((r) => r.fields.is_summary === true);
+    expect(summaryRows.length).toBe(1);
+    const summary = summaryRows[0]!;
+    expect(summary.fields.content).toBe('压缩后的摘要内容');
+    expect(summary.fields.covered_count).toBe(MEMORY_COMPACT_BATCH);
+    expect(summary.fields.kind).toBe('chat');
+    expect(summary.fields.chat_id).toBe('oc_1');
+    expect(summary.fields.source_skill).toBe('memory.compact');
+    // original_ids 是 JSON string，解析后应是最早 50 条的 recordId
+    const ids = JSON.parse(String(summary.fields.original_ids)) as string[];
+    expect(ids.length).toBe(MEMORY_COMPACT_BATCH);
+    expect(ids[0]).toBe('rec_chat_oc_1_1'); // 最早一条
+    expect(ids[MEMORY_COMPACT_BATCH - 1]).toBe(`rec_chat_oc_1_${MEMORY_COMPACT_BATCH}`);
+
+    // 原 50 条已删
+    for (let i = 1; i <= MEMORY_COMPACT_BATCH; i++) {
+      expect(bitable.all.find((r) => r.recordId === `rec_chat_oc_1_${i}`)).toBeUndefined();
+    }
+    // 后 49 条 + 新触发条 + 1 条 summary = 51
+    expect(bitable.size()).toBe(MEMORY_COMPACT_THRESHOLD - MEMORY_COMPACT_BATCH + 1);
+  });
+
+  it('LLM 摘要失败不删原文，failure 计数 +1，logger 不告警（首次失败）', async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    const logger = makeFakeLogger();
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1);
+    llm.askImpl = () => err(makeError(ErrorCode.LLM_INVALID_RESPONSE, 'llm down'));
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      logger: logger as unknown as Logger,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    const before = bitable.size();
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'msg_trigger',
+      content: '触发条',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(bitable.all.some((r) => r.fields.is_summary === true)).toBe(false);
+    // 原数据未被删
+    expect(bitable.size()).toBe(before + 1);
+    // summarize 失败的内部 warn（"compact summarize failed"）会发，但"compact persistently failing"还不会
+    expect(
+      logger.warn.mock.calls.some(
+        ([msg]) => typeof msg === 'string' && msg.includes('compact persistently failing'),
+      ),
+    ).toBe(false);
+  });
+
+  it(`连续 ${MEMORY_COMPACT_MAX_FAILURES} 次失败后告警（同一 chat+kind）`, async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    const logger = makeFakeLogger();
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1);
+    llm.askImpl = () => err(makeError(ErrorCode.LLM_INVALID_RESPONSE, 'llm broken'));
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      logger: logger as unknown as Logger,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    // 连续触发 5 次（每次写新条都 ≥ 阈值）
+    for (let i = 0; i < MEMORY_COMPACT_MAX_FAILURES; i++) {
+      await store.write({
+        kind: 'chat',
+        chat_id: 'oc_1',
+        key: `msg_trigger_${i}`,
+        content: '触发条',
+        source_skill: 'qa',
+        importance: 5,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    expect(
+      logger.warn.mock.calls.some(
+        ([msg]) => typeof msg === 'string' && msg.includes('compact persistently failing'),
+      ),
+    ).toBe(true);
+  });
+
+  it('成功 compact 后失败计数清零', async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    const logger = makeFakeLogger();
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1);
+
+    let failNext = true;
+    llm.askImpl = () => (failNext ? err(makeError(ErrorCode.LLM_INVALID_RESPONSE, 'down')) : ok('summary ok'));
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      logger: logger as unknown as Logger,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    // 失败 4 次（< MAX_FAILURES）
+    for (let i = 0; i < MEMORY_COMPACT_MAX_FAILURES - 1; i++) {
+      await store.write({
+        kind: 'chat',
+        chat_id: 'oc_1',
+        key: `msg_x_${i}`,
+        content: 'x',
+        source_skill: 'qa',
+        importance: 5,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // 还没告警
+    expect(
+      logger.warn.mock.calls.some(
+        ([msg]) => typeof msg === 'string' && msg.includes('compact persistently failing'),
+      ),
+    ).toBe(false);
+
+    // 第 5 次成功
+    failNext = false;
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'msg_recover',
+      content: 'r',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // summary 已写入
+    expect(bitable.all.some((r) => r.fields.is_summary === true)).toBe(true);
+    // 让它再失败 4 次也不告警（计数已清零）
+    failNext = true;
+    logger.warn.mockClear();
+    for (let i = 0; i < MEMORY_COMPACT_MAX_FAILURES - 1; i++) {
+      await store.write({
+        kind: 'chat',
+        chat_id: 'oc_1',
+        key: `msg_y_${i}`,
+        content: 'y',
+        source_skill: 'qa',
+        importance: 5,
+      });
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(
+      logger.warn.mock.calls.some(
+        ([msg]) => typeof msg === 'string' && msg.includes('compact persistently failing'),
+      ),
+    ).toBe(false);
+  });
+
+  it('不同 (chat_id, kind) 互相隔离：A 群达阈值不影响 B 群', async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1, { chatId: 'oc_A' });
+    seedConversation(bitable, 50, { chatId: 'oc_B' }); // B 群只有 50 条
+    llm.askImpl = () => ok('summary A');
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_A',
+      key: 'trigger_A',
+      content: 'a',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    // A 群有 summary
+    const aSummaries = bitable.all.filter(
+      (r) => r.fields.is_summary === true && r.fields.chat_id === 'oc_A',
+    );
+    expect(aSummaries.length).toBe(1);
+    // B 群没动过：仍然 50 条普通记录、无 summary
+    const bRecords = bitable.all.filter((r) => r.fields.chat_id === 'oc_B');
+    expect(bRecords.length).toBe(50);
+    expect(bRecords.every((r) => r.fields.is_summary !== true)).toBe(true);
+  });
+
+  it('summary 自身不会被再次 compact（不无限套娃）', async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    // 注入 99 条普通 + 已存在 1 条 summary（共 100 条 row 数，满阈值；但 compactable 普通条只有 99）
+    seedConversation(bitable, 99, { chatId: 'oc_1' });
+    bitable.seed([
+      {
+        recordId: 'rec_existing_summary',
+        fields: {
+          kind: 'chat',
+          chat_id: 'oc_1',
+          key: '__summary_old',
+          content: '老 summary',
+          importance: 7,
+          last_access: 0,
+          created_at: 0, // 故意设最早，假如逻辑误把 summary 算进 batch 会被抓
+          source_skill: 'memory.compact',
+          is_summary: true,
+          covered_count: 50,
+          original_ids: '[]',
+        },
+      },
+    ]);
+    llm.askImpl = () => ok('new summary');
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    // 写 1 条 → 总 row=101，普通条=100，达 compactable 阈值
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'trigger',
+      content: 'new',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    // 老 summary 仍然存在（没被压进新 summary）
+    expect(bitable.all.some((r) => r.recordId === 'rec_existing_summary')).toBe(true);
+    // 新 summary 也写入了
+    const summaries = bitable.all.filter((r) => r.fields.is_summary === true);
+    expect(summaries.length).toBe(2);
+    // 新 summary 的 original_ids 不应包含老 summary 的 id
+    const newSummary = summaries.find((s) => s.recordId !== 'rec_existing_summary')!;
+    const ids = JSON.parse(String(newSummary.fields.original_ids)) as string[];
+    expect(ids).not.toContain('rec_existing_summary');
+  });
+
+  it('没有 LLM 时不做 compact（fallback 到 LRU 淘汰）', async () => {
+    const bitable = new FakeBitable();
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1);
+
+    const store = new MemoryStore({ bitable, scoreFlushMs: 100_000, now: () => 9_000_000 });
+
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'trigger',
+      content: 'x',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(bitable.all.some((r) => r.fields.is_summary === true)).toBe(false);
   });
 });

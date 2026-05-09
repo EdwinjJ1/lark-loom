@@ -30,8 +30,12 @@ import type {
   RecallCardInput,
   RehearsalCardInput,
   RehearsalClarifyCardInput,
+  RehearsalCritiqueCategory,
   RehearsalDimensionedItem,
   RehearsalDimensionLabel,
+  RehearsalPreviewCardInput,
+  RehearsalReviewCardInput,
+  RehearsalReviewChange,
   SlidesCardInput,
   SummaryCardInput,
   TablePushCardInput,
@@ -777,6 +781,218 @@ function buildRehearsalClarify(input: RehearsalClarifyCardInput): Card {
   });
 }
 
+// ─── rehearsal v2 (issue #145) ────────────────────────────────────────────
+
+const CRITIQUE_CATEGORY_ICON: Record<RehearsalCritiqueCategory, string> = {
+  audience: '🎯',
+  content: '📝',
+  consistency: '⚖️',
+};
+
+const CRITIQUE_CATEGORY_LABEL: Record<RehearsalCritiqueCategory, string> = {
+  audience: '听众',
+  content: '内容',
+  consistency: '一致性',
+};
+
+/**
+ * rehearsalPreview — AI 听众预演分页讲稿卡（issue #145 P1）
+ *
+ * 每页 PPT 一段：标题 → 三段式讲稿（hook/core/transition） → AI 听众点评 → 反馈按钮。
+ * 反馈按钮 value 透传 chatId / page，wiring.handleCardAction 路由到 rehearsal skill。
+ */
+function buildRehearsalPreview(input: RehearsalPreviewCardInput): Card {
+  if (input.errorMessage) {
+    return card('rehearsalPreview', {
+      schema: '2.0',
+      header: { title: pt('AI 听众预演失败'), template: 'red' },
+      body: { elements: [md(`⚠️ ${input.errorMessage}`)] },
+    });
+  }
+
+  const styleLabel = input.style === 'roadshow' ? '路演' : '评委答辩';
+  const elements: BodyElement[] = [
+    md(
+      `🎤 **AI 听众预演**（共 ${input.totalPages} 页 · 风格：${styleLabel}）\n\n` +
+        '每页有讲稿 + 三类点评（听众 / 内容 / 一致性）。看完直接给意见，不需要凑齐开会。',
+    ),
+  ];
+
+  for (const page of input.pages) {
+    elements.push(
+      hr(),
+      md(`**第 ${page.page} 页 / ${input.totalPages}** — ${page.pageTitle}`),
+      md(
+        [
+          `**🎙️ 讲稿**`,
+          `钩子：${page.hook}`,
+          `核心：${page.core}`,
+          `过渡：${page.transition}`,
+        ].join('\n'),
+      ),
+    );
+
+    if (page.critiques.length === 0) {
+      elements.push(md('_👂 AI 听众：本页未发现明显问题。_'));
+    } else {
+      const critiqueLines = page.critiques.map((c) => {
+        const icon = CRITIQUE_CATEGORY_ICON[c.category];
+        const label = CRITIQUE_CATEGORY_LABEL[c.category];
+        const unsureMark = c.attribution === 'unsure' ? ' ⚠️来源待确认' : '';
+        return `- ${icon} **[${label}]**${unsureMark} ${c.text}`;
+      });
+      elements.push(md(`**👂 AI 听众点评**\n${critiqueLines.join('\n')}`));
+    }
+
+    const baseValue = { chatId: input.chatId, page: page.page };
+    elements.push(
+      btn(
+        '👍 同意 AI',
+        { ...baseValue, action: 'rehearsal.preview.agree' },
+        'default',
+      ),
+      btn(
+        '✍️ 我有不同意见',
+        { ...baseValue, action: 'rehearsal.preview.disagree' },
+        'primary',
+      ),
+    );
+  }
+
+  elements.push(
+    hr(),
+    btn(
+      '开始排练（基于反馈跑第一轮分析）',
+      { chatId: input.chatId, action: 'rehearsal.preview.startAnalyze' },
+      'primary',
+    ),
+    md('_累计 ≥ 3 页反馈会自动进入分析。如要直接结束，群里发"满意 / 完成"即可。_'),
+  );
+
+  return card('rehearsalPreview', {
+    schema: '2.0',
+    header: { title: pt('AI 听众预演（rehearsal v2）'), template: 'wathet' },
+    body: { elements },
+  });
+}
+
+const REVIEW_SOURCE_ICON: Record<RehearsalReviewChange['source'], string> = {
+  user: '🟢',
+  listener: '🟦',
+  unsure: '⚠️',
+};
+
+const REVIEW_SOURCE_LABEL: Record<RehearsalReviewChange['source'], string> = {
+  user: '来自用户主动反馈',
+  listener: 'AI 听众建议（默认不勾）',
+  unsure: '来源待确认（attribution unsure）',
+};
+
+const REVIEW_SOURCE_ORDER: readonly RehearsalReviewChange['source'][] = [
+  'user',
+  'listener',
+  'unsure',
+];
+
+/**
+ * rehearsalReview — finalize 之前的累积改动决策透明化卡（issue #145 P2）
+ *
+ * 三组 changes（user / listener / unsure）按 source 分组。每条带 [✓ 包含] / [○ 跳过] 按钮，
+ * 用户主动决定每一条。点 [全部确认执行] → finalize 仅按勾选子集跑 regenerate。
+ */
+function buildRehearsalReview(input: RehearsalReviewCardInput): Card {
+  if (input.errorMessage) {
+    return card('rehearsalReview', {
+      schema: '2.0',
+      header: { title: pt('Review 卡构造失败'), template: 'red' },
+      body: { elements: [md(`⚠️ ${input.errorMessage}`)] },
+    });
+  }
+
+  if (input.resolution) {
+    const time = input.resolvedAt ? formatTime(input.resolvedAt) : '';
+    const lookup: Record<NonNullable<RehearsalReviewCardInput['resolution']>, string> = {
+      confirmed: `✅ ${time} 已按勾选子集开始重生成 PPT / 文档。`,
+      cancelled: `↩️ ${time} 已取消，回到反问澄清继续修改。`,
+      editing: `✏️ ${time} 进入编辑模式，可在群里追加/删除指定条。`,
+    };
+    return card('rehearsalReview', {
+      schema: '2.0',
+      header: { title: pt('Review 已处理'), template: 'turquoise' },
+      body: { elements: [md(lookup[input.resolution])] },
+    });
+  }
+
+  const elements: BodyElement[] = [
+    md(
+      `📋 **第 ${input.round} 轮 review** — 即将应用的累积改动共 **${input.changes.length}** 条\n\n` +
+        '逐条决定要不要执行；user 默认勾选，listener / unsure 默认不勾。',
+    ),
+  ];
+
+  if (input.overLimitHint) {
+    elements.push(
+      hr(),
+      md(
+        '⚠️ **改动条数偏多（> 30）**，请精简：在群里补一句"只保留 X / Y / Z 几条"或直接逐条取消勾选，' +
+          '避免重生成时 LLM 顾此失彼。（不会再静默截断旧条目。）',
+      ),
+    );
+  }
+
+  // 按 source 分三组渲染。每条 change 一行 + 一对 [包含 / 跳过] callback 按钮（用户勾选）。
+  const grouped = new Map<RehearsalReviewChange['source'], RehearsalReviewChange[]>();
+  for (const c of input.changes) {
+    const list = grouped.get(c.source) ?? [];
+    list.push(c);
+    grouped.set(c.source, list);
+  }
+
+  for (const source of REVIEW_SOURCE_ORDER) {
+    const list = grouped.get(source);
+    if (!list || list.length === 0) continue;
+    elements.push(
+      hr(),
+      md(`${REVIEW_SOURCE_ICON[source]} **${REVIEW_SOURCE_LABEL[source]}（${list.length} 条）**`),
+    );
+    for (const c of list) {
+      const targetTag = c.target === 'slides' ? '🎯 PPT' : '📄 doc';
+      const checked = c.defaultChecked ? '☑' : '☐';
+      elements.push(md(`${checked} **${targetTag}** ${c.text}`));
+      const baseValue = { chatId: input.chatId, changeId: c.id };
+      elements.push(
+        btn('✓ 包含', { ...baseValue, action: 'rehearsal.review.toggle', checked: true }, 'default'),
+        btn('○ 跳过', { ...baseValue, action: 'rehearsal.review.toggle', checked: false }, 'default'),
+      );
+    }
+  }
+
+  elements.push(
+    hr(),
+    btn(
+      '✅ 全部确认执行（按当前勾选）',
+      { chatId: input.chatId, action: 'rehearsal.review.confirm' },
+      'primary',
+    ),
+    btn(
+      '✏️ 我再改改',
+      { chatId: input.chatId, action: 'rehearsal.review.editList' },
+      'default',
+    ),
+    btn(
+      '❌ 全部取消',
+      { chatId: input.chatId, action: 'rehearsal.review.cancel' },
+      'danger',
+    ),
+  );
+
+  return card('rehearsalReview', {
+    schema: '2.0',
+    header: { title: pt(`第 ${input.round} 轮 review · 决策透明化`), template: 'blue' },
+    body: { elements },
+  });
+}
+
 // ─── 附属链路卡片 ─────────────────────────────────────────────────────────────
 
 /**
@@ -891,6 +1107,8 @@ const builders: { [K in CardTemplateName]: (input: CardInputMap[K]) => Card } = 
   archive: buildArchive,
   rehearsal: buildRehearsal,
   rehearsalClarify: buildRehearsalClarify,
+  rehearsalPreview: buildRehearsalPreview,
+  rehearsalReview: buildRehearsalReview,
   offlineSummary: buildOfflineSummary,
   docChange: buildDocChange,
   weekly: buildWeekly,

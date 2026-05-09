@@ -481,6 +481,209 @@ describe('rehearsal card 维度分组渲染', () => {
   });
 });
 
+// ── rehearsal v2 (issue #145) ─────────────────────────────────────────────
+
+describe('rehearsalPreview card (issue #145)', () => {
+  it('每页 PPT 渲染三段式讲稿 + critique 分类图标 + 反馈按钮', () => {
+    const card = larkCardBuilder.build('rehearsalPreview', {
+      chatId: 'oc_test',
+      totalPages: 2,
+      style: 'judges',
+      pages: [
+        {
+          page: 1,
+          pageTitle: '封面',
+          hook: '我们做了什么？',
+          core: '一个完整的飞书原生协作助手。',
+          transition: '下一页讲商业模式。',
+          critiques: [
+            {
+              id: 'lc_0',
+              category: 'audience',
+              page: 1,
+              text: '评委会追问目标用户',
+              evidence: 'ppt.p1: 封面',
+              cite: 'ppt.p1',
+              confidence: 0.85,
+              attribution: 'confirmed',
+            },
+            {
+              id: 'lc_1',
+              category: 'consistency',
+              page: 1,
+              text: 'PPT 数字与 OKR 不一致',
+              evidence: 'ppt.p1 vs doc',
+              cite: 'ppt.p1',
+              confidence: 0.95,
+              attribution: 'unsure',
+            },
+          ],
+        },
+        {
+          page: 2,
+          pageTitle: '商业模式',
+          hook: '为什么是这个方向',
+          core: '我们解决了真实痛点。',
+          transition: '继续下一页。',
+          critiques: [],
+        },
+      ],
+    });
+    expect(card.templateName).toBe('rehearsalPreview');
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    // header 含 v2 风格标识
+    expect(j).toContain('AI 听众预演');
+    expect(j).toContain('评委答辩'); // style=judges 显示
+    // 讲稿三段式
+    expect(j).toContain('钩子');
+    expect(j).toContain('核心');
+    expect(j).toContain('过渡');
+    // critique 分类图标
+    expect(j).toContain('🎯'); // audience
+    expect(j).toContain('⚖️'); // consistency
+    // unsure 标记
+    expect(j).toContain('⚠️来源待确认');
+    // 第 2 页无 critique → 显示"未发现明显问题"
+    expect(j).toContain('未发现明显问题');
+    // 反馈按钮
+    expect(j).toContain('同意 AI');
+    expect(j).toContain('我有不同意见');
+    expect(j).toContain('rehearsal.preview.agree');
+    expect(j).toContain('rehearsal.preview.disagree');
+    expect(j).toContain('rehearsal.preview.startAnalyze');
+  });
+
+  it('roadshow style → 显示"路演"标签', () => {
+    const card = larkCardBuilder.build('rehearsalPreview', {
+      chatId: 'oc_test',
+      totalPages: 1,
+      style: 'roadshow',
+      pages: [
+        {
+          page: 1,
+          pageTitle: 'p1',
+          hook: 'h',
+          core: 'c',
+          transition: 't',
+          critiques: [],
+        },
+      ],
+    });
+    expect(json(card)).toContain('路演');
+  });
+
+  it('error 态 → 红色 header + errorMessage', () => {
+    const card = larkCardBuilder.build('rehearsalPreview', {
+      chatId: 'oc_test',
+      totalPages: 0,
+      pages: [],
+      errorMessage: 'speaker LLM 全挂',
+    });
+    const j = json(card);
+    expect(j).toContain('AI 听众预演失败');
+    expect(j).toContain('speaker LLM 全挂');
+    expect(schema(card).header.template).toBe('red');
+  });
+});
+
+describe('rehearsalReview card (issue #145)', () => {
+  it('user / listener / unsure 三组分别渲染，user 默认 ☑、其他默认 ☐', () => {
+    const card = larkCardBuilder.build('rehearsalReview', {
+      chatId: 'oc_test',
+      round: 2,
+      changes: [
+        { id: 'c0', target: 'slides', text: 'A', source: 'user', defaultChecked: true },
+        { id: 'c1', target: 'slides', text: 'B', source: 'listener', defaultChecked: false },
+        { id: 'c2', target: 'doc', text: 'C', source: 'unsure', defaultChecked: false },
+      ],
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    expect(j).toContain('第 2 轮 review');
+    expect(j).toContain('共 **3** 条');
+    // 三组都出现
+    expect(j).toContain('用户主动反馈');
+    expect(j).toContain('AI 听众建议');
+    expect(j).toContain('来源待确认');
+    // user 默认勾，listener / unsure 默认不勾
+    expect(j).toContain('☑ **🎯 PPT** A');
+    expect(j).toContain('☐ **🎯 PPT** B');
+    expect(j).toContain('☐ **📄 doc** C');
+    // 三个底部决策按钮
+    expect(j).toContain('全部确认执行');
+    expect(j).toContain('我再改改');
+    expect(j).toContain('全部取消');
+  });
+
+  it('overLimitHint=true → 显式提示用户精简，不再静默截断', () => {
+    const card = larkCardBuilder.build('rehearsalReview', {
+      chatId: 'oc_test',
+      round: 5,
+      changes: Array.from({ length: 35 }, (_, i) => ({
+        id: `c${i}`,
+        target: 'slides' as const,
+        text: `change ${i}`,
+        source: 'user' as const,
+        defaultChecked: true,
+      })),
+      overLimitHint: true,
+    });
+    const j = json(card);
+    expect(j).toContain('改动条数偏多');
+    expect(j).toContain('请精简');
+    expect(j).toContain('不会再静默截断');
+  });
+
+  it('resolution=confirmed → 已处理态，不再渲染列表', () => {
+    const card = larkCardBuilder.build('rehearsalReview', {
+      chatId: 'oc_test',
+      round: 1,
+      changes: [],
+      resolution: 'confirmed',
+      resolvedAt: 1_700_000_000_000,
+    });
+    const j = json(card);
+    expect(j).toContain('Review 已处理');
+    expect(j).toContain('已按勾选子集开始重生成');
+    expect(j).not.toContain('全部确认执行');
+  });
+
+  it('resolution=cancelled → 提示回到反问澄清', () => {
+    const card = larkCardBuilder.build('rehearsalReview', {
+      chatId: 'oc_test',
+      round: 1,
+      changes: [],
+      resolution: 'cancelled',
+      resolvedAt: 1_700_000_000_000,
+    });
+    expect(json(card)).toContain('已取消');
+    expect(json(card)).toContain('反问澄清');
+  });
+
+  it('changes 为空 → 卡片仍能渲染（不会因为空数组崩）', () => {
+    const card = larkCardBuilder.build('rehearsalReview', {
+      chatId: 'oc_test',
+      round: 1,
+      changes: [],
+    });
+    const j = json(card);
+    expect(noPlaceholders(j)).toBe(true);
+    expect(j).toContain('共 **0** 条');
+  });
+
+  it('error 态 → 红色 header', () => {
+    const card = larkCardBuilder.build('rehearsalReview', {
+      chatId: 'oc_test',
+      round: 1,
+      changes: [],
+      errorMessage: 'review build failed',
+    });
+    expect(schema(card).header.template).toBe('red');
+    expect(json(card)).toContain('review build failed');
+  });
+});
+
 describe('weekly card', () => {
   it('renders weekRange, highlights, decisions, todos, metrics', () => {
     const card = larkCardBuilder.build('weekly', {

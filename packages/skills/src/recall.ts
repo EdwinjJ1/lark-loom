@@ -68,10 +68,19 @@ class RecallSkill implements Skill {
 
     if (!KEYWORDS.some((k) => msg.text.includes(k))) return false;
 
-    const histResult = await ctx.runtime.fetchHistory({ chatId: msg.chatId, pageSize: 10 });
-    const fetched = histResult.ok ? histResult.value.messages : [];
-    const hasCurrent = fetched.some((m) => m.messageId === msg.messageId);
-    const messages = hasCurrent ? fetched : [msg, ...fetched];
+    // 拉历史让 detector 能判断"已被回答" — 否则会对已经有答案的旧问题重复 recall
+    let messages: readonly typeof msg[] = [msg];
+    try {
+      const histResult = await ctx.runtime.fetchHistory({ chatId: msg.chatId, pageSize: 10 });
+      if (histResult && histResult.ok) {
+        const fetched = histResult.value.messages;
+        const hasCurrent = fetched.some((m) => m.messageId === msg.messageId);
+        messages = hasCurrent ? fetched : [msg, ...fetched];
+      }
+    } catch {
+      // history fetch 失败 → 退化为只看当前 msg
+    }
+
     const detector = new GapDetector(ctx.llm);
     const gapResult = await detector.detect(messages);
     if (!gapResult.ok || !gapResult.value.shouldRecall) return false;
