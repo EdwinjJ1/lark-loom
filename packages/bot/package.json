@@ -25,6 +25,7 @@
     "dev:probe-llm-tool": "node --env-file=../../.env --import tsx/esm src/scripts/probe-llm-tool.ts",
     "dev:probe-real-write": "node --env-file=../../.env --import tsx/esm src/scripts/probe-real-write.ts",
     "dev:check-memory": "node --env-file=../../.env --import tsx/esm src/scripts/check-memory.ts",
+    "dev:smoke-memory-compact-real": "node --env-file=../../.env --import tsx/esm src/scripts/smoke-memory-compact-real.ts",
     "start": "node --env-file=../../.env dist/index.js",
     "test": "vitest run --exclude '**/*.eval.test.ts' --exclude '**/memory-e2e.test.ts'",
     "test:e2e-memory": "node --env-file=../../.env --import tsx/esm ./node_modules/vitest/vitest.mjs run src/__tests__/memory-e2e.test.ts",

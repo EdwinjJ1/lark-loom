@@ -40,6 +40,8 @@ export const MEMORY_MAX_TOTAL = 2000;
 export const MEMORY_SCORE_FLUSH_MS = 30_000;
 export const MEMORY_MAX_QUERY_LENGTH = 64;
 export const MEMORY_SUMMARIZE_THRESHOLD_BYTES = 400;
+export const MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD = 3;
+export const MEMORY_SCORE_FAILURE_CIRCUIT_MS = 5 * 60 * 1000;
 /** compact 触发阈值：(chat_id, kind) 维度的记忆条数到达此值即压缩最早 batch 条 */
 export const MEMORY_COMPACT_THRESHOLD = 100;
 /** 一次 compact 操作压缩最早 N 条原文为 1 条 summary */
@@ -119,6 +121,15 @@ function matchesKeyword(memory: Pick<MemoryRecord, 'content' | 'raw'>, query: st
   return memory.content.includes(query) || memory.raw?.includes(query) === true;
 }
 
+function readNumberField(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
 /**
  * 计算淘汰分数：importance 70% + recency 30%
  * recency = 1 - clamp(daysSinceAccess / 30, 0, 1)，30 天前的记忆 recency=0
@@ -149,6 +160,9 @@ export class MemoryStore implements IMemoryStore {
   private readonly now: () => number;
   private scoreQueue: PendingScore[] = [];
   private scoreTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  private consecutiveScoreFailures = 0;
+  private scoreCircuitOpenUntil = 0;
+  private compactInFlight = new Set<string>();
   /** 每个 (chat_id, kind) 维度连续 compact 失败次数，成功一次清零 */
   private compactFailures = new Map<string, number>();
 
@@ -612,15 +626,39 @@ export class MemoryStore implements IMemoryStore {
     const queue = this.scoreQueue;
     this.scoreQueue = [];
     for (const item of queue) {
+      const now = this.now();
+      if (now < this.scoreCircuitOpenUntil) {
+        this.logger?.warn('memory: score skipped while circuit is open', {
+          skipped: queue.length,
+          openUntil: this.scoreCircuitOpenUntil,
+        });
+        break;
+      }
+
       const scoreResult = await this.score(item.content);
       if (!scoreResult.ok) {
-        this.logger?.warn('memory: score failed', {
+        this.consecutiveScoreFailures += 1;
+        const reachedThreshold =
+          this.consecutiveScoreFailures >= MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD;
+        this.logger?.warn(reachedThreshold ? 'memory: score circuit opened' : 'memory: score failed', {
           recordId: item.recordId,
           code: scoreResult.error.code,
           message: scoreResult.error.message,
+          consecutiveFailures: this.consecutiveScoreFailures,
+          ...(reachedThreshold
+            ? {
+                cooldownMs: MEMORY_SCORE_FAILURE_CIRCUIT_MS,
+              }
+            : {}),
         });
+        if (reachedThreshold) {
+          this.scoreCircuitOpenUntil = now + MEMORY_SCORE_FAILURE_CIRCUIT_MS;
+          this.consecutiveScoreFailures = 0;
+          break;
+        }
         continue;
       }
+      this.consecutiveScoreFailures = 0;
       const updateResult = await this.bitable.update({
         table: MEMORY_TABLE,
         recordId: item.recordId,
@@ -762,7 +800,14 @@ export class MemoryStore implements IMemoryStore {
   }
 
   private rowToMemory(row: Record<string, unknown> & { recordId: string }): MemoryRecord {
-    const isSummary = row.is_summary === true || row.is_summary === 1 || row.is_summary === 'true';
+    const sourceSkill = String(row.source_skill ?? '');
+    const key = String(row.key ?? '');
+    const isSummary =
+      row.is_summary === true ||
+      row.is_summary === 1 ||
+      row.is_summary === 'true' ||
+      sourceSkill === 'memory.compact' ||
+      key.startsWith('__summary_');
     let originalIds: readonly string[] | undefined;
     if (typeof row.original_ids === 'string' && row.original_ids) {
       try {
@@ -779,16 +824,20 @@ export class MemoryStore implements IMemoryStore {
       kind: row.kind as MemoryKind,
       chat_id: String(row.chat_id ?? ''),
       ...(typeof row.user_id === 'string' && row.user_id ? { user_id: row.user_id } : {}),
-      key: String(row.key ?? ''),
+      key,
       content: String(row.content ?? ''),
       ...(typeof row.raw === 'string' && row.raw ? { raw: row.raw } : {}),
       ...(typeof row.embedding === 'string' && row.embedding ? { embedding: row.embedding } : {}),
-      importance: typeof row.importance === 'number' ? row.importance : MEMORY_PENDING_SCORE,
-      last_access: typeof row.last_access === 'number' ? row.last_access : 0,
-      created_at: typeof row.created_at === 'number' ? row.created_at : 0,
-      source_skill: String(row.source_skill ?? ''),
+      importance: readNumberField(row.importance, MEMORY_PENDING_SCORE),
+      last_access: readNumberField(row.last_access, 0),
+      created_at: readNumberField(row.created_at, 0),
+      source_skill: sourceSkill,
       ...(isSummary ? { is_summary: true } : {}),
-      ...(typeof row.covered_count === 'number' ? { covered_count: row.covered_count } : {}),
+      ...(typeof row.covered_count === 'number'
+        ? { covered_count: row.covered_count }
+        : isSummary
+          ? { covered_count: MEMORY_COMPACT_BATCH }
+          : {}),
       ...(originalIds ? { original_ids: originalIds } : {}),
     };
   }
@@ -810,82 +859,119 @@ export class MemoryStore implements IMemoryStore {
    */
   private async compactIfNeeded(kind: MemoryKind, chatId: string): Promise<void> {
     if (!this.llm) return; // 没有 LLM 没法摘要，直接 fallback 给 enforceCapacity 的 LRU
-
-    const findResult = await this.bitable.find({
-      table: MEMORY_TABLE,
-      filter: this.buildFilter({ kind, chat_id: chatId }),
-      pageSize: MEMORY_MAX_PER_CHAT_KIND,
-    });
-    if (!findResult.ok) return;
-    if (findResult.value.records.length < MEMORY_COMPACT_THRESHOLD) return;
-
-    const all = findResult.value.records.map((r) => this.rowToMemory(r));
-    // 不把 summary 自身再次压进新 summary（避免无限套娃 + 价值衰减）
-    const compactable = all.filter((m) => m.is_summary !== true);
-    if (compactable.length < MEMORY_COMPACT_BATCH) return;
-
-    // 按 created_at 升序，最早的一批
-    const sorted = [...compactable].sort((a, b) => a.created_at - b.created_at);
-    const batch = sorted.slice(0, MEMORY_COMPACT_BATCH);
     const failKey = `${kind}:${chatId}`;
+    if (this.compactInFlight.has(failKey)) return;
+    this.compactInFlight.add(failKey);
 
-    const summaryText = await this.summarizeBatch(batch);
-    if (!summaryText) {
-      this.recordCompactFailure(failKey, kind, chatId);
-      return;
-    }
+    try {
+      const findResult = await this.bitable.find({
+        table: MEMORY_TABLE,
+        filter: this.buildFilter({ kind, chat_id: chatId }),
+        pageSize: MEMORY_MAX_PER_CHAT_KIND,
+      });
+      if (!findResult.ok) return;
+      if (findResult.value.records.length < MEMORY_COMPACT_THRESHOLD) return;
 
-    const now = this.now();
-    const truncated = truncateBytes(summaryText, MEMORY_MAX_CONTENT_BYTES);
-    const originalIds = batch.flatMap((m) => (m.id ? [m.id] : []));
-    const earliestCreated = batch[0]?.created_at ?? now;
+      const all = findResult.value.records.map((r) => this.rowToMemory(r));
+      // 不把 summary 自身再次压进新 summary（避免无限套娃 + 价值衰减）
+      const compactable = all.filter((m) => m.is_summary !== true);
+      if (compactable.length < MEMORY_COMPACT_BATCH) return;
 
-    // embedding 失败不阻断 compact，summary 仍写入
-    let embedding: string | undefined;
-    const embedResult = await this.llm.embed(truncated);
-    if (embedResult.ok) {
-      embedding = JSON.stringify(embedResult.value);
-    }
+      // 按 created_at 升序，最早的一批
+      const sorted = [...compactable].sort((a, b) => a.created_at - b.created_at);
+      const batch = sorted.slice(0, MEMORY_COMPACT_BATCH);
 
-    const summaryRow: Record<string, unknown> = {
-      kind,
-      chat_id: chatId,
-      key: `__summary_${earliestCreated}_${now}`,
-      content: truncated,
-      importance: 7, // summary 的默认重要度，避免被立即 LRU 淘汰
-      last_access: now,
-      created_at: now,
-      source_skill: 'memory.compact',
-      is_summary: true,
-      covered_count: batch.length,
-      original_ids: JSON.stringify(originalIds),
-    };
-    if (embedding !== undefined) summaryRow.embedding = embedding;
+      const summaryText = await this.summarizeBatch(batch);
+      if (!summaryText) {
+        this.recordCompactFailure(failKey, kind, chatId);
+        return;
+      }
 
-    const insertResult = await this.bitable.insert({ table: MEMORY_TABLE, row: summaryRow });
-    if (!insertResult.ok) {
-      this.recordCompactFailure(failKey, kind, chatId);
-      return;
-    }
+      const now = this.now();
+      const truncated = truncateBytes(summaryText, MEMORY_MAX_CONTENT_BYTES);
+      const originalIds = batch.flatMap((m) => (m.id ? [m.id] : []));
+      const earliestCreated = batch[0]?.created_at ?? now;
+      const summaryKey = `__summary_${earliestCreated}_${now}`;
 
-    // 删除原文。任一删除失败，summary 已留存，下次 compact 不会重复压缩同 id（id 列表已不存在）
-    let deleteFailures = 0;
-    for (const m of batch) {
-      if (!m.id) continue;
-      const delResult = await this.bitable.delete({ table: MEMORY_TABLE, recordId: m.id });
-      if (!delResult.ok) deleteFailures += 1;
-    }
+      // embedding 失败不阻断 compact，summary 仍写入
+      let embedding: string | undefined;
+      const embedResult = await this.llm.embed(truncated);
+      if (embedResult.ok) {
+        embedding = JSON.stringify(embedResult.value);
+      }
 
-    if (deleteFailures > 0) {
-      this.logger?.warn('memory: compact partial delete failure', {
+      const baseSummaryRow: Record<string, unknown> = {
         kind,
         chat_id: chatId,
-        deleteFailures,
-        batch: batch.length,
-      });
+        key: summaryKey,
+        content: truncated,
+        importance: 7, // summary 的默认重要度，避免被立即 LRU 淘汰
+        last_access: now,
+        created_at: now,
+        source_skill: 'memory.compact',
+      };
+      const summaryRow: Record<string, unknown> = {
+        ...baseSummaryRow,
+        is_summary: true,
+        covered_count: batch.length,
+        original_ids: JSON.stringify(originalIds),
+      };
+      if (embedding !== undefined) summaryRow.embedding = embedding;
+
+      const inserted = await this.insertCompactSummary(summaryRow, baseSummaryRow, kind, chatId);
+      if (!inserted) return;
+
+      // 删除原文。任一删除失败，summary 已留存，下次 compact 不会重复压缩同 id（id 列表已不存在）
+      let deleteFailures = 0;
+      for (const m of batch) {
+        if (!m.id) continue;
+        const delResult = await this.bitable.delete({ table: MEMORY_TABLE, recordId: m.id });
+        if (!delResult.ok) deleteFailures += 1;
+      }
+
+      if (deleteFailures > 0) {
+        this.logger?.warn('memory: compact partial delete failure', {
+          kind,
+          chat_id: chatId,
+          deleteFailures,
+          batch: batch.length,
+        });
+      }
+      // summary 已成功写入即视为本轮 compact 成功，清零失败计数
+      this.compactFailures.delete(failKey);
+    } finally {
+      this.compactInFlight.delete(failKey);
     }
-    // summary 已成功写入即视为本轮 compact 成功，清零失败计数
-    this.compactFailures.delete(failKey);
+  }
+
+  private async insertCompactSummary(
+    fullRow: Record<string, unknown>,
+    fallbackRow: Record<string, unknown>,
+    kind: MemoryKind,
+    chatId: string,
+  ): Promise<boolean> {
+    const failKey = `${kind}:${chatId}`;
+    const fullResult = await this.bitable.insert({ table: MEMORY_TABLE, row: fullRow });
+    if (fullResult.ok) return true;
+
+    this.logger?.warn('memory: compact summary insert failed, retrying minimal schema', {
+      kind,
+      chat_id: chatId,
+      code: fullResult.error.code,
+      message: fullResult.error.message,
+    });
+
+    const fallbackResult = await this.bitable.insert({ table: MEMORY_TABLE, row: fallbackRow });
+    if (fallbackResult.ok) return true;
+
+    this.logger?.warn('memory: compact minimal summary insert failed', {
+      kind,
+      chat_id: chatId,
+      code: fallbackResult.error.code,
+      message: fallbackResult.error.message,
+    });
+    this.recordCompactFailure(failKey, kind, chatId);
+    return false;
   }
 
   /**

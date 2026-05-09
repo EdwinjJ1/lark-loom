@@ -5,13 +5,14 @@ import {
   MEMORY_MAX_PER_CHAT_KIND,
   MEMORY_MAX_TOTAL,
   MEMORY_SUMMARIZE_THRESHOLD_BYTES,
+  MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD,
   MEMORY_COMPACT_THRESHOLD,
   MEMORY_COMPACT_BATCH,
   MEMORY_COMPACT_MAX_FAILURES,
   cosineSimilarity,
   evictScore,
 } from '../memory/memory-store.js';
-import type { BitableClient, LLMClient, Result, AppError } from '@seedhac/contracts';
+import type { BitableClient, LLMClient, Result, AppError, Logger } from '@seedhac/contracts';
 import { ok, err, ErrorCode, makeError } from '@seedhac/contracts';
 
 // ────────────────────────────────────────────────────────────────────
@@ -342,6 +343,35 @@ describe('MemoryStore.read', () => {
 });
 
 describe('MemoryStore.list/delete', () => {
+  it('兼容飞书旧表把数字字段按字符串返回', async () => {
+    const bitable = new FakeBitable();
+    const store = new MemoryStore({ bitable, now: () => 1000 });
+    bitable.seed([
+      {
+        recordId: 'rec_string_numbers',
+        fields: {
+          kind: 'chat',
+          chat_id: 'chat_a',
+          key: 'k1',
+          content: '数字字段是字符串',
+          importance: '8',
+          last_access: '1700000000000',
+          created_at: '1699999999000',
+          source_skill: 'qa',
+        },
+      },
+    ]);
+
+    const listed = await store.list({ chatId: 'chat_a', kind: 'chat', minImportance: 7 });
+
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) return;
+    expect(listed.value).toHaveLength(1);
+    expect(listed.value[0]?.importance).toBe(8);
+    expect(listed.value[0]?.last_access).toBe(1_700_000_000_000);
+    expect(listed.value[0]?.created_at).toBe(1_699_999_999_000);
+  });
+
   it('lists records by kind/chat/minImportance and deletes compressed records', async () => {
     const bitable = new FakeBitable();
     const store = new MemoryStore({ bitable, now: () => 1000 });
@@ -613,6 +643,60 @@ describe('MemoryStore — 评分队列批量化', () => {
 
     await store.flushScoreQueue();
     expect(llm.scoreCallCount).toBe(1);
+  });
+
+  it('连续评分失败后打开熔断，避免 score 日志和 LLM 调用刷屏', async () => {
+    const bitable = new FakeBitable();
+    const llm = new FakeLLM();
+    llm.nextScore = Number.NaN;
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      logger,
+      scoreFlushMs: 1,
+      now: () => 1000,
+    });
+
+    for (let i = 0; i < MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD + 2; i++) {
+      await store.write({
+        kind: 'chat',
+        chat_id: 'oc_1',
+        key: `fail_${i}`,
+        content: `第 ${i} 条`,
+        source_skill: 'qa',
+      });
+    }
+
+    await store.flushScoreQueue();
+
+    expect(llm.scoreCallCount).toBe(MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'memory: score circuit opened',
+      expect.objectContaining({
+        consecutiveFailures: MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD,
+      }),
+    );
+
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'still_open',
+      content: '熔断期间不应再打分',
+      source_skill: 'qa',
+    });
+    await store.flushScoreQueue();
+
+    expect(llm.scoreCallCount).toBe(MEMORY_SCORE_FAILURE_CIRCUIT_THRESHOLD);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'memory: score skipped while circuit is open',
+      expect.objectContaining({ skipped: 1 }),
+    );
   });
 
   it('未注入 LLM 时 write 仍可用，只是不评分', async () => {
@@ -962,19 +1046,19 @@ describe('MemoryStore — embedding 写入与语义搜索', () => {
 // compact: 每 (chat_id, kind) 超 100 条压缩最早 50 条为 1 条 summary
 // ────────────────────────────────────────────────────────────────────
 
-interface FakeLogger {
-  warn: ReturnType<typeof vi.fn>;
-  info: ReturnType<typeof vi.fn>;
-  error: ReturnType<typeof vi.fn>;
-  debug: ReturnType<typeof vi.fn>;
+interface FakeLogger extends Logger {
+  warn: ReturnType<typeof vi.fn<Logger['warn']>>;
+  info: ReturnType<typeof vi.fn<Logger['info']>>;
+  error: ReturnType<typeof vi.fn<Logger['error']>>;
+  debug: ReturnType<typeof vi.fn<Logger['debug']>>;
 }
 
 function makeFakeLogger(): FakeLogger {
   return {
-    warn: vi.fn(),
-    info: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
+    warn: vi.fn<Logger['warn']>(),
+    info: vi.fn<Logger['info']>(),
+    error: vi.fn<Logger['error']>(),
+    debug: vi.fn<Logger['debug']>(),
   };
 }
 
@@ -1082,6 +1166,53 @@ describe('MemoryStore — compact', () => {
     }
     // 后 49 条 + 新触发条 + 1 条 summary = 51
     expect(bitable.size()).toBe(MEMORY_COMPACT_THRESHOLD - MEMORY_COMPACT_BATCH + 1);
+  });
+
+  it('真实旧表缺 compact metadata 字段时，降级写最小 summary schema 并继续删除原文', async () => {
+    const bitable = new FakeBitable();
+    const originalInsert = bitable.insert.bind(bitable);
+    vi.spyOn(bitable, 'insert').mockImplementation(async (params) => {
+      if (params.row['is_summary'] === true) {
+        return err(makeError(ErrorCode.FEISHU_API_ERROR, 'unknown field: is_summary'));
+      }
+      return originalInsert(params);
+    });
+    const llm = new FakeLLM();
+    const logger = makeFakeLogger();
+    seedConversation(bitable, MEMORY_COMPACT_THRESHOLD - 1);
+    llm.askImpl = () => ok('旧表兼容摘要');
+
+    const store = new MemoryStore({
+      bitable,
+      llm,
+      logger,
+      scoreFlushMs: 100_000,
+      now: () => 9_000_000,
+    });
+
+    await store.write({
+      kind: 'chat',
+      chat_id: 'oc_1',
+      key: 'msg_trigger',
+      content: '触发条',
+      source_skill: 'qa',
+      importance: 5,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    const summaries = await store.list({ chatId: 'oc_1', kind: 'chat', sourceSkill: 'memory.compact' });
+    expect(summaries.ok).toBe(true);
+    expect(summaries.ok && summaries.value).toHaveLength(1);
+    if (summaries.ok) {
+      expect(summaries.value[0]?.is_summary).toBe(true);
+      expect(summaries.value[0]?.covered_count).toBe(MEMORY_COMPACT_BATCH);
+      expect(summaries.value[0]?.content).toBe('旧表兼容摘要');
+    }
+    expect(bitable.size()).toBe(MEMORY_COMPACT_THRESHOLD - MEMORY_COMPACT_BATCH + 1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'memory: compact summary insert failed, retrying minimal schema',
+      expect.objectContaining({ message: 'unknown field: is_summary' }),
+    );
   });
 
   it('LLM 摘要失败不删原文，failure 计数 +1，logger 不告警（首次失败）', async () => {

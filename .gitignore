@@ -5,6 +5,7 @@ __pycache__/
 .env
 .env.local
 .env.*.local
+.env.bak.*
 .venv/
 venv/
 dist/

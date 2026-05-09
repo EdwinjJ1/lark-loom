@@ -203,6 +203,33 @@ describe('handleEvent wiring', () => {
     expect(taskSkill.run).toHaveBeenCalledOnce();
   });
 
+  it('backfill recovered non-mention messages do not run passive skills or send replies', async () => {
+    const taskSkill: Skill = {
+      ...qaSkill,
+      name: 'taskAssignment' as SkillName,
+      match: vi.fn().mockReturnValue(true),
+      run: vi.fn().mockResolvedValue(ok({ text: '任务已记录' })),
+    };
+    const runtime = makeRuntime();
+    const msg = makeMessage({
+      text: '小明你来负责资料整理',
+      mentions: [],
+      meta: { source: 'backfill', containerChatId: 'oc_chat1' },
+    });
+    const ctx = makeCtx(makeEvent(msg), runtime);
+
+    await handleEvent(ctx, router, {
+      taskAssignment: taskSkill,
+    } as unknown as Record<SkillName, Skill>);
+
+    expect(taskSkill.run).not.toHaveBeenCalled();
+    expect(runtime.sendText).not.toHaveBeenCalled();
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      'backfill non-mention message skipped',
+      expect.objectContaining({ chatId: 'oc_chat1', messageId: 'msg_1' }),
+    );
+  });
+
   // 4b. progressUpdate intent → 调对应 skill.run
   it('progressUpdate intent → progressUpdate skill.run called', async () => {
     const progressSkill: Skill = {
@@ -319,20 +346,16 @@ describe('handleEvent wiring', () => {
     await handleEvent(ctx, router, { qa: skill } as unknown as Record<SkillName, Skill>);
     await vi.waitFor(() => expect(memoryStore.write).toHaveBeenCalledTimes(2));
 
-    // skill_log + chat 并行写入；不显式传 importance（让 store 异步 LLM 评分）。
     const writeKinds = memoryStore.write.mock.calls.map(
       (call) => (call[0] as { kind: string }).kind,
     );
     expect(writeKinds.sort()).toEqual(['chat', 'skill_log']);
     expect(memoryStore.write).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'skill_log', source_skill: 'qa' }),
+      expect.objectContaining({ kind: 'skill_log', source_skill: 'qa', importance: 4 }),
     );
     expect(memoryStore.write).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'chat', source_skill: 'qa' }),
+      expect.objectContaining({ kind: 'chat', source_skill: 'qa', importance: 5 }),
     );
-    for (const call of memoryStore.write.mock.calls) {
-      expect((call[0] as { importance?: number }).importance).toBeUndefined();
-    }
   });
 
   it('schedule event sends selected skill output to the scheduled chat', async () => {

@@ -29,7 +29,7 @@ const NO_GAP: GapDetection = {
 };
 
 interface TriggerRule {
-  readonly kind: '模糊指代' | '记忆型' | '疑问无人答' | '决策追溯';
+  readonly kind: '模糊指代' | '记忆型' | '疑问无人答' | '决策追溯' | '项目信息查询';
   readonly patterns: readonly RegExp[];
 }
 

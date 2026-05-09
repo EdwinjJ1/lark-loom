@@ -97,6 +97,7 @@ describe('LarkBotRuntime', () => {
     expect(event.payload.chatId).toBe('oc_chat1');
     expect(event.payload.sender.userId).toBe('ou_abc');
     expect(event.payload.text).toBe('hello'); // @ 占位符被剥离
+    expect(event.payload.meta?.source).toBe('ws');
     expect(event.payload.mentions).toHaveLength(1);
     expect(event.payload.mentions[0].key).toBe('@_user_1');
   });
@@ -467,6 +468,40 @@ describe('LarkBotRuntime.backfillOnce()', () => {
       (c) => (c[0] as { payload: { messageId: string } }).payload.messageId,
     );
     expect(ids).toEqual(['msg_1', 'msg_2']);
+    const event = (handler as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+      payload: { meta?: Record<string, unknown> };
+    };
+    expect(event.payload.meta?.source).toBe('backfill');
+    expect(event.payload.meta?.containerChatId).toBe('oc_a');
+  });
+
+  it('backfill falls back to container chatId when list item omits chat_id', async () => {
+    const runtime = makeBackfillRuntime();
+    const handler: EventHandler = vi.fn();
+    runtime.on(handler);
+
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_container' }] },
+    });
+    mockMessageList.mockResolvedValueOnce({ code: 0, data: { items: [] } });
+    await runtime.backfillOnce();
+
+    const item = listItem('msg_missing_chat', 'oc_container', 1700000001000);
+    delete item['chat_id'];
+    mockChatList.mockResolvedValueOnce({
+      code: 0,
+      data: { items: [{ chat_id: 'oc_container' }] },
+    });
+    mockMessageList.mockResolvedValueOnce({ code: 0, data: { items: [item] } });
+    await runtime.backfillOnce();
+
+    expect(handler).toHaveBeenCalledOnce();
+    const event = (handler as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+      payload: { chatId: string; meta?: Record<string, unknown> };
+    };
+    expect(event.payload.chatId).toBe('oc_container');
+    expect(event.payload.meta?.source).toBe('backfill');
   });
 
   it('does NOT re-emit messages already pushed via WS', async () => {
