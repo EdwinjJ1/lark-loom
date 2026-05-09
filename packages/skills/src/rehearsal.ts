@@ -52,9 +52,31 @@ import {
   type RelevanceCandidate,
 } from './prompts/requirement-doc.js';
 import { OutlineSchema, SLIDES_PROMPT } from './prompts/slides.js';
+import {
+  LISTENER_PROMPT,
+  SPEAKER_PROMPT,
+  SpeakerTranscriptPageSchema,
+  makeListenerCritiqueBatchSchema,
+  type ListenerCritique,
+  type PreviewDocSection,
+  type PreviewSlideInput,
+  type PreviewStyle,
+  type SpeakerTranscriptPage,
+} from './prompts/rehearsal-preview.js';
+import { verifyAttribution, type ClassifiedCritique } from './utils/attribution.js';
 import { clamp } from './utils/clamp.js';
+import { findCoreDocToken } from './core-doc.js';
+import type {
+  RehearsalCritiqueCategory,
+  RehearsalListenerCritique,
+  RehearsalPreviewPage,
+  RehearsalReviewChange,
+} from '@seedhac/contracts';
 
-const TRIGGER_RE = /演练|演示练习|彩排|汇报复盘|根据刚才反馈修改/i;
+const TRIGGER_RE = /演练|演示练习|彩排|汇报复盘|根据刚才反馈修改|AI\s*试讲|试讲一下/i;
+// rehearsal v2 preview 风格切换（可选）
+const STYLE_ROADSHOW_RE = /路演|生动|轻盈|轻一点/;
+const STYLE_JUDGES_RE = /评委|严肃|学术|正式/;
 // 满意信号：避开"完成了项目 / 完成了任务"等 false positive。
 //   - "满意" 不接受 "不满意 / 没满意"
 //   - "完成" 必须作为独立短语：句尾 / 后接终止标点 / 后接空白结束
@@ -70,11 +92,39 @@ const MAX_HISTORY_FOR_ANALYSIS = 50;
 const SESSION_KEY = 'rehearsal_session';
 export const REHEARSAL_SESSION_KEY = SESSION_KEY;
 
-// session JSON 写到 memory.content（2KB 上限）。每条 change ~80-150 字节，留些余地，
-// 累计到这个上限时丢掉最旧的 — 长 rehearsal 也不会因为状态超长而 parse 失败。
-const MAX_RECOMMENDED_CHANGES = 30;
+// session JSON 写到 memory.content（2KB 上限）。每条 change ~80-150 字节，留些余地。
+// v2 起不再静默截断 —— 改用 review 卡 UI 提示用户精简。仅做软上限警告。
+const SOFT_LIMIT_RECOMMENDED_CHANGES = 30;
 
-export type RehearsalPhase = 'analyzing' | 'clarifying' | 'done';
+// 自动进 analyzing 的"用户反馈页数"门槛（issue #145 P1）
+const PREVIEW_FEEDBACK_THRESHOLD = 3;
+
+// embedding 语义去重的 cosine 相似度门槛
+const EMBEDDING_DEDUP_THRESHOLD = 0.85;
+
+export type RehearsalPhase =
+  | 'preview'
+  | 'analyzing'
+  | 'clarifying'
+  | 'reviewing'
+  | 'done';
+
+/**
+ * 累积的一条 change。v2 加了可选的 id / source（review 卡勾选过滤用）。
+ * 兼容 v1：旧 session 缺这两个字段时，parseSession 会自动补上 id_legacy_<i> + source='user'。
+ */
+export interface RehearsalChangeWithMeta extends RehearsalChange {
+  readonly id?: string;
+  readonly source?: 'user' | 'listener' | 'history';
+}
+
+export interface UserPageFeedback {
+  readonly page: number;
+  readonly text: string;
+  readonly userId?: string;
+  readonly userName?: string;
+  readonly at: number;
+}
 
 export interface RehearsalSession {
   readonly phase: RehearsalPhase;
@@ -83,10 +133,22 @@ export interface RehearsalSession {
   readonly analysisMessageId?: string;
   /** 当前反问卡的 messageId，用于 patch acknowledged 态 */
   readonly clarifyMessageId?: string;
-  /** 累积的 recommendedChanges（每轮叠加） */
-  readonly recommendedChanges: readonly RehearsalChange[];
+  /** 当前 review 卡的 messageId（v2） */
+  readonly reviewMessageId?: string;
+  /** 当前 preview 卡的 messageId（v2） */
+  readonly previewMessageId?: string;
+  /** 累积的 recommendedChanges（每轮叠加，带 id + source） */
+  readonly recommendedChanges: readonly RehearsalChangeWithMeta[];
   /** 上一轮 uncertainties，用于 iterate 按钮直接复用 */
   readonly lastUncertainties: readonly string[];
+  /** v2: AI 听众已校验过 attribution 的 critique（confirmed + unsure） */
+  readonly listenerCritiques?: readonly RehearsalListenerCritique[];
+  /** v2: 用户对 preview 卡的分页反馈 */
+  readonly userPageFeedback?: readonly UserPageFeedback[];
+  /** v2: review 卡上用户勾选的 changeId 列表（confirm 后过滤用） */
+  readonly reviewSelection?: readonly string[];
+  /** v2: preview 风格 */
+  readonly style?: PreviewStyle;
   /** 启动时间，用于诊断 */
   readonly startedAt: number;
   readonly updatedAt: number;
@@ -128,6 +190,45 @@ function parseSession(content: string): RehearsalSession | null {
   try {
     const parsed = JSON.parse(content) as Partial<RehearsalSession>;
     if (typeof parsed.phase !== 'string' || typeof parsed.round !== 'number') return null;
+    // 兼容 v1 session（旧格式 recommendedChanges 是 RehearsalChange[]，无 id / source）
+    const rawChanges = Array.isArray(parsed.recommendedChanges) ? parsed.recommendedChanges : [];
+    const recommendedChanges: RehearsalChangeWithMeta[] = rawChanges
+      .map((c, i): RehearsalChangeWithMeta | null => {
+        if (typeof c !== 'object' || c === null) return null;
+        const raw = c as Record<string, unknown>;
+        const target = raw['target'];
+        const text = typeof raw['text'] === 'string' ? raw['text'].trim() : '';
+        if (!text) return null;
+        if (target !== 'slides' && target !== 'doc') return null;
+        const id = typeof raw['id'] === 'string' ? raw['id'] : `c_legacy_${i}`;
+        const sourceRaw = typeof raw['source'] === 'string' ? raw['source'] : 'user';
+        const source: 'user' | 'listener' | 'history' =
+          sourceRaw === 'listener' || sourceRaw === 'history' ? sourceRaw : 'user';
+        return { id, target, text, source };
+      })
+      .filter((x): x is RehearsalChangeWithMeta => x !== null);
+
+    const listenerCritiques: RehearsalListenerCritique[] = Array.isArray(parsed.listenerCritiques)
+      ? (parsed.listenerCritiques as RehearsalListenerCritique[]).filter(
+          (c): c is RehearsalListenerCritique =>
+            !!c && typeof c === 'object' && typeof c.id === 'string',
+        )
+      : [];
+
+    const userPageFeedback: UserPageFeedback[] = Array.isArray(parsed.userPageFeedback)
+      ? (parsed.userPageFeedback as UserPageFeedback[]).filter(
+          (f): f is UserPageFeedback =>
+            !!f && typeof f === 'object' && typeof f.page === 'number' && typeof f.text === 'string',
+        )
+      : [];
+
+    const reviewSelection: string[] = Array.isArray(parsed.reviewSelection)
+      ? (parsed.reviewSelection as unknown[]).filter((x): x is string => typeof x === 'string')
+      : [];
+
+    const style: PreviewStyle | undefined =
+      parsed.style === 'roadshow' || parsed.style === 'judges' ? parsed.style : undefined;
+
     return {
       phase: parsed.phase as RehearsalPhase,
       round: parsed.round,
@@ -137,12 +238,20 @@ function parseSession(content: string): RehearsalSession | null {
       ...(typeof parsed.clarifyMessageId === 'string'
         ? { clarifyMessageId: parsed.clarifyMessageId }
         : {}),
-      recommendedChanges: Array.isArray(parsed.recommendedChanges)
-        ? (parsed.recommendedChanges as RehearsalChange[])
-        : [],
+      ...(typeof parsed.reviewMessageId === 'string'
+        ? { reviewMessageId: parsed.reviewMessageId }
+        : {}),
+      ...(typeof parsed.previewMessageId === 'string'
+        ? { previewMessageId: parsed.previewMessageId }
+        : {}),
+      recommendedChanges,
       lastUncertainties: Array.isArray(parsed.lastUncertainties)
         ? (parsed.lastUncertainties as string[])
         : [],
+      listenerCritiques,
+      userPageFeedback,
+      reviewSelection,
+      ...(style ? { style } : {}),
       startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : Date.now(),
       updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : Date.now(),
     };
@@ -151,12 +260,56 @@ function parseSession(content: string): RehearsalSession | null {
   }
 }
 
+/**
+ * 把 session JSON 控制在 ~2KB 以内时**不能用 clamp**：clamp 会在尾部加 "…" 截断，破坏 JSON。
+ * v2 不再 slice changes，所以会有 30+ 条 case。我们对结构化字段做主动瘦身：
+ *   - listenerCritiques.text 截断到 80 字（review 卡只显示一行）
+ *   - userPageFeedback.text 截断到 100 字
+ *   - 仍然超 2.5KB 才丢弃最旧的 listenerCritiques / userPageFeedback（保留 changes 完整性）
+ */
+function compactSessionForStorage(session: RehearsalSession): RehearsalSession {
+  const compactCritique = (c: RehearsalListenerCritique): RehearsalListenerCritique => ({
+    ...c,
+    text: c.text.length > 80 ? `${c.text.slice(0, 79)}…` : c.text,
+    evidence: c.evidence.length > 60 ? `${c.evidence.slice(0, 59)}…` : c.evidence,
+  });
+  const compactFeedback = (f: UserPageFeedback): UserPageFeedback => ({
+    ...f,
+    text: f.text.length > 100 ? `${f.text.slice(0, 99)}…` : f.text,
+  });
+
+  let compact: RehearsalSession = {
+    ...session,
+    listenerCritiques: (session.listenerCritiques ?? []).map(compactCritique),
+    userPageFeedback: (session.userPageFeedback ?? []).map(compactFeedback),
+  };
+
+  // 如果还是超，逐步丢弃最旧的 listenerCritiques / userPageFeedback（保 recommendedChanges 不动）
+  const HARD_CAP = 6_000; // 给底层 storage 留余地，超过就分批丢
+  let serialized = JSON.stringify(compact);
+  while (serialized.length > HARD_CAP) {
+    const lc = compact.listenerCritiques ?? [];
+    const ufb = compact.userPageFeedback ?? [];
+    if (lc.length > 0) {
+      compact = { ...compact, listenerCritiques: lc.slice(1) };
+    } else if (ufb.length > 0) {
+      compact = { ...compact, userPageFeedback: ufb.slice(1) };
+    } else {
+      // changes 不动，让底层 storage 决定 — 否则就违反"用户决策依据 ≠ 执行依据"原则
+      break;
+    }
+    serialized = JSON.stringify(compact);
+  }
+  return compact;
+}
+
 async function saveSession(
   ctx: SkillContext,
   chatId: string,
   session: RehearsalSession,
 ): Promise<void> {
-  const content = clamp(JSON.stringify(session), 'LONG');
+  // v2：不能用 clamp（"…"截断破坏 JSON）；改用结构化瘦身
+  const content = JSON.stringify(compactSessionForStorage(session));
   if (ctx.memoryStore) {
     const res = await ctx.memoryStore.write({
       kind: 'skill_log',
@@ -227,7 +380,28 @@ export function isFreshTrigger(text: string): boolean {
 /** session 是否处于"等用户继续输入反馈或满意信号"的状态 */
 export function isAwaitingUserResponse(session: RehearsalSession | null): boolean {
   if (!session) return false;
-  return session.phase === 'analyzing' || session.phase === 'clarifying';
+  return (
+    session.phase === 'analyzing' ||
+    session.phase === 'clarifying' ||
+    session.phase === 'preview' ||
+    session.phase === 'reviewing'
+  );
+}
+
+function detectStyle(text: string): PreviewStyle | undefined {
+  if (STYLE_ROADSHOW_RE.test(text)) return 'roadshow';
+  if (STYLE_JUDGES_RE.test(text)) return 'judges';
+  return undefined;
+}
+
+function nextChangeId(prefix: string, existing: ReadonlySet<string>): string {
+  let i = 0;
+  while (i < 10_000) {
+    const candidate = `${prefix}_${i}`;
+    if (!existing.has(candidate)) return candidate;
+    i += 1;
+  }
+  return `${prefix}_${Date.now()}`;
 }
 
 // ─── 历史拉取 + 相关性预筛（仿 summary）──────────────────────────────────────
@@ -303,6 +477,52 @@ async function analyze(
   const filtered = await filterByRelevance(ctx, trigger, histRes.value.messages);
   const history = filtered.slice(-MAX_HISTORY_FOR_ANALYSIS);
 
+  // 把 listener critique + 用户分页反馈 通过合成消息塞进 history 头部，
+  // 不动 REHEARSAL_PROMPT 的 schema，让既有反幻觉规则继续生效。
+  const augmentedHistory: Message[] = [];
+  if (prevSession?.listenerCritiques?.length) {
+    const text = [
+      'AI 听众预演产出（已通过 attribution 校验）：',
+      ...prevSession.listenerCritiques.slice(0, 30).map((c) => {
+        const unsureMark = c.attribution === 'unsure' ? '⚠️ unsure' : '';
+        return `  - [${c.category}] 第 ${c.page} 页 ${unsureMark}: ${c.text}（依据：${c.evidence}）`;
+      }),
+    ].join('\n');
+    augmentedHistory.push({
+      messageId: 'rehearsal_listener',
+      chatId: trigger.chatId,
+      chatType: 'group',
+      sender: { userId: 'rehearsal_bot', name: 'AI 听众' },
+      contentType: 'text',
+      text: clamp(text, 'LONG'),
+      rawContent: '',
+      mentions: [],
+      timestamp: Date.now(),
+    });
+  }
+  if (prevSession?.userPageFeedback?.length) {
+    const text = [
+      '用户分页反馈（来自 preview 卡）：',
+      ...prevSession.userPageFeedback.slice(-15).map((f) => {
+        const who = f.userName ?? f.userId ?? '匿名';
+        return `  - 第 ${f.page} 页 [${who}]: ${f.text}`;
+      }),
+    ].join('\n');
+    augmentedHistory.push({
+      messageId: 'rehearsal_userfb',
+      chatId: trigger.chatId,
+      chatType: 'group',
+      sender: { userId: 'rehearsal_bot', name: '用户分页反馈' },
+      contentType: 'text',
+      text: clamp(text, 'LONG'),
+      rawContent: '',
+      mentions: [],
+      timestamp: Date.now(),
+    });
+  }
+
+  const combinedHistory = [...augmentedHistory, ...history];
+
   const prevContext = prevSession
     ? {
         round: prevSession.round + 1,
@@ -311,7 +531,7 @@ async function analyze(
     : undefined;
 
   const llmRes = await ctx.llm.askStructured(
-    REHEARSAL_PROMPT(history, prevContext),
+    REHEARSAL_PROMPT(combinedHistory, prevContext),
     RehearsalAnalysisSchema,
     { model: 'pro', timeoutMs: 90_000 },
   );
@@ -342,7 +562,7 @@ interface SlidesRegenResult {
 async function regenerateSlides(
   ctx: SkillContext,
   chatId: string,
-  changes: readonly RehearsalChange[],
+  changes: readonly RehearsalChangeWithMeta[],
 ): Promise<SlidesRegenResult | undefined> {
   if (!ctx.slides) {
     ctx.logger.warn('rehearsal: slides client not configured, skip regeneration', { chatId });
@@ -456,7 +676,7 @@ async function regenerateSlides(
 async function regenerateReportDoc(
   ctx: SkillContext,
   chatId: string,
-  changes: readonly RehearsalChange[],
+  changes: readonly RehearsalChangeWithMeta[],
 ): Promise<string | undefined> {
   const docChanges = changes.filter((c) => c.target === 'doc');
   if (docChanges.length === 0) return undefined;
@@ -686,10 +906,13 @@ async function performAnalysisRound(
   const analysis = analysisRes.value;
   const filtered = applyConfidenceFilter(analysis);
 
-  // 累积 recommendedChanges：去重以 text+target 为 key
-  const accumulated = mergeChanges(
+  // 累积 recommendedChanges：v2 用 embedding 语义去重（issue #145）
+  // 标记 source: prev 已有的保留各自 source；本轮 LLM 给的来自 history（群聊/纪要）
+  const accumulated = await mergeChangesV2(
+    ctx,
     prevSession?.recommendedChanges ?? [],
     analysis.recommendedChanges,
+    'history',
   );
 
   // patch 分析卡
@@ -736,8 +959,13 @@ async function performAnalysisRound(
     round,
     analysisMessageId: loadingMessageId,
     ...(clarifyMessageId ? { clarifyMessageId } : {}),
+    ...(prevSession?.previewMessageId ? { previewMessageId: prevSession.previewMessageId } : {}),
     recommendedChanges: accumulated,
     lastUncertainties: filtered.uncertainties,
+    listenerCritiques: prevSession?.listenerCritiques ?? [],
+    userPageFeedback: prevSession?.userPageFeedback ?? [],
+    reviewSelection: prevSession?.reviewSelection ?? [],
+    ...(prevSession?.style ? { style: prevSession.style } : {}),
     startedAt: prevSession?.startedAt ?? Date.now(),
     updatedAt: Date.now(),
   };
@@ -749,37 +977,129 @@ async function performAnalysisRound(
   });
 }
 
-function mergeChanges(
-  prev: readonly RehearsalChange[],
+/**
+ * v2 版 mergeChanges（修 issue #145 三个子 bug）：
+ *   - 用户决策依据 ≠ 执行依据 → review 卡显式列累积全集（在 performReview 处）
+ *   - 静默截断 → 改为返回完整集合 + 软上限信号；UI 提示用户精简，不再 slice
+ *   - 去重粒度粗 → 优先 embedding 余弦相似度合并；embed 不可用回退到旧 `target::text` key
+ *
+ * 入参 prev 已带 id/source，next 来自 LLM analyze 输出（无 id），需要分配 id + source。
+ */
+async function mergeChangesV2(
+  ctx: SkillContext,
+  prev: readonly RehearsalChangeWithMeta[],
   next: readonly RehearsalChange[],
-): readonly RehearsalChange[] {
-  const seen = new Set<string>(prev.map((c) => `${c.target}::${c.text}`));
-  const out: RehearsalChange[] = [...prev];
-  for (const c of next) {
-    const k = `${c.target}::${c.text}`;
-    if (!seen.has(k)) {
-      out.push(c);
-      seen.add(k);
+  defaultSource: 'user' | 'listener' | 'history',
+): Promise<readonly RehearsalChangeWithMeta[]> {
+  if (next.length === 0) return prev;
+
+  const existingIds = new Set<string>(
+    prev.map((c) => c.id).filter((id): id is string => typeof id === 'string'),
+  );
+  const out: RehearsalChangeWithMeta[] = [...prev];
+
+  // 先做 cheap 层：完全相同 target+text 直接跳过
+  const exactKeys = new Set(prev.map((c) => `${c.target}::${c.text}`));
+
+  // 准备 embedding cache（prev 的 embedding 一次性拉，next 增量算）
+  const embedCache = new Map<string, readonly number[]>();
+  let embedAvailable = true;
+
+  async function embed(text: string): Promise<readonly number[] | null> {
+    if (!embedAvailable) return null;
+    const cached = embedCache.get(text);
+    if (cached) return cached;
+    let res: Awaited<ReturnType<typeof ctx.llm.embed>> | undefined;
+    try {
+      res = await ctx.llm.embed(text);
+    } catch {
+      embedAvailable = false;
+      return null;
     }
+    if (!res || !res.ok) {
+      // 任何一次 embed 失败就关掉 embedding 路径（多半是 CONFIG_MISSING / 测试 mock 未实现）
+      ctx.logger.info('rehearsal: embedding unavailable, dedup falls back to exact key', {
+        code: res?.ok === false ? res.error.code : 'embed_unimplemented',
+      });
+      embedAvailable = false;
+      return null;
+    }
+    embedCache.set(text, res.value);
+    return res.value;
   }
-  // 防 session JSON 超 2KB：超出上限保留最新的（老的多半已应用进 round 1-2 的 PPT）
-  if (out.length > MAX_RECOMMENDED_CHANGES) {
-    return out.slice(-MAX_RECOMMENDED_CHANGES);
+
+  // 预先 embed prev（小心错误）
+  for (const c of prev) {
+    await embed(c.text);
+    if (!embedAvailable) break;
   }
+
+  for (const c of next) {
+    const exactKey = `${c.target}::${c.text}`;
+    if (exactKeys.has(exactKey)) continue;
+
+    let merged = false;
+    if (embedAvailable) {
+      const emb = await embed(c.text);
+      if (emb) {
+        for (const existing of out) {
+          if (existing.target !== c.target) continue;
+          const existingEmb = await embed(existing.text);
+          if (!existingEmb) break;
+          if (cosine(emb, existingEmb) >= EMBEDDING_DEDUP_THRESHOLD) {
+            merged = true;
+            ctx.logger.info('rehearsal: change merged by embedding similarity', {
+              kept: existing.text.slice(0, 60),
+              dropped: c.text.slice(0, 60),
+            });
+            break;
+          }
+        }
+      }
+    }
+    if (merged) continue;
+
+    const id = nextChangeId('c', existingIds);
+    existingIds.add(id);
+    exactKeys.add(exactKey);
+    out.push({ ...c, id, source: defaultSource });
+  }
+
+  // 不再 slice。超过软上限只是返回，调用方在 review 卡里给提示。
   return out;
+}
+
+function cosine(a: readonly number[], b: readonly number[]): number {
+  if (a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i]!;
+    const bi = b[i]!;
+    dot += ai * bi;
+    na += ai * ai;
+    nb += bi * bi;
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
 async function performFinalize(
   ctx: SkillContext,
   chatId: string,
   session: RehearsalSession,
+  /** v2: review 卡用户勾选过滤后的子集；不传则用整个 session.recommendedChanges */
+  selectedChanges?: readonly RehearsalChangeWithMeta[],
 ): Promise<Result<SkillResult>> {
-  // step ⑤：调 slides + doc 重生成
-  const outputs = await finalize(ctx, chatId, session);
+  // step ⑤：调 slides + doc 重生成（v2 按用户勾选的子集执行，不再"用户决策依据 ≠ 执行依据"）
+  const effectiveChanges = selectedChanges ?? session.recommendedChanges;
+  const finalSession: RehearsalSession = { ...session, recommendedChanges: effectiveChanges };
+  const outputs = await finalize(ctx, chatId, finalSession);
 
   // patch 分析卡为完成态
   if (session.analysisMessageId) {
-    const hasChanges = session.recommendedChanges.length > 0;
+    const hasChanges = effectiveChanges.length > 0;
     const hasOutput = Boolean(outputs.newSlidesUrl || outputs.newDocUrl);
     // 兜底原因：有改动但产出物全空 → 重生成失败；无改动 → 用户没要求改
     const noRegenReason: 'noChanges' | 'regenFailed' | undefined = hasOutput
@@ -794,7 +1114,7 @@ async function performFinalize(
       suggestions: [],
       uncertainties: [],
       summary: hasChanges
-        ? `共 ${session.recommendedChanges.length} 条改动已采纳`
+        ? `共 ${effectiveChanges.length} 条改动已采纳`
         : '本次未沉淀具体改动',
       chatId,
       isCompleted: true,
@@ -823,12 +1143,13 @@ async function performFinalize(
     void ctx.runtime.sendCard({ chatId, card: slidesCard });
   }
 
-  await writeFinalMemory(ctx, chatId, session, outputs);
+  await writeFinalMemory(ctx, chatId, finalSession, outputs);
 
   // 标 session done（避免下条消息被当 continueLoop）
   await saveSession(ctx, chatId, {
     ...session,
     phase: 'done',
+    recommendedChanges: effectiveChanges,
     updatedAt: Date.now(),
   });
 
@@ -866,6 +1187,441 @@ async function performIterateClarify(
   return ok({
     reasoning: `演练复盘进入第 ${session.round} 轮反问澄清`,
   });
+}
+
+// ─── v2 reviewing phase（issue #145 P2）─────────────────────────────────────
+
+function buildReviewChanges(session: RehearsalSession): readonly RehearsalReviewChange[] {
+  // 1) 累积的 recommendedChanges（来自 analyze）— history/user 默认勾选，listener 不勾
+  const fromChanges: RehearsalReviewChange[] = session.recommendedChanges.map((c, i) => {
+    const rawSource = c.source ?? 'user';
+    const source: RehearsalReviewChange['source'] =
+      rawSource === 'history' ? 'user' : rawSource === 'listener' ? 'listener' : 'user';
+    const defaultChecked = source === 'user';
+    return {
+      id: c.id ?? `c_${i}`,
+      target: c.target,
+      text: c.text,
+      source,
+      defaultChecked,
+    };
+  });
+
+  // 2) AI 听众的 critique 也作为可选改动呈现（默认不勾，让用户自己决定要不要采纳）。
+  // attribution=unsure 的进 'unsure' 组（⚠️ 来源待确认），confirmed 的进 'listener' 组。
+  const fromListener: RehearsalReviewChange[] = (session.listenerCritiques ?? []).map((c) => ({
+    id: c.id,
+    target: 'slides',
+    text: `第 ${c.page} 页 [${c.category}] ${c.text}`,
+    source: c.attribution === 'unsure' ? 'unsure' : 'listener',
+    defaultChecked: false,
+  }));
+
+  return [...fromChanges, ...fromListener];
+}
+
+async function performReview(
+  ctx: SkillContext,
+  chatId: string,
+  session: RehearsalSession,
+): Promise<Result<SkillResult>> {
+  const reviewChanges = buildReviewChanges(session);
+  const overLimit = session.recommendedChanges.length > SOFT_LIMIT_RECOMMENDED_CHANGES;
+
+  const card = ctx.cardBuilder.build('rehearsalReview', {
+    chatId,
+    round: session.round,
+    changes: reviewChanges,
+    overLimitHint: overLimit,
+  });
+  const sent = await ctx.runtime.sendCard({ chatId, card });
+  if (!sent.ok) return err(sent.error);
+
+  // 默认勾选 = user 来源；用户在卡上点 toggle 会增删 reviewSelection。
+  const defaultSelection = reviewChanges.filter((c) => c.defaultChecked).map((c) => c.id);
+
+  await saveSession(ctx, chatId, {
+    ...session,
+    phase: 'reviewing',
+    reviewMessageId: sent.value.messageId,
+    reviewSelection: defaultSelection,
+    updatedAt: Date.now(),
+  });
+
+  return ok({
+    reasoning: `演练复盘进入 review checkpoint（${reviewChanges.length} 条累积改动待用户确认）`,
+  });
+}
+
+async function patchReviewResolved(
+  ctx: SkillContext,
+  session: RehearsalSession,
+  resolution: 'confirmed' | 'cancelled' | 'editing',
+): Promise<void> {
+  if (!session.reviewMessageId) return;
+  const card = ctx.cardBuilder.build('rehearsalReview', {
+    chatId: '',
+    round: session.round,
+    changes: [],
+    resolution,
+    resolvedAt: Date.now(),
+  });
+  const res = await ctx.runtime.patchCard({
+    messageId: session.reviewMessageId,
+    card,
+  });
+  if (!res.ok) {
+    ctx.logger.warn('rehearsal: patch review resolved failed', { error: res.error.message });
+  }
+}
+
+async function handleReviewToggle(
+  ctx: SkillContext,
+  chatId: string,
+  session: RehearsalSession,
+  changeId: string,
+  checked: boolean,
+): Promise<Result<SkillResult>> {
+  const current = new Set(session.reviewSelection ?? []);
+  if (checked) current.add(changeId);
+  else current.delete(changeId);
+  await saveSession(ctx, chatId, {
+    ...session,
+    reviewSelection: [...current],
+    updatedAt: Date.now(),
+  });
+  return ok({ reasoning: `review toggle ${changeId}=${checked}` });
+}
+
+async function performReviewConfirm(
+  ctx: SkillContext,
+  chatId: string,
+  session: RehearsalSession,
+): Promise<Result<SkillResult>> {
+  const selectedSet = new Set(session.reviewSelection ?? []);
+  const subset = session.recommendedChanges.filter((c, i) => selectedSet.has(c.id ?? `c_${i}`));
+  await patchReviewResolved(ctx, session, 'confirmed');
+  return performFinalize(ctx, chatId, session, subset);
+}
+
+async function performReviewCancel(
+  ctx: SkillContext,
+  chatId: string,
+  session: RehearsalSession,
+): Promise<Result<SkillResult>> {
+  await patchReviewResolved(ctx, session, 'cancelled');
+  return performIterateClarify(ctx, chatId, session);
+}
+
+async function performReviewEditList(
+  ctx: SkillContext,
+  chatId: string,
+  session: RehearsalSession,
+): Promise<Result<SkillResult>> {
+  await patchReviewResolved(ctx, session, 'editing');
+  // 让用户在群里追加文字微调，沿用 clarify 卡，提示框稍微定制
+  const card = ctx.cardBuilder.build('rehearsalClarify', {
+    round: session.round,
+    questions: [
+      '想保留哪几条？（可以直接说"只留 3 条"或"删掉关于 OKR 的"）',
+      '有没有要新增的改动？',
+    ],
+    chatId,
+  });
+  const sent = await ctx.runtime.sendCard({ chatId, card });
+  if (!sent.ok) return err(sent.error);
+  await saveSession(ctx, chatId, {
+    ...session,
+    phase: 'clarifying',
+    clarifyMessageId: sent.value.messageId,
+    updatedAt: Date.now(),
+  });
+  return ok({ reasoning: 'review editList — 回 clarifying 让用户追加/删除' });
+}
+
+// ─── v2 preview phase（issue #145 P1）──────────────────────────────────────
+
+function findLatestSlidesOutlineFromMemory(
+  records: ReadonlyArray<Record<string, unknown>>,
+): { title: string; outline: { slides: PreviewSlideInput[] } } | null {
+  // [slides_outline] 前缀的 memory 是 v2 由 slides skill 写入的（见 slides.ts）；
+  // 内容是 JSON.stringify({title, slides[]})。
+  const candidates = records.filter((r) =>
+    /^\[slides_outline\]/.test(String(r['content'] ?? '')),
+  );
+  if (candidates.length === 0) return null;
+  const newest = [...candidates].sort(
+    (a, b) => Number(b['created_at'] ?? 0) - Number(a['created_at'] ?? 0),
+  )[0]!;
+  const content = String(newest['content'] ?? '');
+  const jsonStart = content.indexOf('{');
+  if (jsonStart < 0) return null;
+  try {
+    const parsed = JSON.parse(content.slice(jsonStart)) as {
+      title?: unknown;
+      slides?: unknown;
+    };
+    if (typeof parsed.title !== 'string' || !Array.isArray(parsed.slides)) return null;
+    const slides: PreviewSlideInput[] = parsed.slides
+      .map((s, i): PreviewSlideInput | null => {
+        if (typeof s !== 'object' || s === null) return null;
+        const o = s as Record<string, unknown>;
+        const title = typeof o['title'] === 'string' ? o['title'] : '';
+        if (!title.trim()) return null;
+        const bullets = Array.isArray(o['bullets'])
+          ? (o['bullets'] as unknown[]).filter((b): b is string => typeof b === 'string')
+          : [];
+        const subtitle = typeof o['subtitle'] === 'string' ? o['subtitle'] : undefined;
+        return {
+          page: i + 1,
+          title,
+          bullets,
+          ...(subtitle ? { subtitle } : {}),
+        };
+      })
+      .filter((x): x is PreviewSlideInput => x !== null);
+    if (slides.length === 0) return null;
+    return { title: parsed.title, outline: { slides } };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCoreDocSections(
+  ctx: SkillContext,
+  chatId: string,
+): Promise<readonly PreviewDocSection[]> {
+  const docToken = await findCoreDocToken(ctx, chatId);
+  if (!docToken) return [];
+  const res = await ctx.docx.readContent(docToken, 'doc');
+  if (!res.ok) {
+    ctx.logger.info('rehearsal-preview: core-doc readContent failed, degrading', {
+      code: res.error.code,
+    });
+    return [];
+  }
+  return parseDocIntoSections(res.value);
+}
+
+/**
+ * 把 readContent 返回的纯文本按 H2 / `## ` 切段。
+ * core-doc 的 SECTION 列表（见 core-doc.ts）一般是 OKR / 一句话定义 / 项目状态等。
+ * 找不到结构 → 整个 doc 当一段。
+ */
+function parseDocIntoSections(text: string): readonly PreviewDocSection[] {
+  const lines = text.split(/\r?\n/);
+  const sections: { section: string; lines: string[] }[] = [];
+  let current: { section: string; lines: string[] } | null = null;
+  for (const line of lines) {
+    const m = line.match(/^(?:##\s+|H2[:：]\s*)(.+)$/);
+    if (m) {
+      if (current) sections.push(current);
+      current = { section: m[1]!.trim(), lines: [] };
+      continue;
+    }
+    if (!current) continue;
+    current.lines.push(line);
+  }
+  if (current) sections.push(current);
+  if (sections.length === 0) {
+    return [{ section: 'core-doc', content: text.trim() }];
+  }
+  return sections.map((s) => ({
+    section: s.section,
+    content: s.lines.join('\n').trim(),
+  }));
+}
+
+async function generateSpeakerTranscripts(
+  ctx: SkillContext,
+  pages: readonly PreviewSlideInput[],
+  docContext: readonly PreviewDocSection[],
+  style: PreviewStyle,
+): Promise<readonly SpeakerTranscriptPage[]> {
+  const transcripts: SpeakerTranscriptPage[] = [];
+  // 顺序跑（不并发）：保证 LLM 能力被 attribution 校验复用 cache
+  for (const page of pages) {
+    const res = await ctx.llm.askStructured(
+      SPEAKER_PROMPT(page, docContext, style),
+      SpeakerTranscriptPageSchema,
+      { model: 'pro', timeoutMs: 60_000, temperature: 0.6, maxTokens: 800 },
+    );
+    if (!res.ok) {
+      ctx.logger.warn('rehearsal-preview: speaker LLM failed for page', {
+        page: page.page,
+        code: res.error.code,
+      });
+      // 降级：用 PPT title + 第一条 bullet 拼一个最小可用讲稿，保整链路不挂
+      const fallback: SpeakerTranscriptPage = {
+        page: page.page,
+        hook: page.title,
+        core: (page.bullets ?? []).slice(0, 3).join('；') || page.title,
+        transition: '继续下一页。',
+        cite: [`ppt.p${page.page}`],
+        evidence: 'fallback (speaker LLM degraded)',
+      };
+      transcripts.push(fallback);
+      continue;
+    }
+    transcripts.push(res.value);
+  }
+  return transcripts;
+}
+
+async function generateListenerCritiques(
+  ctx: SkillContext,
+  pages: readonly PreviewSlideInput[],
+  docContext: readonly PreviewDocSection[],
+  transcripts: readonly SpeakerTranscriptPage[],
+): Promise<readonly ListenerCritique[]> {
+  const schema = makeListenerCritiqueBatchSchema(pages.length);
+  const res = await ctx.llm.askStructured(
+    LISTENER_PROMPT(pages, docContext, transcripts),
+    schema,
+    { model: 'pro', timeoutMs: 90_000, temperature: 0.2, maxTokens: 2400 },
+  );
+  if (!res.ok) {
+    ctx.logger.warn('rehearsal-preview: listener LLM failed', { code: res.error.code });
+    return [];
+  }
+  return res.value.critiques;
+}
+
+function critiquesToContractShape(
+  classified: readonly ClassifiedCritique[],
+): readonly RehearsalListenerCritique[] {
+  return classified.map((cc, i): RehearsalListenerCritique => {
+    const c = cc.critique;
+    return {
+      id: `lc_${i}`,
+      category: c.category as RehearsalCritiqueCategory,
+      page: c.page,
+      text: c.text,
+      evidence: c.evidence,
+      cite: c.cite,
+      confidence: c.confidence,
+      attribution: cc.attribution,
+    };
+  });
+}
+
+async function performPreview(
+  ctx: SkillContext,
+  chatId: string,
+  trigger: Message,
+  prevSession: RehearsalSession | null,
+): Promise<Result<SkillResult>> {
+  const style = detectStyle(trigger.text) ?? prevSession?.style ?? 'judges';
+
+  // 1. 拉 PPT outline（来自 slides skill 写入的 [slides_outline] memory）
+  const memRes = await ctx.bitable.find({
+    table: 'memory',
+    filter: `AND(CurrentValue.[chat_id]="${chatId}")`,
+    pageSize: 100,
+  });
+  const records = memRes.ok ? memRes.value.records : [];
+  const slidesData = findLatestSlidesOutlineFromMemory(records);
+
+  if (!slidesData) {
+    // 没有 PPT outline 缓存 → 退化成 v1：直接进 analyze
+    ctx.logger.info('rehearsal-preview: no slides outline in memory, falling back to v1 analyze', {
+      chatId,
+    });
+    return performAnalysisRound(
+      ctx,
+      { chatId, trigger, action: 'message' },
+      prevSession,
+    );
+  }
+
+  const pages = slidesData.outline.slides;
+
+  // 2. 拉 core-doc
+  const docContext = await fetchCoreDocSections(ctx, chatId);
+
+  // 3. 演讲者讲稿（pro × N 页）— graceful，逐页 fallback
+  const transcripts = await generateSpeakerTranscripts(ctx, pages, docContext, style);
+
+  // 4. 听众 critique（pro 一次）
+  const rawCritiques = await generateListenerCritiques(ctx, pages, docContext, transcripts);
+
+  // 5. attribution 校验（lite × N 并发）
+  const classified = await verifyAttribution(ctx, rawCritiques, pages, docContext);
+  const listenerCritiques = critiquesToContractShape(classified);
+
+  // 6. 渲染 preview 卡（每页一段）
+  const critiquesByPage = new Map<number, RehearsalListenerCritique[]>();
+  for (const c of listenerCritiques) {
+    const list = critiquesByPage.get(c.page) ?? [];
+    list.push(c);
+    critiquesByPage.set(c.page, list);
+  }
+  const previewPages: RehearsalPreviewPage[] = pages.map((p): RehearsalPreviewPage => {
+    const t = transcripts.find((tt) => tt.page === p.page);
+    const critiques = critiquesByPage.get(p.page) ?? [];
+    return {
+      page: p.page,
+      pageTitle: p.title,
+      hook: t?.hook ?? p.title,
+      core: t?.core ?? '',
+      transition: t?.transition ?? '',
+      critiques,
+    };
+  });
+
+  const previewCard = ctx.cardBuilder.build('rehearsalPreview', {
+    chatId,
+    totalPages: pages.length,
+    pages: previewPages,
+    style,
+  });
+  const sent = await ctx.runtime.sendCard({ chatId, card: previewCard });
+  if (!sent.ok) return err(sent.error);
+
+  // 7. session 写入：phase=preview，缓存 listenerCritiques + style
+  const startedAt = prevSession?.startedAt ?? Date.now();
+  const newSession: RehearsalSession = {
+    phase: 'preview',
+    round: 0, // preview 是第 0 轮，进入 analyze 后自然变 1
+    previewMessageId: sent.value.messageId,
+    recommendedChanges: prevSession?.recommendedChanges ?? [],
+    lastUncertainties: prevSession?.lastUncertainties ?? [],
+    listenerCritiques,
+    userPageFeedback: prevSession?.userPageFeedback ?? [],
+    reviewSelection: prevSession?.reviewSelection ?? [],
+    style,
+    startedAt,
+    updatedAt: Date.now(),
+  };
+  await saveSession(ctx, chatId, newSession);
+
+  return ok({
+    reasoning: `AI 听众预演：${pages.length} 页讲稿 + ${listenerCritiques.length} 条 critique（${classified.filter((c) => c.attribution === 'unsure').length} 待确认）`,
+  });
+}
+
+async function recordPreviewFeedback(
+  ctx: SkillContext,
+  chatId: string,
+  session: RehearsalSession,
+  page: number,
+  text: string,
+  user?: { userId?: string | undefined; userName?: string | undefined },
+): Promise<RehearsalSession> {
+  const fb: UserPageFeedback = {
+    page,
+    text: clamp(text, 'MEDIUM'),
+    at: Date.now(),
+    ...(user?.userId ? { userId: user.userId } : {}),
+    ...(user?.userName ? { userName: user.userName } : {}),
+  };
+  const updated: RehearsalSession = {
+    ...session,
+    userPageFeedback: [...(session.userPageFeedback ?? []), fb],
+    updatedAt: Date.now(),
+  };
+  await saveSession(ctx, chatId, updated);
+  return updated;
 }
 
 async function ackClarifyCard(ctx: SkillContext, session: RehearsalSession): Promise<void> {
@@ -908,7 +1664,17 @@ export const rehearsalSkill: Skill = {
   match(ctx: SkillContext): boolean {
     if (ctx.event.type === 'cardAction') {
       const action = String(ctx.event.payload.value['action'] ?? '');
-      return action === 'rehearsal.satisfied' || action === 'rehearsal.iterate';
+      return (
+        action === 'rehearsal.satisfied' ||
+        action === 'rehearsal.iterate' ||
+        action === 'rehearsal.preview.agree' ||
+        action === 'rehearsal.preview.disagree' ||
+        action === 'rehearsal.preview.startAnalyze' ||
+        action === 'rehearsal.review.toggle' ||
+        action === 'rehearsal.review.confirm' ||
+        action === 'rehearsal.review.cancel' ||
+        action === 'rehearsal.review.editList'
+      );
     }
     if (ctx.event.type !== 'message') return false;
     return TRIGGER_RE.test(ctx.event.payload.text);
@@ -926,12 +1692,15 @@ export const rehearsalSkill: Skill = {
     // ── cardAction 入口 ──────────────────────────────────────────────────
     if (event.type === 'cardAction') {
       const action = String(event.payload.value['action'] ?? '');
+      const value = event.payload.value;
+
+      // v1 兼容入口：satisfied → 现在先进 review 卡，不直接 finalize
       if (action === 'rehearsal.satisfied') {
         if (!session || session.phase === 'done') {
           ctx.logger.warn('rehearsal: satisfied click without active session', { chatId });
           return ok({ reasoning: '无活跃 session，忽略 satisfied 点击' });
         }
-        return performFinalize(ctx, chatId, session);
+        return performReview(ctx, chatId, session);
       }
       if (action === 'rehearsal.iterate') {
         if (!session || session.phase === 'done') {
@@ -939,6 +1708,60 @@ export const rehearsalSkill: Skill = {
           return ok({ reasoning: '无活跃 session，忽略 iterate 点击' });
         }
         return performIterateClarify(ctx, chatId, session);
+      }
+
+      // v2 preview 卡按钮
+      if (action === 'rehearsal.preview.agree' || action === 'rehearsal.preview.disagree') {
+        if (!session || session.phase === 'done') {
+          ctx.logger.warn('rehearsal: preview click without active session', { chatId });
+          return ok({ reasoning: '无活跃 preview session' });
+        }
+        const page = Number(value['page']);
+        if (!Number.isInteger(page) || page < 1) {
+          return err(makeError(ErrorCode.INVALID_INPUT, 'preview action missing page'));
+        }
+        // agree → 视为接受 AI 听众建议，写一条简短反馈
+        const text = action === 'rehearsal.preview.agree' ? '同意 AI 听众建议（来自卡片按钮）' : '我有不同意见（来自卡片按钮，请在群里补充具体内容）';
+        const updated = await recordPreviewFeedback(ctx, chatId, session, page, text, {
+          userId: event.payload.user.userId,
+          userName: event.payload.user.name,
+        });
+        const fbCount = updated.userPageFeedback?.length ?? 0;
+        if (fbCount >= PREVIEW_FEEDBACK_THRESHOLD && updated.phase === 'preview') {
+          return performAnalysisRound(ctx, { chatId, trigger: null, action: 'message' }, updated);
+        }
+        return ok({
+          reasoning: `preview feedback recorded (page ${page}, ${fbCount}/${PREVIEW_FEEDBACK_THRESHOLD})`,
+        });
+      }
+      if (action === 'rehearsal.preview.startAnalyze') {
+        if (!session) {
+          return ok({ reasoning: '无活跃 preview session' });
+        }
+        return performAnalysisRound(ctx, { chatId, trigger: null, action: 'message' }, session);
+      }
+
+      // v2 review 卡按钮
+      if (action === 'rehearsal.review.toggle') {
+        if (!session) return ok({ reasoning: '无活跃 session, 忽略 toggle' });
+        const changeId = typeof value['changeId'] === 'string' ? value['changeId'] : '';
+        const checked = value['checked'] === true;
+        if (!changeId) {
+          return err(makeError(ErrorCode.INVALID_INPUT, 'review.toggle missing changeId'));
+        }
+        return handleReviewToggle(ctx, chatId, session, changeId, checked);
+      }
+      if (action === 'rehearsal.review.confirm') {
+        if (!session) return ok({ reasoning: '无活跃 session, 忽略 confirm' });
+        return performReviewConfirm(ctx, chatId, session);
+      }
+      if (action === 'rehearsal.review.cancel') {
+        if (!session) return ok({ reasoning: '无活跃 session, 忽略 cancel' });
+        return performReviewCancel(ctx, chatId, session);
+      }
+      if (action === 'rehearsal.review.editList') {
+        if (!session) return ok({ reasoning: '无活跃 session, 忽略 editList' });
+        return performReviewEditList(ctx, chatId, session);
       }
       return err(makeError(ErrorCode.INVALID_INPUT, `rehearsal: unknown action ${action}`));
     }
@@ -949,9 +1772,13 @@ export const rehearsalSkill: Skill = {
 
     const msg = event.payload;
 
-    // ── 满意信号优先（即使 trigger 也命中，满意优先级更高，避免无限循环新启动） ──
+    // ── 满意信号优先：v2 起进 review 卡（不直接 finalize）── ──────────────
     if (session && session.phase !== 'done' && isSatisfactionSignal(msg.text)) {
-      return performFinalize(ctx, chatId, session);
+      // 已经在 reviewing 阶段又再次说"满意"→ 直接按当前勾选 confirm
+      if (session.phase === 'reviewing') {
+        return performReviewConfirm(ctx, chatId, session);
+      }
+      return performReview(ctx, chatId, session);
     }
 
     // ── 全新触发（无 session 或上次 session 已 done）──
@@ -965,7 +1792,8 @@ export const rehearsalSkill: Skill = {
         });
         return ok({ reasoning: '无触发词且无活跃 session' });
       }
-      return performAnalysisRound(ctx, { chatId, trigger: msg, action: 'message' }, null);
+      // v2: fresh trigger 走 preview phase；preview 内部若读不到 PPT outline 会回退到 v1 analyze
+      return performPreview(ctx, chatId, msg, null);
     }
 
     // ── 活跃 session + 用户文本 → 视为反馈，重新分析 ──
@@ -973,6 +1801,32 @@ export const rehearsalSkill: Skill = {
     if (session.phase === 'clarifying') {
       await ackClarifyCard(ctx, session);
     }
+
+    // v2: preview phase 收到用户文本 → 视为通用反馈（page=0 表示未指定页码）。
+    // 累计达阈值就自动进 analyzing。
+    if (session.phase === 'preview') {
+      const updated = await recordPreviewFeedback(ctx, chatId, session, 0, msg.text, {
+        userId: msg.sender.userId,
+        userName: msg.sender.name,
+      });
+      const fbCount = updated.userPageFeedback?.length ?? 0;
+      if (fbCount >= PREVIEW_FEEDBACK_THRESHOLD) {
+        return performAnalysisRound(
+          ctx,
+          {
+            chatId,
+            trigger: msg,
+            action: 'message',
+            userTextSummary: clamp(msg.text, 'MEDIUM'),
+          },
+          updated,
+        );
+      }
+      return ok({
+        reasoning: `preview phase 反馈累积 ${fbCount}/${PREVIEW_FEEDBACK_THRESHOLD}`,
+      });
+    }
+
     return performAnalysisRound(
       ctx,
       {
