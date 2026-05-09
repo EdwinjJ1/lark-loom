@@ -478,19 +478,33 @@ describe('E2E 剧本 A：fresh trigger → 文本反馈 → 文本满意', () =>
       expect(session.phase).toBe('analyzing'); // r2 没 uncertainty
     }
 
-    // ──— 第 3 步：用户文本"OK 就这样" → finalize ─────────────────
+    // ──— 第 3 步：用户文本"OK 就这样" → v2 走 review checkpoint（不直接 finalize）──
     const step3 = makeE2ECtx(
       makeMessageEvent('OK 就这样'),
       REHEARSAL_HISTORY,
-      { analysisQueue: [] }, // finalize 不调分析 LLM
+      { analysisQueue: [] }, // review 不调分析 LLM
       memStore,
     );
     const r3 = await rehearsalSkill.run(step3.ctx);
     expect(r3.ok).toBe(true);
-    dumpCards(step3.cards, '剧本A 第3步 finalize');
+    dumpCards(step3.cards, '剧本A 第3步 review');
+    // v2: 发 review 卡，未生成新 PPT
+    expect(step3.cards.find((c) => c.templateName === 'rehearsalReview')).toBeDefined();
+    expect(step3.ctx.slides!.createFromOutline).not.toHaveBeenCalled();
+
+    // ──— 第 4 步：用户在 review 卡点全部确认 → finalize ──────────────────
+    const step4 = makeE2ECtx(
+      makeCardActionEvent('rehearsal.review.confirm'),
+      REHEARSAL_HISTORY,
+      { analysisQueue: [] },
+      memStore,
+    );
+    const r4 = await rehearsalSkill.run(step4.ctx);
+    expect(r4.ok).toBe(true);
+    dumpCards(step4.cards, '剧本A 第4步 review.confirm');
 
     // 完成态：patch rehearsal 卡为 isCompleted；发新的 slides 卡
-    const completedPatch = step3.cards.find(
+    const completedPatch = step4.cards.find(
       (c) => c.op === 'patch' && c.templateName === 'rehearsal',
     );
     expect(completedPatch).toBeDefined();
@@ -499,14 +513,14 @@ describe('E2E 剧本 A：fresh trigger → 文本反馈 → 文本满意', () =>
     expect(completedSnap.bodyText).toContain('演练复盘已完成');
     expect(completedSnap.buttons.find((b) => b.text === '打开新版 PPT')).toBeDefined();
 
-    const slidesCard = step3.cards.find(
+    const slidesCard = step4.cards.find(
       (c) => c.op === 'send' && c.templateName === 'slides',
     );
     expect(slidesCard).toBeDefined();
 
     // 调过 slides + docx
-    expect(step3.ctx.slides!.createFromOutline).toHaveBeenCalled();
-    expect(step3.ctx.docx.createFromMarkdown).not.toHaveBeenCalled(); // 这轮无 doc 类改动
+    expect(step4.ctx.slides!.createFromOutline).toHaveBeenCalled();
+    expect(step4.ctx.docx.createFromMarkdown).not.toHaveBeenCalled(); // 这轮无 doc 类改动
 
     // session phase = done
     const finalSession = await memStore.client.read(
@@ -521,7 +535,7 @@ describe('E2E 剧本 A：fresh trigger → 文本反馈 → 文本满意', () =>
     }
 
     // 写过 [演练复盘] project memory
-    const projectMem = step3.bitableInserts.find(
+    const projectMem = step4.bitableInserts.find(
       (x) =>
         x.row['kind'] === 'project' && String(x.row['content']).includes('[演练复盘]'),
     );
@@ -572,7 +586,7 @@ describe('E2E 剧本 B：按钮驱动的多轮循环', () => {
     );
     await rehearsalSkill.run(step3.ctx);
 
-    // 第 4 步：点满意按钮
+    // 第 4 步：点满意按钮 → v2 review 卡
     const step4 = makeE2ECtx(
       makeCardActionEvent('rehearsal.satisfied'),
       REHEARSAL_HISTORY,
@@ -581,11 +595,24 @@ describe('E2E 剧本 B：按钮驱动的多轮循环', () => {
     );
     const r4 = await rehearsalSkill.run(step4.ctx);
     expect(r4.ok).toBe(true);
-    dumpCards(step4.cards, '剧本B 第4步 satisfied');
+    dumpCards(step4.cards, '剧本B 第4步 review');
+    expect(step4.cards.find((c) => c.templateName === 'rehearsalReview')).toBeDefined();
+    expect(step4.ctx.slides!.createFromOutline).not.toHaveBeenCalled();
+
+    // 第 5 步：review.confirm → 真正 finalize
+    const step5 = makeE2ECtx(
+      makeCardActionEvent('rehearsal.review.confirm'),
+      REHEARSAL_HISTORY,
+      { analysisQueue: [] },
+      memStore,
+    );
+    const r5 = await rehearsalSkill.run(step5.ctx);
+    expect(r5.ok).toBe(true);
+    dumpCards(step5.cards, '剧本B 第5步 review.confirm');
 
     // 验证最终发了完成卡 + slides 卡
-    expect(step4.cards.find((c) => c.op === 'send' && c.templateName === 'slides')).toBeDefined();
-    const completed = step4.cards.find(
+    expect(step5.cards.find((c) => c.op === 'send' && c.templateName === 'slides')).toBeDefined();
+    const completed = step5.cards.find(
       (c) => c.op === 'patch' && c.templateName === 'rehearsal',
     );
     expect(completed).toBeDefined();
@@ -671,16 +698,30 @@ describe('E2E 剧本 D：纯 doc 改动 finalize', () => {
       { analysisQueue: [] },
       memStore,
     );
-    const r = await rehearsalSkill.run(step2.ctx);
-    expect(r.ok).toBe(true);
-    dumpCards(step2.cards, '剧本D finalize');
+    const r2 = await rehearsalSkill.run(step2.ctx);
+    expect(r2.ok).toBe(true);
+    dumpCards(step2.cards, '剧本D 第2步 review');
+    // v2: 满意先发 review，未真正调 docx
+    expect(step2.cards.find((c) => c.templateName === 'rehearsalReview')).toBeDefined();
+    expect(step2.ctx.docx.createFromMarkdown).not.toHaveBeenCalled();
 
-    // slides client 不被调
-    expect(step2.ctx.slides!.createFromOutline).not.toHaveBeenCalled();
+    // 第 3 步：review.confirm → finalize
+    const step3 = makeE2ECtx(
+      makeCardActionEvent('rehearsal.review.confirm'),
+      REHEARSAL_HISTORY,
+      { analysisQueue: [] },
+      memStore,
+    );
+    const r3 = await rehearsalSkill.run(step3.ctx);
+    expect(r3.ok).toBe(true);
+    dumpCards(step3.cards, '剧本D 第3步 review.confirm');
+
+    // slides client 不被调（无 slides 类改动）
+    expect(step3.ctx.slides!.createFromOutline).not.toHaveBeenCalled();
     // docx 被调
-    expect(step2.ctx.docx.createFromMarkdown).toHaveBeenCalled();
+    expect(step3.ctx.docx.createFromMarkdown).toHaveBeenCalled();
     // 完成卡里只有"打开汇报文档"按钮，没有"打开新版 PPT"
-    const completed = step2.cards.find(
+    const completed = step3.cards.find(
       (c) => c.op === 'patch' && c.templateName === 'rehearsal',
     );
     expect(completed).toBeDefined();
@@ -737,17 +778,21 @@ describe('E2E 剧本 E：边界场景', () => {
 
   it('finalize 时 slides + doc 都失败 → 完成卡显示"重生成未成功"，不是空卡', async () => {
     const memStore = makeFakeMemoryStore();
-    // 预置 round 1 session 带 changes
+    // 预置 reviewing session（v2: review.confirm → finalize 路径）
     await memStore.client.write({
       kind: 'skill_log',
       chat_id: CHAT_ID,
       key: REHEARSAL_SESSION_KEY,
       content: JSON.stringify({
-        phase: 'analyzing',
+        phase: 'reviewing',
         round: 1,
         analysisMessageId: 'analysis_msg',
-        recommendedChanges: [{ target: 'slides', text: '第 3 页补单位' }],
+        reviewMessageId: 'review_msg',
+        recommendedChanges: [
+          { id: 'c_0', target: 'slides', text: '第 3 页补单位', source: 'user' },
+        ],
         lastUncertainties: [],
+        reviewSelection: ['c_0'],
         startedAt: Date.now() - 10_000,
         updatedAt: Date.now() - 1_000,
       }),
@@ -756,7 +801,7 @@ describe('E2E 剧本 E：边界场景', () => {
     });
 
     const e2e = makeE2ECtx(
-      makeCardActionEvent('rehearsal.satisfied'),
+      makeCardActionEvent('rehearsal.review.confirm'),
       REHEARSAL_HISTORY,
       { analysisQueue: [] },
       memStore,
@@ -783,12 +828,14 @@ describe('E2E 剧本 E：边界场景', () => {
     expect(snap.bodyText).not.toContain('没有需要重新生成');
   });
 
-  it('mergeChanges 累积上限 30 条，防 session JSON 超 2KB', async () => {
+  it('v2: mergeChanges 不再静默截断，全部保留供 review 卡上提示用户精简', async () => {
     const memStore = makeFakeMemoryStore();
     // 预置一个已经累积 30 条 changes 的 session
     const lots = Array.from({ length: 30 }, (_, i) => ({
+      id: `c_${i}`,
       target: 'slides' as const,
       text: `历史改动 #${i}`,
+      source: 'user' as const,
     }));
     await memStore.client.write({
       kind: 'skill_log',
@@ -836,16 +883,14 @@ describe('E2E 剧本 E：边界场景', () => {
       const s = JSON.parse(sessionRec.value.content) as {
         recommendedChanges: { text: string }[];
       };
-      // 上限 30 → 5 旧的被挤出，5 新的进来
-      expect(s.recommendedChanges.length).toBe(30);
-      // 新的 5 条都还在
+      // v2: 不再 slice — 30 历史 + 5 新 = 35 条全部保留
+      expect(s.recommendedChanges.length).toBe(35);
+      // 老条目仍在
+      expect(s.recommendedChanges.find((c) => c.text === '历史改动 #0')).toBeDefined();
+      expect(s.recommendedChanges.find((c) => c.text === '历史改动 #29')).toBeDefined();
+      // 新条目也在
       expect(s.recommendedChanges.find((c) => c.text === '新改动 #0')).toBeDefined();
       expect(s.recommendedChanges.find((c) => c.text === '新改动 #4')).toBeDefined();
-      // 最旧的 5 条被挤出
-      expect(s.recommendedChanges.find((c) => c.text === '历史改动 #0')).toBeUndefined();
-      expect(s.recommendedChanges.find((c) => c.text === '历史改动 #4')).toBeUndefined();
-      // 第 5 条之后还在
-      expect(s.recommendedChanges.find((c) => c.text === '历史改动 #5')).toBeDefined();
     } else {
       throw new Error('session not found');
     }

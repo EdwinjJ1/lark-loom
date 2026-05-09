@@ -52,7 +52,10 @@ pnpm monorepo，三个 package：
 packages/
 ├── contracts/    # 跨包接口契约（Message/Card/BotRuntime/BitableClient/CardBuilder/LLMClient/Retriever/Skill）
 ├── bot/          # 飞书 bot 进程入口（WSClient + Skill Router + 限流）
-└── skills/       # 7 条业务主线 Skill 实现（qa/recall/summary/slides/archive/crossChat/weekly）
+└── skills/       # 11 条业务主线 Skill 实现
+                  # qa / recall / summary / slides / archive / weekly /
+                  # requirement-doc / doc-iterate / task-assignment /
+                  # progress-update / rehearsal
 ```
 
 > 改 `packages/contracts` 必须 PR + 三人 review（CLAUDE.md 硬约束）。
@@ -61,8 +64,8 @@ packages/
 
 ```bash
 # 1. clone
-git clone git@github.com:EdwinjJ1/seedhac.git
-cd seedhac
+git clone git@github.com:EdwinjJ1/lark-loom.git
+cd lark-loom
 
 # 2. install
 pnpm install

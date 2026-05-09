@@ -12,7 +12,7 @@ import {
   cosineSimilarity,
   evictScore,
 } from '../memory/memory-store.js';
-import type { BitableClient, LLMClient, Result, AppError, Logger } from '@seedhac/contracts';
+import type { BitableClient, LLMClient, Logger, Result, AppError } from '@seedhac/contracts';
 import { ok, err, ErrorCode, makeError } from '@seedhac/contracts';
 
 // ────────────────────────────────────────────────────────────────────
@@ -1265,7 +1265,7 @@ describe('MemoryStore — compact', () => {
     const store = new MemoryStore({
       bitable,
       llm,
-      logger: logger as unknown as import('@seedhac/contracts').Logger,
+      logger: logger as unknown as Logger,
       scoreFlushMs: 100_000,
       now: () => 9_000_000,
     });
@@ -1302,7 +1302,7 @@ describe('MemoryStore — compact', () => {
     const store = new MemoryStore({
       bitable,
       llm,
-      logger: logger as unknown as import('@seedhac/contracts').Logger,
+      logger: logger as unknown as Logger,
       scoreFlushMs: 100_000,
       now: () => 9_000_000,
     });
@@ -1339,7 +1339,7 @@ describe('MemoryStore — compact', () => {
     const store = new MemoryStore({
       bitable,
       llm,
-      logger: logger as unknown as import('@seedhac/contracts').Logger,
+      logger: logger as unknown as Logger,
       scoreFlushMs: 100_000,
       now: () => 9_000_000,
     });

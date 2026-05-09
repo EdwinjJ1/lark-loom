@@ -555,8 +555,8 @@ async function handleCardAction(
     return;
   }
 
-  // rehearsal（issue #102）：分析卡的"满意，完成" / "继续修改"按钮
-  if (action === 'rehearsal.satisfied' || action === 'rehearsal.iterate') {
+  // rehearsal（issue #102 + v2 issue #145）：所有 rehearsal.* cardAction 由 rehearsal skill 处理
+  if (typeof action === 'string' && action.startsWith('rehearsal.')) {
     const rehearsal = skills.rehearsal;
     if (!rehearsal) {
       logger.warn('rehearsal cardAction received but skill not registered');
