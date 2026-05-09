@@ -231,6 +231,63 @@ describe('skill.read', () => {
   });
 });
 
+// ─── memory.write ────────────────────────────────────────────────────────────
+
+describe('memory.write', () => {
+  it('adds default importance when model omits it', async () => {
+    const store = makeStore();
+    const exec = makeExecutor({
+      store,
+      chatId: CHAT_ID,
+      logger: mockLogger,
+      docsRoot: DOCS_ROOT,
+      sourceSkill: 'passive_observe',
+    });
+
+    const toolResult = await exec(
+      makeCall('memory.write', {
+        kind: 'chat',
+        key: 'project_deadline',
+        content: '截止日期是 5 月 15 日',
+      }),
+    );
+
+    const data = JSON.parse(toolResult.content) as { ok: boolean };
+    expect(data.ok).toBe(true);
+    expect(store.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'chat',
+        chat_id: CHAT_ID,
+        key: 'project_deadline',
+        content: '截止日期是 5 月 15 日',
+        source_skill: 'passive_observe',
+        importance: 5,
+      }),
+    );
+  });
+
+  it('keeps explicit importance from the model', async () => {
+    const store = makeStore();
+    const exec = makeExecutor({ store, chatId: CHAT_ID, logger: mockLogger, docsRoot: DOCS_ROOT });
+
+    await exec(
+      makeCall('memory.write', {
+        kind: 'project',
+        key: 'core_decision',
+        content: '确认不做 PC 端',
+        importance: 9,
+      }),
+    );
+
+    expect(store.write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'project',
+        importance: 9,
+      }),
+    );
+  });
+});
+
 // ─── 日志 ────────────────────────────────────────────────────────────────────
 
 describe('executor logging', () => {

@@ -243,6 +243,12 @@ async function handleMemorySearch(
 const VALID_KINDS: ReadonlySet<MemoryKind> = new Set(['project', 'chat', 'user', 'skill_log']);
 const SAFE_DECISION_KEY_RE = /^[A-Za-z0-9_:.-]+$/;
 const MAX_DECISION_KEY_LENGTH = 120;
+const DEFAULT_TOOL_IMPORTANCE: Record<MemoryKind, number> = {
+  project: 7,
+  chat: 5,
+  user: 5,
+  skill_log: 4,
+};
 
 async function handleMemoryWrite(
   args: Record<string, unknown>,
@@ -260,7 +266,7 @@ async function handleMemoryWrite(
   const importance =
     typeof args['importance'] === 'number'
       ? Math.min(Math.max(args['importance'], 1), 10)
-      : undefined;
+      : DEFAULT_TOOL_IMPORTANCE[kindRaw as MemoryKind];
 
   const r = await deps.store.write({
     kind: kindRaw as MemoryKind,
@@ -268,7 +274,7 @@ async function handleMemoryWrite(
     key,
     content,
     source_skill: deps.sourceSkill ?? 'harness',
-    ...(importance !== undefined && { importance }),
+    importance,
   });
   if (!r.ok) return JSON.stringify({ error: r.error.message });
   return JSON.stringify({

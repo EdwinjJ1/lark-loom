@@ -75,6 +75,18 @@ export async function handleEvent(
 
   const msg = event.payload;
   const isMention = msg.mentions.some((m) => m.user.userId === harness?.botOpenId);
+  const isBackfill = msg.meta?.['source'] === 'backfill';
+
+  // Backfill can recover messages from every group the bot has joined. For
+  // non-mention messages, running passive skills would make old activity in
+  // unrelated groups suddenly produce visible bot replies.
+  if (isBackfill && !isMention) {
+    logger.info('backfill non-mention message skipped', {
+      chatId: msg.chatId,
+      messageId: msg.messageId,
+    });
+    return;
+  }
 
   // @mention 消息走 Harness：chatWithTools 让模型按需调 memory/skill 工具
   if (harness && isMention) {
@@ -240,6 +252,8 @@ function writeSkillMemory(
 // 自动写入的 skill_log / chat 记忆 input 上限：JSON.stringify 后还要嵌进 2KB content，
 // 给 reason/output/skill/at 留余量后单字段最多 500 字符。
 const AUTO_MEMORY_INPUT_MAX = 500;
+const AUTO_SKILL_LOG_IMPORTANCE = 4;
+const AUTO_CHAT_MEMORY_IMPORTANCE = 5;
 
 async function writeSkillMemoryNow(
   ctx: SkillContext,
@@ -253,7 +267,6 @@ async function writeSkillMemoryNow(
   const summary = summarizeSkillResult(skill, result);
   const baseUserField = userId ? { user_id: safeMemoryKey(userId) } : {};
 
-  // 不显式传 importance —— MemoryStore.write 会异步调 LLM 评分。
   const skillLogPromise = memoryStore.write({
     kind: 'skill_log',
     chat_id: chatId,
@@ -266,6 +279,7 @@ async function writeSkillMemoryNow(
       output: summary,
       at: now,
     }),
+    importance: AUTO_SKILL_LOG_IMPORTANCE,
   });
 
   const writeChatMemory = skill.name === 'qa' || skill.name === 'summary';
@@ -286,6 +300,7 @@ async function writeSkillMemoryNow(
           reason: result.reasoning ?? '',
           at: now,
         }),
+        importance: AUTO_CHAT_MEMORY_IMPORTANCE,
       })
     : null;
 

@@ -220,6 +220,21 @@ function parseListItem(item: Record<string, unknown>): Message {
   });
 }
 
+function withMessageSource(
+  msg: Message,
+  source: 'ws' | 'backfill',
+  extraMeta: Record<string, unknown> = {},
+): Message {
+  return {
+    ...msg,
+    meta: {
+      ...(msg.meta ?? {}),
+      ...extraMeta,
+      source,
+    },
+  };
+}
+
 function parseCardAction(data: Record<string, unknown>): CardAction {
   const context = (data.context ?? {}) as Record<string, unknown>;
   const action = (data.action ?? {}) as Record<string, unknown>;
@@ -335,7 +350,10 @@ export class LarkBotRuntime implements BotRuntime {
         ...(this.env.logLevel !== undefined && { loggerLevel: this.env.logLevel }),
       }).register({
         'im.message.receive_v1': async (data) => {
-          const msg = parseMessage(data as unknown as Record<string, unknown>);
+          const msg = withMessageSource(
+            parseMessage(data as unknown as Record<string, unknown>),
+            'ws',
+          );
           this.markMessageSeen(msg);
           this.emit({ type: 'message', payload: msg });
           return { code: 0 };
@@ -513,7 +531,20 @@ export class LarkBotRuntime implements BotRuntime {
 
       let parsed: Message;
       try {
-        parsed = parseListItem(item);
+        const itemMessage = parseListItem(item);
+        if (itemMessage.chatId && itemMessage.chatId !== chatId) {
+          this.logger?.warn('[BotRuntime] backfill: item chatId mismatch, skip', {
+            containerChatId: chatId,
+            itemChatId: itemMessage.chatId,
+            messageId,
+          });
+          continue;
+        }
+        parsed = withMessageSource(
+          itemMessage.chatId ? itemMessage : { ...itemMessage, chatId },
+          'backfill',
+          { containerChatId: chatId },
+        );
       } catch (e) {
         this.logger?.warn('[BotRuntime] backfill: parseListItem failed', {
           chatId,
